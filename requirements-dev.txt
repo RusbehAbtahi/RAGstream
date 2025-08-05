@@ -1,0 +1,6 @@
+# install with:  pip install -r requirements-dev.txt
+black>=24.4
+isort>=5.13
+mypy>=1.10
+pytest>=8.2
+pytest-cov>=5.0
