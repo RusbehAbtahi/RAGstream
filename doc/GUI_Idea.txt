@@ -1,0 +1,36 @@
+So I say what I think from GUI side: 
+
+Main TAB:
+
+1-An edit box where I can copy paste my prompt
+
+2-An Edit Box where I can see the final prompt you have created, it must be edit able.. So that if I dint like it to change it
+
+3-A create Super-Prompt Push-Button
+
+4-A Send Prompt
+
+5-A Check-box-- when acticavated, synchronize create-Super-Prompt and Send Prompt together
+
+6-A Push Button for Adding Path... If I add path, then you automatically create Vector Numpy of that path and change all allowed files there into vector  (we difine a list of all allowed files, py, tf, md, txt, yml, json, etc) 
+
+7- pop-up menu, which chose the final LLM model
+
+8- Check boxes for activating an deactivating some agents
+
+9-A Info BOX.. which automatically reads what is inside SuperPrompt box and reads the chossen model.. and make an estimation of price online.  (How we estimate Output Token size?)-- The box has an estimation and then an actual price
+
+Attention TAB:
+
+GUI automatically reads ALL paths, and automatically create check boxes.. where we can activate or deactivated some files (to be or not to be considered) Agents may ovewrite this.. If we explicitly as for a specific file inside my LAPTOP.. then Agent doesnt care and will deterministically read it.. but for Retrival, these radio buttons define, which files must be considered
+
+Radio BUttons for Roles/Types:  Because as you said, choosing all files manually is difficutl.. I implement RAdio Butons were you give a specific role... for Example "Requirment Expert".. if I activate this, automatically all relevant checkboxes will be activated, and others deactivated... Therefore we can easily save our favorite ROle (up to 8 Roles) give any name, and any combination of checkboxes.... 
+
+
+--------------------------  
+
+
+This is my first Idea about our GUI ..,, what do you think?
+
+
+

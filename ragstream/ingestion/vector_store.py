@@ -1,20 +1,39 @@
+# -*- coding: utf-8 -*-
 """
-VectorStore
-===========
-Thin façade around Chroma (or any future DB) handling persistence & snapshots.
+VectorStore (router)
+====================
+On Windows (default): use pure NumPy exact-cosine backend (no native deps).
+On non-Windows or when RAG_FORCE_CHROMA=1: use Chroma (PersistentClient).
 """
-from typing import List
 
-class VectorStore:
-    """Stores embeddings and metadata; persists to disk."""
-    def add(self, ids: List[str], vectors: List[list[float]], meta: List[dict]) -> None:
-        """Insert or update vectors; no implementation yet."""
-        return
+from __future__ import annotations
+import os, sys
+from typing import List, Dict
 
-    def query(self, vector: list[float], k: int = 10) -> List[str]:
-        """Return top-k IDs (dummy)."""
-        return []
+if sys.platform.startswith("win") and os.getenv("RAG_FORCE_CHROMA") != "1":
+    # Windows default: native-free store
+    from .vector_store_pure import VectorStorePure as VectorStore  # re-export
+else:
+    # Non-Windows (or forced): Chroma embedded client
+    from chromadb import PersistentClient
 
-    def snapshot(self, timestamp: str) -> None:
-        """Create a timestamped backup of the DB on disk."""
-        return
+    class VectorStore:
+        def __init__(self, persist_dir: str) -> None:
+            self.client = PersistentClient(path=persist_dir)
+            self.collection = self.client.get_or_create_collection(
+                name="rag_vectors",
+                embedding_function=None  # embeddings are precomputed
+            )
+
+        def add(self, ids: List[str], vectors: List[List[float]], meta: List[Dict]) -> None:
+            if not ids or not vectors:
+                return
+            self.collection.add(ids=ids, embeddings=vectors, metadatas=meta)
+
+        def query(self, vector: List[float], k: int = 10) -> List[str]:
+            res = self.collection.query(query_embeddings=[vector], n_results=k)
+            return res.get("ids", [[]])[0]
+
+        def snapshot(self, timestamp: str) -> None:
+            # Chroma persists continuously; no-op here.
+            return
