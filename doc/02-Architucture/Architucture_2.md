@@ -1,4 +1,7 @@
 
+# Architecture – RAGstream (Pre-MVP, Aug 2025)
+
+This document shows the end-to-end architecture for RAGstream. It reflects the updated README: A2 is a Prompt Shaper (intent/domain + headers), vectors persist as NumPy `.pkl` snapshots (Chroma paused), and ingestion currently handles plain/unformatted text files.
 
 ```text
                                      ┌───────────────────────────────────┐
@@ -7,10 +10,10 @@
  User adds / updates docs  ─────────►│ 1  DocumentLoader (paths / watch) │
                                      │ 2  Chunker  (recursive splitter)  │
                                      │ 3  Embedder (E5 / BGE model)      │
-                                     │ 4  VectorStore.add() (Chroma)     │
+                                     │ 4  VectorStore.add() (NumPy .pkl) │
                                      └───────────────────────────────────┘
                          ▲              ▲
-                         │ builds       │ builds
+                         │ builds       │ planned
                          │              │
                          │              └──▶ 📇 FileManifest (path, sha, mtime, type)
                          │
@@ -21,14 +24,14 @@
 [User Prompt] ───▶ 🎛️  Streamlit GUI
                     ├── Prompt box (you)
                     ├── ON/OFF file checkboxes  (+ “Exact File Lock”)
-                    ├── Role presets (REQ/ARCH/CODE/TEST)
+                    ├── Prompt Shaper panel (intent/domain + headers)
                     ├── Agent toggles (A1..A4), Mode (INTP/ENTJ…)
                     ├── Model picker + cost estimator
                     └── Super-Prompt preview (editable, source of truth)
 
                     ▼
                  🧠 Controller
-                    ├── A2 Role Router (suggest; your presets override)
+                    ├── A2 Prompt Shaper (propose intent/domain + headers; you override)
                     ├── A1 Deterministic Code Injector (files you named)
                     │     └─ emits:  ❖ FILES section (FULL or PACK), locked if chosen
                     ├── Eligibility Pool (from your ON/OFF checkboxes / presets)
@@ -42,119 +45,146 @@
                     │     └─ Authority order:
                     │        [Hard Rules] → [Project Memory] → [❖ FILES]
                     │        → [S_ctx] → [Your Task/Format/Mode]
-                    ├── 🛠️ ToolDispatcher (calc:/py: when explicitly asked)
+                    ├── 🛠️ ToolDispatcher (calc:/py: when explicitly asked; future)
                     ├── 📡 LLMClient (model call + cost)
                     └── 📊 Transparency panel (kept/dropped chunks, reasons)
 
                     ▼
         🖥️  Streamlit GUI (answer, citations, FILES block, costs, logs)
-```
+````
 
-* The top half (Ingestion→VectorStore) and your original query path (Retriever→Reranker→PromptBuilder→LLMClient) remain as you designed. I’ve added **FileManifest** and the **four agents** in the controller path, plus an **Eligibility Pool** that matches your ON/OFF checkboxes.&#x20;
-* Class-level mapping stays compatible with your UML: `DocumentLoader`, `Chunker`, `Embedder`, `VectorStore`, `Retriever`, `Reranker`, `PromptBuilder`, `LLMClient`, `ToolDispatcher`, `Controller`, `StreamlitUI`. We’re just inserting agent calls inside `Controller`, which is precisely how your packages are already arranged.&#x20;
-* This still satisfies your requirements spec (dense top-k → cross-encoder rerank; prompt composition; UI transparency). Only the **attention sliders** are conceptually replaced by **ON/OFF eligibility**, which your spec tolerates because weights were always a UI concern, not a hard contract.&#x20;
+* The top half (Ingestion→VectorStore) is unchanged in flow, but **vectors persist as NumPy `.pkl`** (Chroma paused due to env issue). **FileManifest** is planned (path/sha/mtime/type).
+* The **four agents** now include **A2 Prompt Shaper** (not only role routing; it proposes full headers), and the **Eligibility Pool** mirrors your GUI ON/OFF file controls.
+* The query path stays: **Retriever → Reranker → PromptBuilder → LLMClient**, with **NLI gating + Condenser** inserted to control/condense context. Attention sliders are replaced by explicit **ON/OFF eligibility**.
 
 ---
 
-## Agent-by-agent (precise responsibilities, simple and practical)
+## Ingestion & Memory
 
-### Agent 1 — Deterministic Code Injector (DCI)  ➜ “❖ FILES” section
+* **DocumentLoader**: discovers files under `data/doc_raw/`.
 
-**What it is:** The **only** agent allowed to inject full code/config files you explicitly name (e.g., `handler.py`, `main.tf`, `docker-compose.yml`). It does *no* ranking or retrieval.
-**Inputs:** your prompt; FileManifest; GUI “Exact File Lock” toggle; ON/OFF file selections.
-**Outputs:** a **FILES** block added to the Super-Prompt, in this standard shape:
+  * **Current**: plain/unformatted text (`.txt`, `.md`, `.json`, `.yml`).
+  * **Planned**: rich/binary (`.pdf`, `.docx`).
+* **Chunker**: token-aware overlapping windows.
+* **Embedder**: E5/BGE family (configurable).
+* **VectorStore**: local persistence.
 
-```
-## FILES (locked=yes/no)
-- C:\path\to\handler.py   [included verbatim]
-```
+  * **Current**: NumPy-backed `.pkl` snapshots (Chroma disabled temporarily).
+  * **Planned**: on-disk Chroma once stable in this environment.
+* **📇 FileManifest (planned)**: `path`, `sha256`, `mtime`, `type` to support deterministic inclusion and change detection.
 
-```python
-# handler.py
-...entire content or PACK (if very large)...
-```
+---
 
+## Agent-by-agent (precise responsibilities)
+
+### A1 — Deterministic Code Injector (DCI)  ➜ “❖ FILES” section
+
+**What:** The only agent allowed to inject **full** code/config you explicitly name (e.g., `handler.py`, `main.tf`, `docker-compose.yml`). No ranking or retrieval.
+
+**Inputs:** your prompt; FileManifest (when available); GUI “Exact File Lock”; ON/OFF selections.
+**Output:** top-level **❖ FILES** block (FULL; or **PACK** if file is huge).
 **Policy (deterministic):**
 
-* If you **explicitly name** a code/config file ⇒ include it **FULL** (or **PACK** if it exceeds a safe limit).
-* If **Exact File Lock = ON** ⇒ no other documents may enter from retrieval (you chose a laser task).
-* Never touches Markdown docs; those are handled by retrieval.
-  **Why here:** Guarantees your referenced files are present *exactly*, a capability missing in a vanilla RAG path. (Your original design couldn’t *guarantee* deterministic file presence.)&#x20;
+* If you explicitly name a code/config file ⇒ include **FULL** (or **PACK** if over limit).
+* If **Exact File Lock = ON** ⇒ retrieval path is skipped (laser task).
+* Markdown/notes remain in retrieval; A1 targets code/config deterministically.
 
 ---
 
-### Agent 2 — Role Router (soft suggestion)
+### A2 — Prompt Shaper (intent/domain + meta-prompt headers)
 
-**What it is:** A tiny classifier that reads your prompt and proposes `{REQ, ARCH, CODE, TEST}`.
-**Inputs:** your prompt text (+ optional recent chat history with decay if you enable it).
-**Outputs:** role suggestions + confidence.
-**Authority:** **Your role presets/checkboxes always override** its suggestion.
-**Why here:** Reduces clicks when you forget to flip a role, but never steals control. This matches your “commander–autopilot” ethos and keeps the system aligned with your Requirements/Architecture separation.&#x20;
+**What:** Lightweight **prompt shaper** that suggests task **intent** and **domain**, and proposes structured headers for the Super-Prompt.
 
----
+**Inputs:** raw query + optional project state.
+**Outputs (advisory):**
 
-### Agent 3 — NLI Gate (semantic keep/drop)
+* **intent** (e.g., explain, design, implement, refactor, debug, test, review, plan, compare, decide, compute, translate, generate, …)
+* **domain** (software, AWS, research, writing, legal, music, …)
+* **headers**: `SYSTEM, AUDIENCE, PURPOSE, TONE, CONFIDENCE, RESPONSE DEPTH, OUTPUT FORMAT` (may suggest `CHECKLIST/EXAMPLE`)
 
-**What it is:** A **gatekeeper** that filters retrieved chunks using textual entailment with the active role(s).
-**Inputs:** query, reranked candidates, active role(s).
-**Outputs:** only **supporting** chunks (keeps), with scores; drops contradictory/irrelevant ones.
-**Control:** you expose a **Strictness (θ)** knob in the GUI (low = exploratory, high = strict).
-**Why here:** Prevents “nice-but-irrelevant” context from entering your Super-Prompt—something plain dense+rerank can’t guarantee. It’s the single biggest quality/correctness upgrade beyond your baseline. (Your spec already has rerank; the NLI filter sits right after it.)&#x20;
+**Implementation:**
 
----
-
-### Agent 4 — Context Condenser (structured pack)
-
-**What it is:** A summarizer that turns the **kept** chunks into a compact, **cited** block the LLM can reliably use.
-**Inputs:** kept chunks + metadata.
-**Outputs:** `S_ctx` with **three sections**:
-
-* **Facts** (copy minimal exacts like ARNs, paths, code lines)
-* **Constraints** (decisions, security/cost limits, acceptance criteria)
-* **Open Issues** (what’s missing/uncertain)
-
-**Why here:** Stops prompt bloat, increases grounding, and gives you a single, inspectable block below the ❖ FILES section. Fits cleanly into your existing `PromptBuilder` and UI (citations already part of your spec).&#x20;
+* Uses a small LLM (e.g., GPT-4o-mini) with **deterministic templates as fallback**.
+* May suggest defaults for downstream strictness (e.g., higher NLI θ for implement/debug).
+* **You always review/override** in the GUI.
 
 ---
 
-## The rest of the pipeline (what stays as-is, with small clarifications)
+### A3 — NLI Gate (semantic keep/drop)
 
-* **Ingestion Pipeline**: unchanged; adds **FileManifest** (path, sha256, mtime, type) so Agent 1 can resolve exact files deterministically. Your `DocumentLoader → Chunker → Embedder → VectorStore` remains the backbone.&#x20;
-* **Retriever & Reranker**: unchanged core; now take the **Eligibility Pool** (from ON/OFF checkboxes) and any role filter (from you / A2). This is still “dense top-k → cross-encoder rerank,” as in your spec.&#x20;
-* **PromptBuilder**: add the **Authority Order** you want:
-  `[Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Your Task & Output Format] → [Optional Mode (INTP/ENTJ…)]`.
-  This aligns with your PromptGenerator schema and prevents style from outranking facts.&#x20;
-* **ToolDispatcher**: remains opt-in (`calc:` / `py:`), exactly as in your current design.&#x20;
-* **LLMClient**: same; add a **cost estimator** that reads token counts from the Super-Prompt and your chosen model pricing (your audit already suggested small client add-ons like this).&#x20;
-* **Streamlit UI**: same layout; swap sliders → **ON/OFF checkboxes**; add toggles for **Exact File Lock** and **Agent Strictness**; keep the **Super-Prompt preview** fully editable (the final source of truth).&#x20;
+**What:** Filters reranked chunks via natural-language inference (entailment) to keep only those that **support** the task.
+
+**Inputs:** query, reranked candidates, Prompt Shaper hints.
+**Output:** kept chunks (+ scores); drops irrelevant/contradictory.
+**Control:** **Strictness (θ)** in GUI (low = exploratory; high = strict).
+**Why:** Prevents “nice-but-irrelevant” context from bloating the Super-Prompt.
 
 ---
 
-## End-to-end narrative (what happens when you click)
+### A4 — Context Condenser (structured pack → `S_ctx`)
 
-1. **You** type a prompt and (optionally) name explicit files; choose roles/presets; turn **Exact File Lock** ON or OFF; pick model; see estimated cost.&#x20;
-2. **A2** proposes roles (you can ignore).
-3. **A1** injects your named code/config files **verbatim** into `❖ FILES`; if **lock ON**, this alone may be your whole context.
-4. If **lock OFF**: **Retriever → Reranker → A3 NLI Gate → A4 Condenser** produce `S_ctx` (short, cited).
-5. **PromptBuilder** assembles the Super-Prompt in the fixed authority order; **you can still edit it**.&#x20;
-6. **ToolDispatcher** runs only if you asked for it.
-7. **LLMClient** sends; UI shows answer, citations, ❖ FILES, token/cost, and “kept vs dropped” evidence with reasons.&#x20;
+**What:** Summarizes **kept** chunks into a compact, **cited** block the LLM can reliably use.
 
----
+**Output:** `S_ctx` with three sections:
 
-## Why this fits your repo and specs without churn
+* **Facts** — minimal exacts (paths, code lines, IDs)
+* **Constraints** — decisions, limits, acceptance criteria
+* **Open Issues** — gaps/uncertainties
 
-* It **preserves** your modular classes and package tree (only adds Agent calls inside `Controller`), exactly the way your **UML** and **Architecture** files intend.
-* It **completes** your **Requirements** by adding the two missing quality levers professionals rely on (NLI gate + condenser) and by formalizing the **Super-Prompt** composition you already standardize in **PromptGenerator**.
-* It **aligns** with the earlier **audit** suggestions (explicit value objects like `DocScore`, truncation/cost awareness, simple logging) without forcing any heavy framework.&#x20;
+Small LLM is sufficient (e.g., GPT-4o-mini). This reduces tokens while preserving grounding.
 
 ---
 
-## TL;DR (your four must-have agents, one line each)
+## Prompt Orchestration
 
-* **A1 DCI:** Include named code/config files **verbatim** (or structured PACK) as a top **FILES** block. Deterministic.
-* **A2 Router:** Suggest roles; you’re the boss.
-* **A3 NLI Gate:** Only let **supporting** chunks through (semantic keep/drop).
-* **A4 Condenser:** Compress kept chunks into **Facts / Constraints / Open Issues** with citations.
+Fixed authority order (keeps facts above style):
 
-This is the simplest, most **controllable** agentic layer over your existing system that meaningfully increases correctness and focus—while keeping *you* in command.
+```
+[Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Your Task & Output Format] → [Optional Mode]
+```
+
+* **Hard Rules** — non-negotiables (e.g., do not alter code blocks; follow exact spec boundaries).
+* **Project Memory** — persistent decisions and invariants (stack, naming, policies).
+* **S\_ctx** — cited, structured pack from A4 (Facts / Constraints / Open Issues).
+* **Optional Mode** — style/voice presets (e.g., INTP/ENTJ) applied after facts.
+
+---
+
+## Deterministic vs. Model-Driven
+
+* **Deterministic:** A1 (DCI), File ON/OFF eligibility, PromptBuilder authority application.
+* **Model-driven:** A2 (Prompt Shaper), Reranker (cross-encoder/LLM), A3 (NLI Gate), A4 (Condenser).
+
+> Note: **Reranker** reorders candidates (scores order) and is not an agent because it does not inject/exclude by policy.
+
+---
+
+## End-to-End Narrative (what happens when you click)
+
+1. You type a prompt, optionally name files, toggle **Exact File Lock**, pick model, see cost.
+2. **A2 Prompt Shaper** proposes intent/domain + headers (you edit/approve).
+3. **A1 DCI** injects named files into **❖ FILES** (FULL/PACK). If locked, retrieval is skipped.
+4. If unlocked: **🔍 Retriever → 🏅 Reranker → A3 NLI Gate → A4 Condenser** emit **`S_ctx`** (short, cited).
+5. **PromptBuilder** assembles the Super-Prompt with the fixed authority order; you can still edit.
+6. **🛠️ ToolDispatcher** runs only if explicitly requested.
+7. **📡 LLMClient** sends; GUI shows answer, citations, **❖ FILES**, token/cost, and **📊 Transparency** (kept/dropped with reasons).
+
+---
+
+## Why this fits the repo and requirements
+
+* Preserves the modular packages (agents live in Controller).
+* Adds quality levers beyond vanilla RAG (NLI gate + condenser) and makes Super-Prompt composition transparent.
+* Aligns with requirements: dense top-k → rerank, prompt composition, local-first control, UI transparency.
+
+---
+
+## TL;DR
+
+* **A1 DCI** — Deterministic file injection (FILES block; optional lock).
+* **A2 Prompt Shaper** — Suggests intent/domain + headers; you approve.
+* **A3 NLI Gate** — Keep only semantically supporting chunks.
+* **A4 Condenser** — Compress to cited Facts / Constraints / Open Issues.
+
+
+
