@@ -1,9 +1,10 @@
 """
 Retriever
 =========
-Coordinates vector search, attention weighting and reranking.
+Coordinates vector search and reranking. In the new design, per-file eligibility
+is handled in the controller (Exact File Lock / ON-OFF pool) before retrieval.
 """
-from typing import List, Dict
+from typing import List
 
 class DocScore:
     """Lightweight value object pairing *doc_id* with *score*."""

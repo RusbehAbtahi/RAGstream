@@ -9,11 +9,12 @@ import logging
 class SimpleLogger:
     """Minimal façade for standard logging (single responsibility: output)."""
     _logger = logging.getLogger("ragstream")
-    _logger.setLevel(logging.INFO)
-    _handler = logging.StreamHandler()
-    _formatter = logging.Formatter("[%(asctime)s] %(levelname)s : %(message)s")
-    _handler.setFormatter(_formatter)
-    _logger.addHandler(_handler)
+    if not _logger.handlers:
+        _logger.setLevel(logging.INFO)
+        _handler = logging.StreamHandler()
+        _formatter = logging.Formatter("[%(asctime)s] %(levelname)s : %(message)s")
+        _handler.setFormatter(_formatter)
+        _logger.addHandler(_handler)
 
     @classmethod
     def log(cls, msg: str) -> None:

@@ -1,12 +1,12 @@
 """
-AttentionWeights
-================
-Applies user-controlled slider weights to raw similarity scores.
+AttentionWeights (legacy shim)
+==============================
+Kept for legacy tests. In the current design, eligibility is controlled via
+ON/OFF per-file toggles and Exact File Lock in the UI, not sliders.
 """
 from typing import Dict
 
 class AttentionWeights:
-    """Holds per-document weights (0-1) and applies them to similarity scores."""
+    """No-op weight application kept for backward compatibility."""
     def weight(self, scores: Dict[str, float]) -> Dict[str, float]:
-        """Return re-weighted scores (dummy implementation)."""
         return scores

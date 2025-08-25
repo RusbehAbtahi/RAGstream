@@ -4,7 +4,6 @@ ToolDispatcher
 Detects `calc:` / `py:` prefixes in the user prompt and routes to the tool.
 """
 from typing import Tuple
-from ragstream.tooling.registry import ToolRegistry
 
 class ToolDispatcher:
     """Front controller for local tool execution."""

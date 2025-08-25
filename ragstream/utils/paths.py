@@ -13,12 +13,16 @@ class _Paths(TypedDict):
     data:        Path
     raw_docs:    Path
     chroma_db:   Path
+    vector_pkls: Path
     logs:        Path
 
+ROOT = Path(__file__).resolve().parents[2]
+
 PATHS: _Paths = {
-    "root":      Path(__file__).resolve().parents[2],
-    "data":      Path(__file__).resolve().parents[2] / "data",
-    "raw_docs":  Path(__file__).resolve().parents[2] / "data" / "doc_raw",
-    "chroma_db": Path(__file__).resolve().parents[2] / "data" / "chroma_db",
-    "logs":      Path(__file__).resolve().parents[2] / "logs",
+    "root":        ROOT,
+    "data":        ROOT / "data",
+    "raw_docs":    ROOT / "data" / "doc_raw",
+    "chroma_db":   ROOT / "data" / "chroma_db",   # planned
+    "vector_pkls": ROOT / "data" / "vector_pkls", # current persistence
+    "logs":        ROOT / "logs",
 }

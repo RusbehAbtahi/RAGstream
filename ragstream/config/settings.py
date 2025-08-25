@@ -2,7 +2,7 @@
 Settings
 ========
 Loads environment variables **once** at start-up so that every module accesses
-configuration via `Settings.get("OPENAI_API_KEY")` instead of scattered `os.getenv`.
+configuration via Settings.get("OPENAI_API_KEY") instead of scattered os.getenv.
 """
 import os
 from typing import Any, Dict

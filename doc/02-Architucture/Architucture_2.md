@@ -173,7 +173,7 @@ Fixed authority order (keeps facts above style):
 
 ## Why this fits the repo and requirements
 
-* Preserves the modular packages (agents live in Controller).
+* Preserves the modular packages (Controller orchestrates agents A1–A4; implementations live in ragstream/app/agents/).
 * Adds quality levers beyond vanilla RAG (NLI gate + condenser) and makes Super-Prompt composition transparent.
 * Aligns with requirements: dense top-k → rerank, prompt composition, local-first control, UI transparency.
 

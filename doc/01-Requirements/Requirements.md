@@ -1,12 +1,12 @@
 # RAG Stream — **Comprehensive Requirements Specification**
 
-*Version 0.9 • 2025-08-05*
+*Version 1.0 • 2025-08-25*
 
 ---
 
 ## 1  Purpose & Scope
 
-RAG Stream is a **local-first retrieval-augmented generation (RAG) workbench** that lets a power-user ingest arbitrary documents, steer retrieval weights via interactive *Attention Sliders*, optionally execute local tools (math / Python), and obtain a fully-cited answer from a remote or local LLM—all inside a transparent Streamlit UI.
+RAG Stream is a **local-first retrieval-augmented generation (RAG) workbench** that lets a power-user ingest documents, deterministically include/exclude files via ON/OFF toggles or an Exact File Lock, optionally execute local tools (math / Python), and obtain a fully-cited answer from a remote or local LLM—all inside a transparent Streamlit UI with cost estimation and agent logs.
 
 ---
 
@@ -26,18 +26,16 @@ RAG Stream is a **local-first retrieval-augmented generation (RAG) workbench** t
 ```
 User ──▶ Streamlit GUI ──▶ Controller
                    ▲          │
-                   │          ├──▶ Retriever ──▶ VectorStore (Chroma on-disk)
-                   │          │
-                   │          ├──▶ AttentionWeights
-                   │          │
+                   │          ├──▶ A2 Prompt Shaper → headers
+                   │          ├──▶ A1 DCI → ❖ FILES (lock/full/pack)
+                   │          ├──▶ Retriever → Reranker → A3 NLI Gate → A4 Condenser (S_ctx)
+                   │          ├──▶ PromptBuilder (authority order)
                    │          ├──▶ ToolDispatcher ──▶ {MathTool | PyTool}
-                   │          │
-                   │          ├──▶ PromptBuilder ──▶ LLMClient (OpenAI GPT-4o)
-                   │          │
-                   │          └──▶ Logging / Paths utilities
-DocumentLoader ◀───┘          │
-     ▲                         └──▶ Settings (env / .env / CLI)
-     └─ Chunker ─ Embedder ─ VectorStore.add()
+                   │          ├──▶ LLMClient (OpenAI GPT-4o or local)
+                   │          └──▶ Transparency / Cost / Logs
+DocumentLoader ◀───┘
+     ▲
+     └─ Chunker ─ Embedder ─ VectorStore.add() (.pkl snapshots; Chroma paused)
 ```
 
 ---
@@ -46,30 +44,36 @@ DocumentLoader ◀───┘          │
 
 ### 4.1  Ingestion / Memory
 
-| ID     | Requirement                                                                 | Priority |
-| ------ | --------------------------------------------------------------------------- | -------- |
-| ING-01 | Load `.pdf`, `.md`, `.txt`, `.docx` from *drag-and-drop* or watched folder. | Must     |
-| ING-02 | RecursiveTextSplitter (window = 1 024 tok, overlap = 200 tok).              | Must     |
-| ING-03 | Default embedding model **BGE-Large-v3** via `sentence_transformers`.       | Must     |
-| ING-04 | Persist and delta-update Chroma collection on disk (`./data/chroma_db`).    | Must     |
-| ING-05 | Emit ingestion log (docs added / skipped / updated).                        | Should   |
+| ID     | Requirement                                                           | Priority |
+| ------ | --------------------------------------------------------------------- | -------- |
+| ING-01 | Load `.txt`, `.md`, `.json`, `.yml`.                                  | Must     |
+| ING-02 | Planned: support `.pdf`, `.docx` via drag-and-drop or watched folder. | Planned  |
+| ING-03 | RecursiveTextSplitter (window = 1 024 tok, overlap = 200 tok).        | Must     |
+| ING-04 | Persist vectors as NumPy `.pkl` snapshots.                            | Must     |
+| ING-05 | Planned: Chroma collection on disk once stable.                       | Planned  |
+| ING-06 | Planned: FileManifest with `path`, `sha`, `mtime`, `type`.            | Planned  |
+| ING-07 | Emit ingestion log (docs added / skipped / updated).                  | Should   |
 
-### 4.2  Retrieval & Ranking
+### 4.2  Retrieval & Agents
 
 | ID     | Requirement                                                           | Priority |
 | ------ | --------------------------------------------------------------------- | -------- |
 | RET-01 | Cosine top-k search (k = 20) with embedder from 4.1.                  | Must     |
-| RET-02 | Multiply each document score by UI-supplied slider weight  wᵢ∈\[0,1]. | Must     |
-| RET-03 | Cross-encoder rerank with `mixedbread-ai/mxbai-rerank-xsmall-v1`.     | Must     |
-| RET-04 | Expose retriever latency in the UI status bar.                        | Should   |
+| RET-02 | Cross-encoder rerank with `mixedbread-ai/mxbai-rerank-xsmall-v1`.     | Must     |
+| RET-03 | Eligibility Pool: ON/OFF checkboxes per file.                         | Must     |
+| RET-04 | Exact File Lock disables retrieval and injects only named ❖ FILES.    | Must     |
+| RET-05 | A3 NLI Gate filters reranked chunks by entailment with strictness θ.  | Must     |
+| RET-06 | A4 Condenser emits cited `S_ctx` (Facts / Constraints / Open Issues). | Must     |
+| RET-07 | Expose retriever latency in the UI status bar.                        | Should   |
 
 ### 4.3  Prompt Orchestration
 
-| ID     | Requirement                                                                       | Priority |
-| ------ | --------------------------------------------------------------------------------- | -------- |
-| ORC-01 | Build system prompt with slots: `{{question}}`, `{{context}}`, `{{tool_output}}`. | Must     |
-| ORC-02 | Inject `<source_i>` tags for cited chunks for UI highlighting.                    | Must     |
-| ORC-03 | Circular limit: prompt ≤ 8 k tokens incl. context & tool output.                  | Must     |
+| ID     | Requirement                                                                                             | Priority |
+| ------ | ------------------------------------------------------------------------------------------------------- | -------- |
+| ORC-01 | Build system prompt with slots: `{{question}}`, `{{❖ FILES}}`, `{{S_ctx}}`, `{{tool_output}}`.          | Must     |
+| ORC-02 | Apply fixed authority order: \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode]. | Must     |
+| ORC-03 | Inject `<source_i>` tags for cited chunks for UI highlighting.                                          | Must     |
+| ORC-04 | Circular limit: prompt ≤ 8 k tokens incl. context & tool output.                                        | Must     |
 
 ### 4.4  Tooling
 
@@ -88,39 +92,42 @@ DocumentLoader ◀───┘          │
 | LLM-02 | Pluggable local model via `ollama run llama3:instruct`, flag `--local`. | Should   |
 | LLM-03 | Stream tokens to UI with first byte < 1 s.                              | Must     |
 | LLM-04 | Retry on HTTP 429/5xx with exponential back-off max 3 tries.            | Should   |
+| LLM-05 | Provide estimated cost for composed prompt.                             | Must     |
 
 ### 4.6  UI / App
 
-| ID    | Requirement                                                         | Priority |
-| ----- | ------------------------------------------------------------------- | -------- |
-| UI-01 | Two-pane layout: left = prompt & sliders, right = answer & sources. | Must     |
-| UI-02 | Show chunk pills with score × weight × rerank; click opens raw doc. | Should   |
-| UI-03 | Dark & light theme auto-switch (`streamlit-theme`).                 | Could    |
-| UI-04 | Download chat history as Markdown with citations.                   | Should   |
+| ID    | Requirement                                                                                     | Priority |
+| ----- | ----------------------------------------------------------------------------------------------- | -------- |
+| UI-01 | Prompt box, ON/OFF file checkboxes, Exact File Lock, Prompt Shaper panel, Agent toggles, Modes. | Must     |
+| UI-02 | Super-Prompt preview (editable).                                                                | Must     |
+| UI-03 | Transparency panel shows kept/dropped chunks with reasons.                                      | Must     |
+| UI-04 | Show ❖ FILES block and `S_ctx`.                                                                 | Must     |
+| UI-05 | Model picker + cost estimator.                                                                  | Must     |
+| UI-06 | Answer + citations view.                                                                        | Must     |
+| UI-07 | Download chat history as Markdown with citations.                                               | Should   |
+| UI-08 | Dark & light theme auto-switch (`streamlit-theme`).                                             | Could    |
 
 ---
 
 ## 5  Non-Functional Requirements
 
-| Category          | Target                                                              |
-| ----------------- | ------------------------------------------------------------------- |
-| **Latency**       | < 3 s p95 prompt→first token with 1 M-token Chroma store on M2-Pro. |
-| **Memory**        | ≤ 6 GB RAM peak (embeddings loaded on demand).                      |
-| **Extensibility** | Add a new tool or embedding model without touching > 1 file.        |
-| **Observability** | Structured logs JSON → `ragstream/utils/logging.py`.                |
-| **Test coverage** | Unit 80 % (`pytest` + `hypothesis` for splitter & retriever).       |
-| **Security**      | Tool sandbox runs in separate process; no network in math/py tools. |
-| **Licensing**     | Apache-2.0 except external models retaining original licenses.      |
-
----
-
+| Category          | Target                                                               |
+| ----------------- | -------------------------------------------------------------------- |
+| **Latency**       | < 3 s p95 prompt→first token with 1 M-token `.pkl` snapshot store.   |
+| **Memory**        | ≤ 6 GB RAM peak (embeddings loaded on demand).                       |
+| **Extensibility** | Add a new tool, agent, or embedding model without touching > 1 file. |
+| **Observability** | Structured logs JSON → `ragstream/utils/logging.py`.                 |
+| **Test coverage** | Unit 80 % (`pytest` + `hypothesis` for splitter & retriever).        |
+| **Security**      | Tool sandbox runs in separate process; no network in math/py tools.  |
+| **Licensing**     | Apache-2.0 except external models retaining original licenses.       |
 ## 6  Technology Stack
 
 | Layer           | Library / Service                                   | Version (Aug 2025)                |
 | --------------- | --------------------------------------------------- | --------------------------------- |
 | GUI             | Streamlit                                           | 1.38                              |
 | Embeddings      | `bge-large-en-v3`, `E5-Mistral` (optional)          | via `sentence_transformers = 3.0` |
-| Vector DB       | Chroma                                              | 0.10                              |
+| Vector Store    | NumPy `.pkl` snapshots (current)                    | -                                 |
+| Planned DB      | Chroma                                              | 0.10                              |
 | Cross-encoder   | `mixedbread-ai/mxbai-rerank-xsmall-v1`              | 🤗 `cross-encoder = 0.6`          |
 | LLM API         | OpenAI (`openai>=1.15.0`)                           | GPT-4o                            |
 | Local LLM (opt) | Ollama                                              | 0.2                               |
@@ -134,16 +141,25 @@ DocumentLoader ◀───┘          │
 ## 7  Directory / Module Tree
 
 ```
+Here’s the corrected tree with agents in their own files and the controller just orchestrating them:
+
+```
 .
 ├── .gitignore
 ├── data/
-│   ├── chroma_db/
+│   ├── chroma_db/         # planned
 │   └── doc_raw/
 ├── ragstream/
 │   ├── __init__.py
 │   ├── app/
-│   │   ├── controller.py
-│   │   └── ui_streamlit.py
+│   │   ├── controller.py        # orchestrates agents A1–A4 (implemented in app/agents/)
+│   │   ├── ui_streamlit.py
+│   │   └── agents/
+│   │       ├── __init__.py
+│   │       ├── a1_dci.py            # A1 Deterministic Code Injector
+│   │       ├── a2_prompt_shaper.py  # A2 Prompt Shaper
+│   │       ├── a3_nli_gate.py       # A3 NLI Gate
+│   │       └── a4_condenser.py      # A4 Context Condenser
 │   ├── config/
 │   │   ├── __init__.py
 │   │   └── settings.py
@@ -155,7 +171,7 @@ DocumentLoader ◀───┘          │
 │   │   └── vector_store.py      # VectorStore
 │   ├── retrieval/
 │   │   ├── __init__.py
-│   │   ├── attention.py         # AttentionWeights
+│   │   ├── attention.py         # replaced by eligibility toggles
 │   │   ├── reranker.py          # Reranker
 │   │   └── retriever.py         # Retriever
 │   ├── orchestration/
@@ -176,6 +192,8 @@ DocumentLoader ◀───┘          │
 └── pyproject.toml  (or requirements.txt)
 ```
 
+```
+
 ---
 
 ## 8  Open Issues / Risks
@@ -186,28 +204,40 @@ DocumentLoader ◀───┘          │
 | SymPy sandbox leakage via `eval`.                                 | Use `sympy.parsing.sympy_parser` + restricted globals.       |
 | Streamlit session state resets when file watcher triggers reload. | Debounce file-watch events; persist state to JSON.           |
 | Embedding model size ≈ 2 GB > memory on low-spec laptops.         | Offer `bge-base-v1` fallback; lazy-load model on first call. |
+| FileManifest not yet implemented.                                 | Plan incremental rollout after `.pkl` stable.                |
+| Chroma paused due to environment issues.                          | Resume once stable in deployment environment.                |
 
 ---
 
 ## 9  Acceptance Criteria (5-day MVP)
 
-1. Ingest at least **1 000** Markdown pages; run dense + rerank retrieval; answer in ≤ 5 s p95.
-2. Attention slider demonstrably changes ranking order live.
-3. `calc: 3*(4+5)` prompt returns `27` inline.
-4. Streamlit UI shows citations and chunk pop-ups.
-5. All unit tests pass; `pytest` reports ≥ 80 % coverage.
+1. Ingest at least **1 000** Markdown / text pages; run dense + rerank retrieval; answer in ≤ 5 s p95.
+2. ❖ FILES block deterministically injects named files and respects Exact File Lock.
+3. `S_ctx` (Facts / Constraints / Open Issues) generated with citations.
+4. Prompt assembled in fixed authority order.
+5. Transparency panel shows kept/dropped chunks with reasons.
+6. Cost estimator visible and accurate.
+7. `calc: 3*(4+5)` prompt returns `27` inline.
+8. Streamlit UI shows citations and ❖ FILES block.
+9. All unit tests pass; `pytest` reports ≥ 80 % coverage.
 
 ---
 
 ## 10  Glossary
 
-| Term                 | Meaning                                                       |
-| -------------------- | ------------------------------------------------------------- |
-| **RAG**              | Retrieval-Augmented Generation.                               |
-| **Attention Slider** | UI widget assigning manual weights to per-document groups.    |
-| **ToolDispatcher**   | Router that detects and executes local tools before LLM call. |
-| **Chunk**            | Fixed-size text window (≈ 500 tokens) stored with embedding.  |
+| Term                   | Meaning                                                       |
+| ---------------------- | ------------------------------------------------------------- |
+| **RAG**                | Retrieval-Augmented Generation.                               |
+| **Eligibility Pool**   | ON/OFF per-file toggles controlling retrieval.                |
+| **Exact File Lock**    | Mode skipping retrieval and injecting only named ❖ FILES.     |
+| **❖ FILES**            | Deterministically injected file contents (via A1).            |
+| **S\_ctx**             | Condensed cited context (Facts / Constraints / Open Issues).  |
+| **Prompt Shaper (A2)** | Suggests intent/domain + headers.                             |
+| **NLI Gate (A3)**      | Filters reranked chunks by entailment.                        |
+| **Condenser (A4)**     | Compresses context to `S_ctx`.                                |
+| **ToolDispatcher**     | Router that detects and executes local tools before LLM call. |
+| **Chunk**              | Fixed-size text window (≈ 500 tokens) stored with embedding.  |
 
 ---
 
-> **Status:** Spec validated against current repo layout (commit *HEAD* on 2025-08-05). Any structural change should update sections 4 & 7 and increment spec version.
+> **Status:** Spec validated against Architecture\_2.md (commit *HEAD* on 2025-08-25). Any structural change should update sections 4 & 7 and increment spec version.

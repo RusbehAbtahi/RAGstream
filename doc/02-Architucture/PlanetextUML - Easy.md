@@ -18,7 +18,12 @@ package "Config & Utils" {
     }
 
     class Paths {
-        + PATHS : TypedDict(root:Path, data:Path, raw_docs:Path, chroma_db:Path, vector_pkls:Path, logs:Path)
+        + PATHS : TypedDict(root:Path,\n\
+                            data:Path,\n\
+                            raw_docs:Path,\n\
+                            chroma_db:Path,\n\
+                            vector_pkls:Path,\n\
+                            logs:Path)
         + ROOT  : Path
     }
 
@@ -40,7 +45,9 @@ package "Ingestion / Memory" {
     }
 
     class Chunker {
-        + split(file_path:str, text:str, chunk_size:int=500, overlap:int=100) : List[Tuple[str,str]]
+        + split(file_path:str, text:str,\n\
+                chunk_size:int=500,\n\
+                overlap:int=100) : List[Tuple[str,str]]
     }
 
     class Embedder {
@@ -50,7 +57,8 @@ package "Ingestion / Memory" {
     }
 
     interface IVectorStore {
-        + add(ids:List[str], vectors:List[List[float]], meta:List[Dict]) : None
+        + add(ids:List[str], vectors:List[List[float]],\n\
+              meta:List[Dict]) : None
         + query(vector:List[float], k:int=10) : List[str]
         + snapshot(timestamp:str) : None
     }
@@ -71,8 +79,8 @@ package "Ingestion / Memory" {
         + add(ids,vectors,meta) : None
         + query(vector,k=10) : List[str]
         + snapshot(ts:str) : None
-        - client : chromadb.PersistentClient
-        - collection : chromadb.Collection
+        - client : chromadb.\n\ PersistentClient
+        - collection : chromadb.\n\ Collection
     }
 
     class VectorStoreRouter {
@@ -125,22 +133,27 @@ package "Retrieval & Ranking" {
 package "Agents (app/agents)" {
 
     class A1_DCI {
-        + build_files_block(named_files:List[str], lock:bool) : str
+        + build_files_block(named_files:List[str],\n\
+                            lock:bool) : str
         - pack_threshold_tokens : int
         - file_manifest : Optional[Any]
     }
 
     class A2_PromptShaper {
-        + propose(question:str) : Dict[str,str]  ' {intent, domain, headers}
+        + propose(question:str) :\n\
+         Dict[str,str]  ' {intent, domain, headers}
     }
 
     class A3_NLIGate {
-        + filter(candidates:List[str], question:str) : List[str]
+        + filter(candidates:List[str],\n\
+                 question:str) : List[str]
         - theta : float
     }
 
     class A4_Condenser {
-        + condense(kept:List[str]) : List[str]   ' S_ctx lines: Facts/Constraints/Open Issues
+        + condense(kept:List[str]\n\
+                   ) : List[str] \n\
+          ' S_ctx lines: Facts/Constraints/Open Issues
     }
 }
 
@@ -174,7 +187,8 @@ package "Local Tooling" {
     }
 
     class ToolDispatcher {
-        + maybe_dispatch(prompt:str) : Tuple[str,str]  ' (tool_output, stripped_prompt)
+        + maybe_dispatch(prompt:str) :\n\
+         Tuple[str,str]  ' (tool_output, stripped_prompt)
     }
 
     ToolDispatcher --> ToolRegistry
@@ -187,7 +201,11 @@ package "Local Tooling" {
 package "Prompt Orchestration" {
 
     class PromptBuilder {
-        + build(question:str, files_block:str, s_ctx:List[str], shape:Dict=None, tool:str=None) : str
+        + build(question:str,\n\
+                files_block:str,\n\
+                s_ctx:List[str],\n\
+                shape:Dict=None,\n\
+                tool:str=None) : str
         - template : str
     }
 
@@ -204,7 +222,9 @@ package "Prompt Orchestration" {
 package "Application Layer" {
 
     class AppController {
-        + handle(user_prompt:str, named_files:List[str], exact_lock:bool) : str
+        + handle(user_prompt:str,\n\
+                 named_files:List[str],\n\
+                 exact_lock:bool) : str
         - shaper : A2_PromptShaper
         - dci : A1_DCI
         - gate : A3_NLIGate
@@ -250,9 +270,11 @@ PromptBuilder ..> A1_DCI        : receives ❖ FILES
 PromptBuilder ..> A4_Condenser  : receives S_ctx
 
 ' Misc
+class AllClasses
 Settings ..> LLMClient : API keys/config
+
 Settings ..> Embedder  : API keys/config
-SimpleLogger ..> AllClasses: logging
+SimpleLogger ..> AllClasses : logging
 
 note right of AppController
   Authority order in PromptBuilder:

@@ -1,9 +1,9 @@
 """
 ToolRegistry
 ============
-Discovers all subclasses of BaseTool and exposes them via `.get(name)`.
+Discovers all subclasses of BaseTool and exposes them via .get(name).
 """
-from typing import Dict, Type
+from typing import Dict
 from ragstream.tooling.base_tool import BaseTool
 
 class ToolRegistry:

@@ -2,9 +2,8 @@
 LLMClient
 =========
 Thin adapter around OpenAI (or local model) providing streaming & retry.
+Also exposes a basic cost estimator for UI display.
 """
-from typing import List
-
 class LLMClient:
     """Handles completion calls and cost estimation."""
     def complete(self, prompt: str) -> str:
