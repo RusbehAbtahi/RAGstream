@@ -1,16 +1,12 @@
 """
 PromptBuilder
 =============
-Assembles the final Super-Prompt from:
-  - ❖ FILES (deterministic block by A1)
-  - S_ctx (Facts / Constraints / Open Issues by A4)
-  - tool_output (if any)
-and applies the fixed authority order:
+Composes the Super-Prompt with fixed authority order:
 [Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Task/Mode]
+(RECENT HISTORY may be shown for continuity; non-authoritative.)
 """
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 class PromptBuilder:
-    def build(self, question: str, files_block: str | None, s_ctx, shape=None, tool: str | None = None) -> str:
-        # assemble using the authority order from the docs (Hard Rules → Project Memory → ❖ FILES → S_ctx → Task/Mode)
+    def build(self, question: str, files_block: Optional[str], s_ctx: List[str], shape: Optional[Dict] = None) -> str:
         return "PROMPT"

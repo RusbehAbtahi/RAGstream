@@ -1,9 +1,8 @@
 """
 Paths
 =====
-Centralises all on-disk locations for the project so that a single import
-(`from ragstream.utils.paths import PATHS`) provides **typed** access to
-directories used across ingestion, vector store, caching, and logging.
+Centralises on-disk locations so a single import
+(`from ragstream.utils.paths import PATHS`) gives typed access.
 """
 from pathlib import Path
 from typing import TypedDict
@@ -24,5 +23,5 @@ PATHS: _Paths = {
     "raw_docs":    ROOT / "data" / "doc_raw",
     "chroma_db":   ROOT / "data" / "chroma_db",   # planned
     "vector_pkls": ROOT / "data" / "vector_pkls", # current persistence
-    "logs":        ROOT / "logs",
+    "logs":        ROOT / "logs",                 # present as a path; no persistent logging required
 }

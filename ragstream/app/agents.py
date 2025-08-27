@@ -1,13 +1,12 @@
 """
 Agents (A1..A4)
 ===============
-Controller-side agents:
-- A1 Deterministic Code Injector → builds ❖ FILES (FULL/PACK) and enforces Exact File Lock.
-- A2 Prompt Shaper → suggests intent/domain + headers (advisory).
-- A3 NLI Gate → keep/drop based on entailment with θ strictness.
-- A4 Context Condenser → outputs S_ctx (Facts / Constraints / Open Issues) with citations.
+- A1 Deterministic Code Injector → builds ❖ FILES and enforces Exact File Lock.
+- A2 Prompt Shaper → pass-1 propose headers; audit-2 may trigger one retrieval re-run on scope change.
+- A3 NLI Gate → keep/drop via entailment (θ strictness).
+- A4 Condenser → emits S_ctx (Facts / Constraints / Open Issues) with citations.
 """
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 
 class A1_DCI:
     def build_files_block(self, named_files: List[str], lock: bool) -> str:
@@ -15,7 +14,13 @@ class A1_DCI:
 
 class A2_PromptShaper:
     def propose(self, question: str) -> Dict[str, str]:
-        return {"intent": "explain", "domain": "software"}
+        return {"intent": "explain", "domain": "software", "headers": "H"}
+    def audit_and_rerun(self, shape: Dict[str, str], s_ctx: List[str]) -> bool:
+        """
+        Return True iff audit materially changes task scope (intent/domain),
+        allowing exactly one retrieval→A3→A4 re-run.
+        """
+        return False
 
 class A3_NLIGate:
     def __init__(self, theta: float = 0.6) -> None:

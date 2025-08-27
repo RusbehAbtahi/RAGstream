@@ -17,10 +17,16 @@ package "Config & Utils" {
         - _CACHE : Dict[str,Any]
     }
 
-    class Paths {
-        + PATHS : TypedDict(root:Path, data:Path, raw_docs:Path, chroma_db:Path, vector_pkls:Path, logs:Path)
-        + ROOT  : Path
-    }
+class Paths {
+  + PATHS : TypedDict
+  + ROOT  : Path
+}
+
+note as N1
+root:Path, data:Path
+raw_docs:Path, chroma_db:Path
+vector_pkls:Path, logs:Path
+end note
 
     class SimpleLogger {
         + log(msg:str)   : None
@@ -80,6 +86,15 @@ package "Ingestion / Memory" {
         - select_by_env() : IVectorStore
     }
 
+    ' --- ConversationMemory (read-only; two-layer, soft fading)
+    class ConversationMemory {
+        + get_recent(k:int=5) : List[Tuple[str,str]]      ' Layer-G (recency window)
+        + get_episodic() : List[Tuple[str,str]]           ' Layer-E (episodic, on-topic)
+        - k_default : int
+        - soft_fading : bool
+        - conflict_policy : str    ' ❖ FILES > newer > older (dedup)
+    }
+
     DocumentLoader --> Chunker : raw text
     Chunker --> Embedder : chunks
     Embedder --> IVectorStore : ids + vectors
@@ -131,7 +146,8 @@ package "Agents (app/agents)" {
     }
 
     class A2_PromptShaper {
-        + propose(question:str) : Dict[str,str]  ' {intent, domain, headers}
+        + propose(question:str) : Dict[str,str]           ' {intent, domain, headers}
+        + audit_and_rerun(shape:Dict, s_ctx:List[str]) : bool  ' may trigger one retrieval re-run
     }
 
     class A3_NLIGate {
@@ -145,49 +161,12 @@ package "Agents (app/agents)" {
 }
 
 '──────────────────────────────────────────────────────────────
-'  4) LOCAL TOOLING
-'──────────────────────────────────────────────────────────────
-package "Local Tooling" {
-
-    abstract class BaseTool {
-        + name : str
-        + __call__(instruction:str) : str
-    }
-
-    class MathTool {
-        + name = "math"
-        + __call__(expr:str) : str
-    }
-
-    class PyTool {
-        + name = "py"
-        + __call__(code:str) : str
-    }
-
-    BaseTool <|-- MathTool
-    BaseTool <|-- PyTool
-
-    class ToolRegistry {
-        + discover() : None
-        + get(name:str) : BaseTool
-        - _registry : Dict[str,BaseTool]
-    }
-
-    class ToolDispatcher {
-        + maybe_dispatch(prompt:str) : Tuple[str,str]  ' (tool_output, stripped_prompt)
-    }
-
-    ToolDispatcher --> ToolRegistry
-    ToolRegistry --> BaseTool
-}
-
-'──────────────────────────────────────────────────────────────
 '  5) PROMPT ORCHESTRATION
 '──────────────────────────────────────────────────────────────
 package "Prompt Orchestration" {
 
     class PromptBuilder {
-        + build(question:str, files_block:str, s_ctx:List[str], shape:Dict=None, tool:str=None) : str
+        + build(question:str, files_block:str, s_ctx:List[str], shape:Dict=None) : str
         - template : str
     }
 
@@ -213,9 +192,9 @@ package "Application Layer" {
         - reranker : Reranker
         - prompt_builder : PromptBuilder
         - llm : LLMClient
-        - tool_dispatcher : ToolDispatcher
         - eligibility_pool : Set[str]
         - exact_lock : bool
+        - convmem : ConversationMemory
     }
 
     class StreamlitUI {
@@ -236,9 +215,13 @@ AppController --> Retriever       : retrieve() [if not exact_lock]
 AppController --> Reranker        : rerank()
 AppController --> A3_NLIGate      : filter()
 AppController --> A4_Condenser    : condense() -> S_ctx
+AppController --> A2_PromptShaper : audit_and_rerun()  ' single bounded re-run gate
 AppController --> PromptBuilder   : build()
 AppController --> LLMClient       : complete()
-AppController --> ToolDispatcher  : maybe_dispatch()
+
+' History exposure (read-only)
+AppController ..> ConversationMemory : reads G/E (non-authoritative)
+PromptBuilder ..> ConversationMemory : may show RECENT HISTORY
 
 ' Ingestion path
 DocumentLoader --> Chunker
@@ -258,6 +241,8 @@ note right of AppController
   Authority order in PromptBuilder:
   [Hard Rules] → [Project Memory] → [❖ FILES]
   → [S_ctx] → [Task/Mode]
+  (RECENT HISTORY is optional & non-authoritative)
+  Personal use only: no Tooling, no MVP, no persistent logs.
 end note
 
 note bottom of VectorStoreNP
@@ -271,4 +256,13 @@ note bottom of VectorStoreChroma
   (enabled when environment allows).
 end note
 
+A1_DCI -[hidden]down-> A2_PromptShaper
+A2_PromptShaper -[hidden]down-> A3_NLIGate
+A3_NLIGate -[hidden]down-> A4_Condenser
+
+
+Settings -[hidden]down-> SimpleLogger
+Paths -[hidden]down-> Settings
+
+ConversationMemory-[hidden]down->  DocumentLoader
 @enduml

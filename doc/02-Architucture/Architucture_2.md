@@ -1,7 +1,6 @@
+# Architecture – RAGstream (Aug 2025)
 
-# Architecture – RAGstream (Pre-MVP, Aug 2025)
-
-This document shows the end-to-end architecture for RAGstream. It reflects the updated README: A2 is a Prompt Shaper (intent/domain + headers), vectors persist as NumPy `.pkl` snapshots (Chroma paused), and ingestion currently handles plain/unformatted text files.
+This document shows the end-to-end architecture for RAGstream, aligned with the updated Requirements (v2.0). It removes internal Tooling, adds **ConversationMemory** (two-layer, soft-fading, read-only), formalizes **A2’s post-audit** with a **single bounded re-run** of the retrieval path, and preserves deterministic authority order and Exact File Lock semantics. Vectors persist as NumPy `.pkl` snapshots (Chroma paused), and ingestion targets clean text. Personal-use only: no persistent logs, no pytest/CI/DevOps; functional quality remains production-grade.&#x20;
 
 ```text
                                      ┌───────────────────────────────────┐
@@ -17,61 +16,82 @@ This document shows the end-to-end architecture for RAGstream. It reflects the u
                          │              │
                          │              └──▶ 📇 FileManifest (path, sha, mtime, type)
                          │
+
 ╔═════════════════════════════════════════════════════════════════════════════╗
 ║                               MAIN QUERY FLOW                               ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
-                                                                           
+
 [User Prompt] ───▶ 🎛️  Streamlit GUI
                     ├── Prompt box (you)
                     ├── ON/OFF file checkboxes  (+ “Exact File Lock”)
                     ├── Prompt Shaper panel (intent/domain + headers)
-                    ├── Agent toggles (A1..A4), Mode (INTP/ENTJ…)
-                    ├── Model picker + cost estimator
+                    ├── Agent toggles (A1..A4), Model picker, Cost estimator
                     └── Super-Prompt preview (editable, source of truth)
 
                     ▼
                  🧠 Controller
-                    ├── A2 Prompt Shaper (propose intent/domain + headers; you override)
+                    ├── A2 Prompt Shaper — pass-1 (uses: Project Memory + ConversationMemory.G/E)
                     ├── A1 Deterministic Code Injector (files you named)
-                    │     └─ emits:  ❖ FILES section (FULL or PACK), locked if chosen
-                    ├── Eligibility Pool (from your ON/OFF checkboxes / presets)
+                    │     └─ emits:  ❖ FILES (FULL or PACK); if locked ⇒ retrieval is skipped
+                    ├── Eligibility Pool (from ON/OFF checkboxes)
                     ├── (if not locked)
                     │      ┌──────────────────────────────────────────────┐
                     │      │ 🔍 Retriever → 🏅 Reranker → A3 NLI Gate → A4│
-                    │      │ Context Condenser (S_ctx: Facts/Constraints/ │
+                    │      │ Condenser (S_ctx: Facts / Constraints /      │
                     │      │ Open Issues + citations)                     │
                     │      └──────────────────────────────────────────────┘
-                    ├── PromptBuilder
-                    │     └─ Authority order:
-                    │        [Hard Rules] → [Project Memory] → [❖ FILES]
-                    │        → [S_ctx] → [Your Task/Format/Mode]
-                    ├── 🛠️ ToolDispatcher (calc:/py: when explicitly asked; future)
+                    ├── A2 Prompt Shaper — audit-2 (reads S_ctx + same anchors)
+                    ├── PromptBuilder (authority order; may show a brief “RECENT HISTORY” view)
                     ├── 📡 LLMClient (model call + cost)
-                    └── 📊 Transparency panel (kept/dropped chunks, reasons)
+                    └── 📊 Transparency panel (kept/dropped reasons; ephemeral)
 
-                    ▼
-        🖥️  Streamlit GUI (answer, citations, FILES block, costs, logs)
-````
+                    ▲
+                    │  read-only
+                    │
+             🗂️ ConversationMemory
+             (G = recency window; E = episodic w/ metadata; soft fading)
+```
 
-* The top half (Ingestion→VectorStore) is unchanged in flow, but **vectors persist as NumPy `.pkl`** (Chroma paused due to env issue). **FileManifest** is planned (path/sha/mtime/type).
-* The **four agents** now include **A2 Prompt Shaper** (not only role routing; it proposes full headers), and the **Eligibility Pool** mirrors your GUI ON/OFF file controls.
-* The query path stays: **Retriever → Reranker → PromptBuilder → LLMClient**, with **NLI gating + Condenser** inserted to control/condense context. Attention sliders are replaced by explicit **ON/OFF eligibility**.
+*Notes:* **ConversationMemory** is a **controller-side, read-only** source used by A2 (pre and post) and optionally surfaced by PromptBuilder; it **does not change A1–A4 interfaces**. Internal Tooling is **out of scope**.&#x20;
 
 ---
 
 ## Ingestion & Memory
 
-* **DocumentLoader**: discovers files under `data/doc_raw/`.
+**DocumentLoader** discovers files under `data/doc_raw/`.
+• Current: `.txt`, `.md`, `.json`, `.yml`. • Planned: FileManifest (`path`, `sha256`, `mtime`, `type`).
+**Chunker**: token-aware overlapping windows.
+**Embedder**: E5/BGE family (configurable).
+**VectorStore**: **NumPy `.pkl` snapshots** (Chroma paused; planned on-disk collection when stable).&#x20;
 
-  * **Current**: plain/unformatted text (`.txt`, `.md`, `.json`, `.yml`).
-  * **Planned**: rich/binary (`.pdf`, `.docx`).
-* **Chunker**: token-aware overlapping windows.
-* **Embedder**: E5/BGE family (configurable).
-* **VectorStore**: local persistence.
+### Conversation Memory (read-only; two-layer, soft fading)
 
-  * **Current**: NumPy-backed `.pkl` snapshots (Chroma disabled temporarily).
-  * **Planned**: on-disk Chroma once stable in this environment.
-* **📇 FileManifest (planned)**: `path`, `sha256`, `mtime`, `type` to support deterministic inclusion and change detection.
+**Purpose.** Maintain flow/coherence without re-chunking or embedding chat. History is **not** part of the document store.&#x20;
+
+**Layers.**
+
+* **Layer-G (recency window):** always include last *k* user–assistant turns (k≈3–5; configurable).
+* **Layer-E (episodic store):** older turns w/ metadata (turn distance, optional Δt, tags, importance flag, source, version hints).&#x20;
+
+**Selection & fading.**
+
+* Guaranteed recency (always pass G).
+* From E, pick clearly on-topic with soft preference for freshness; importance can override; smooth keep/drop; **token-budget-first** selection.
+* Optional real-time damping if long gaps between sessions.&#x20;
+
+**Dedup & conflicts vs ❖ FILES.**
+
+* If A1 injects a file, **suppress chat fragments** that duplicate/conflict with that file for this turn.
+* Conflict resolution: **❖ FILES > newer > older**; surface conflicts in the transparency panel (ephemeral).&#x20;
+
+**Compression.**
+
+* Very old spans may be rolled into compact, titled summaries; **never summarize G**. Promote summaries that prove useful.&#x20;
+
+**Exposure.**
+
+* A2 (pass-1 and audit-2) reads G + eligible E; PromptBuilder **may** include a short “RECENT HISTORY” block when helpful.
+* The RECENT HISTORY view is **non-authoritative**; it cannot override ❖ FILES or S\_ctx.&#x20;
 
 ---
 
@@ -79,112 +99,83 @@ This document shows the end-to-end architecture for RAGstream. It reflects the u
 
 ### A1 — Deterministic Code Injector (DCI)  ➜ “❖ FILES” section
 
-**What:** The only agent allowed to inject **full** code/config you explicitly name (e.g., `handler.py`, `main.tf`, `docker-compose.yml`). No ranking or retrieval.
-
-**Inputs:** your prompt; FileManifest (when available); GUI “Exact File Lock”; ON/OFF selections.
-**Output:** top-level **❖ FILES** block (FULL; or **PACK** if file is huge).
-**Policy (deterministic):**
-
-* If you explicitly name a code/config file ⇒ include **FULL** (or **PACK** if over limit).
-* If **Exact File Lock = ON** ⇒ retrieval path is skipped (laser task).
-* Markdown/notes remain in retrieval; A1 targets code/config deterministically.
-
----
+**What:** The only agent allowed to inject **full** code/config you explicitly name. No ranking/retrieval.
+**Inputs:** your prompt; ON/OFF selections; Exact File Lock; (planned) FileManifest.
+**Output:** **❖ FILES** block (FULL or PACK if large).
+**Policy:** If **Exact File Lock = ON**, retrieval is skipped. Markdown/notes remain for retrieval; A1 targets code/config deterministically.&#x20;
 
 ### A2 — Prompt Shaper (intent/domain + meta-prompt headers)
 
-**What:** Lightweight **prompt shaper** that suggests task **intent** and **domain**, and proposes structured headers for the Super-Prompt.
+**What:** Lightweight **prompt shaper** proposing task **intent/domain** and structured headers.
+**Pass-1 (pre-retrieval):** Uses *user prompt + Project Memory + ConversationMemory.G/E*.
+**Audit-2 (post-A4):** Reads **S\_ctx** (plus same anchors) to **audit** and **refine** headers/roles.
+**Bounded re-run rule:** If audit-2 **materially** changes **task scope** (intent/domain), permit **one** re-run of *Retriever → Reranker → A3 → A4*; otherwise reuse S\_ctx. **Never** override Hard Rules, Project Memory, or Exact File Lock.&#x20;
 
-**Inputs:** raw query + optional project state.
-**Outputs (advisory):**
+### A3 — NLI Gate (semantic filter)
 
-* **intent** (e.g., explain, design, implement, refactor, debug, test, review, plan, compare, decide, compute, translate, generate, …)
-* **domain** (software, AWS, research, writing, legal, music, …)
-* **headers**: `SYSTEM, AUDIENCE, PURPOSE, TONE, CONFIDENCE, RESPONSE DEPTH, OUTPUT FORMAT` (may suggest `CHECKLIST/EXAMPLE`)
+**What:** Drops candidates not **entailed** by the query/task; adjustable strictness θ.
+**Role with history & files:** Suppresses chat fragments overlapping with ❖ FILES; enforces conflict policy (FILES > newer > older).&#x20;
 
-**Implementation:**
+### A4 — Condenser (composer of `S_ctx`)
 
-* Uses a small LLM (e.g., GPT-4o-mini) with **deterministic templates as fallback**.
-* May suggest defaults for downstream strictness (e.g., higher NLI θ for implement/debug).
-* **You always review/override** in the GUI.
-
----
-
-### A3 — NLI Gate (semantic keep/drop)
-
-**What:** Filters reranked chunks via natural-language inference (entailment) to keep only those that **support** the task.
-
-**Inputs:** query, reranked candidates, Prompt Shaper hints.
-**Output:** kept chunks (+ scores); drops irrelevant/contradictory.
-**Control:** **Strictness (θ)** in GUI (low = exploratory; high = strict).
-**Why:** Prevents “nice-but-irrelevant” context from bloating the Super-Prompt.
-
----
-
-### A4 — Context Condenser (structured pack → `S_ctx`)
-
-**What:** Summarizes **kept** chunks into a compact, **cited** block the LLM can reliably use.
-
-**Output:** `S_ctx` with three sections:
-
-* **Facts** — minimal exacts (paths, code lines, IDs)
-* **Constraints** — decisions, limits, acceptance criteria
-* **Open Issues** — gaps/uncertainties
-
-Small LLM is sufficient (e.g., GPT-4o-mini). This reduces tokens while preserving grounding.
+**What:** Produces compact, cited **`S_ctx`** with **Facts / Constraints / Open Issues**. Output **must** validate to schema; on failure, controller falls back to showing top reranked, NLI-kept chunks.&#x20;
 
 ---
 
 ## Prompt Orchestration
 
-Fixed authority order (keeps facts above style):
+**Fixed authority order** (facts over style):
 
 ```
-[Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Your Task & Output Format] → [Optional Mode]
+[Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Your Task/Format/Mode]
 ```
 
-* **Hard Rules** — non-negotiables (e.g., do not alter code blocks; follow exact spec boundaries).
-* **Project Memory** — persistent decisions and invariants (stack, naming, policies).
-* **S\_ctx** — cited, structured pack from A4 (Facts / Constraints / Open Issues).
-* **Optional Mode** — style/voice presets (e.g., INTP/ENTJ) applied after facts.
+*Notes:* **RECENT HISTORY**, when shown, is a **non-authoritative** aide for continuity; it does not participate in precedence and cannot overrule ❖ FILES or S\_ctx. Exact File Lock continues to short-circuit retrieval.&#x20;
 
 ---
 
 ## Deterministic vs. Model-Driven
 
-* **Deterministic:** A1 (DCI), File ON/OFF eligibility, PromptBuilder authority application.
-* **Model-driven:** A2 (Prompt Shaper), Reranker (cross-encoder/LLM), A3 (NLI Gate), A4 (Condenser).
-
-> Note: **Reranker** reorders candidates (scores order) and is not an agent because it does not inject/exclude by policy.
+* **Deterministic:** A1 (DCI), File ON/OFF eligibility, PromptBuilder authority application, Exact File Lock, bounded re-run rule.
+* **Model-driven:** A2 (both passes), Reranker, A3 (NLI Gate), A4 (Condenser). The pipeline order and “one audit + optional one re-run” cap preserve **determinism of flow**.&#x20;
 
 ---
 
 ## End-to-End Narrative (what happens when you click)
 
-1. You type a prompt, optionally name files, toggle **Exact File Lock**, pick model, see cost.
-2. **A2 Prompt Shaper** proposes intent/domain + headers (you edit/approve).
-3. **A1 DCI** injects named files into **❖ FILES** (FULL/PACK). If locked, retrieval is skipped.
-4. If unlocked: **🔍 Retriever → 🏅 Reranker → A3 NLI Gate → A4 Condenser** emit **`S_ctx`** (short, cited).
-5. **PromptBuilder** assembles the Super-Prompt with the fixed authority order; you can still edit.
-6. **🛠️ ToolDispatcher** runs only if explicitly requested.
-7. **📡 LLMClient** sends; GUI shows answer, citations, **❖ FILES**, token/cost, and **📊 Transparency** (kept/dropped with reasons).
+1. You type a prompt, optionally name files, set Exact File Lock, pick model, see cost.
+2. **A2 pass-1** proposes intent/domain + headers using Project Memory + ConversationMemory (G/E).
+3. **A1** emits **❖ FILES** (FULL/PACK). If **locked**, skip retrieval.
+4. If unlocked: **Retriever → Reranker → A3 → A4** produce **S\_ctx** (short, cited).
+5. **A2 audit-2** reads **S\_ctx** and refines headers/roles; if it **changes scope**, perform **one** retrieval→A3→A4 re-run; otherwise keep S\_ctx.
+6. **PromptBuilder** assembles the Super-Prompt with the fixed authority order; it may show a brief non-authoritative “RECENT HISTORY” block for continuity.
+7. **LLMClient** sends; GUI shows answer, citations, ❖ FILES, token/cost, and a **transparency** view of kept/dropped with reasons (ephemeral only).&#x20;
 
 ---
 
 ## Why this fits the repo and requirements
 
-* Preserves the modular packages (Controller orchestrates agents A1–A4; implementations live in ragstream/app/agents/).
-* Adds quality levers beyond vanilla RAG (NLI gate + condenser) and makes Super-Prompt composition transparent.
-* Aligns with requirements: dense top-k → rerank, prompt composition, local-first control, UI transparency.
+* Preserves clean module boundaries (Controller orchestrates A1–A4; ConversationMemory is a controller-side helper; PromptBuilder/LLMClient unchanged).
+* Adds quality levers beyond vanilla RAG (NLI Gate + schema-validated Condenser; authority order; Exact File Lock; bounded audit) for **production-grade** functional control.
+* Mirrors the updated Requirements: **two-layer history with fading**, **A2 double-pass with one allowed re-run**, **no internal Tooling**, **NumPy `.pkl` persistence**, **personal-use** constraints, and **TinnyLlama-ready** modularity.&#x20;
 
 ---
 
 ## TL;DR
 
-* **A1 DCI** — Deterministic file injection (FILES block; optional lock).
-* **A2 Prompt Shaper** — Suggests intent/domain + headers; you approve.
-* **A3 NLI Gate** — Keep only semantically supporting chunks.
-* **A4 Condenser** — Compress to cited Facts / Constraints / Open Issues.
+* **A1 DCI** — Deterministic file injection (**❖ FILES**, lock supported).
+* **A2 Prompt Shaper** — Two passes (pre + post audit), can trigger **one** retrieval re-run on scope change.
+* **A3 NLI Gate** — Semantic bouncer; enforces “FILES > newer > older” and suppresses duplicates.
+* **A4 Condenser** — Emits cited **`S_ctx`** (Facts / Constraints / Open Issues), schema-validated.
+* **ConversationMemory (G/E)** — Read-only continuity: recency + episodic, soft fading, dedup vs ❖ FILES, optional compact summaries.
+* **PromptBuilder** — Fixed authority order; RECENT HISTORY is non-authoritative.&#x20;
 
+---
 
+## Sync Report
 
+**Imported from Requirements.md:** ConversationMemory (G/E, metadata, soft fading, dedup vs ❖FILES, conflict policy, optional compression, token-budget selection, exposure rules); A2 audit with **single bounded re-run** on scope change; fixed authority order; Exact File Lock; Eligibility Pool; A4 schema validation and transparency (ephemeral); NumPy `.pkl` persistence; personal-use constraints; modularity/TinnyLlama readiness.&#x20;
+
+**Removed/edited lines:** Eliminated any “Pre-MVP/MVP” wording; removed ToolDispatcher/Tooling mentions in flow and sections; clarified transparency as **ephemeral** (no persistent logs); added non-authoritative status for RECENT HISTORY; noted read-only ConversationMemory feeding A2 and PromptBuilder.&#x20;
+
+**Consistency check:** Architecture now matches Requirements with no contradictions: A1–A4 interfaces unchanged; ConversationMemory is controller-side, read-only; A2’s two passes and the one re-run gate are explicit; authority order untouched; Exact File Lock and eligibility semantics preserved; no internal Tooling; personal-use, production-grade stance affirmed.&#x20;

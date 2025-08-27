@@ -1,23 +1,24 @@
-# RAG Stream — **Comprehensive Requirements Specification**
+# RAGstream — Comprehensive Requirements Specification (Updated)
 
-*Version 1.0 • 2025-08-25*
+*Version 2.0 • 2025-08-27*
+*This document supersedes v1.0 and integrates the decisions from “HistoryManagementandSafty.md” and our latest design discussion. It removes internal Tooling, adds Conversation History Management, and formalizes the A2 audit model while keeping the overall architecture intact.* &#x20;
 
 ---
 
 ## 1  Purpose & Scope
 
-RAG Stream is a **local-first retrieval-augmented generation (RAG) workbench** that lets a power-user ingest documents, deterministically include/exclude files via ON/OFF toggles or an Exact File Lock, optionally execute local tools (math / Python), and obtain a fully-cited answer from a remote or local LLM—all inside a transparent Streamlit UI with cost estimation and agent logs.
+RAGstream is a personal, production-grade, local-first RAG workbench for a single expert user. Its mission is to deliver superior, deterministic prompt/context orchestration compared with generic chat UIs by combining: deterministic file inclusion (Exact File Lock), high-quality retrieval with semantic gating and condensation, explicit authority ordering, and now explicit Conversation History Management with fading. It remains modular to allow future integration with the AWS TinnyLlama Cloud project. “MVP” and end-user automation concepts do not apply here.&#x20;
 
 ---
 
 ## 2  Stakeholders
 
-| Role                     | Interest                                                                 |
-| ------------------------ | ------------------------------------------------------------------------ |
-| Product owner            | End-to-end demo & daily assistant running on a laptop (no cloud infra).  |
-| Prompt-/Context-Engineer | Fine-tune templates, inspect retrieved chunks, toggle tool routing.      |
-| Data engineer            | Extend ingestion pipeline, add file-watcher, experiment with embeddings. |
-| Future OSS users         | Fork and replace LLM or vector DB without touching GUI / controller.     |
+| Role                | Interest                                                                 |
+| ------------------- | ------------------------------------------------------------------------ |
+| Owner (single user) | Precise, deterministic orchestration; fast iteration; personal workflow. |
+| Future integrator   | Clean interfaces for later AWS TinnyLlama Cloud integration.             |
+
+(Previously listed “future OSS users,” “data engineer,” and demo-oriented stakeholders are out of scope for this personal system.)
 
 ---
 
@@ -26,218 +27,260 @@ RAG Stream is a **local-first retrieval-augmented generation (RAG) workbench** t
 ```
 User ──▶ Streamlit GUI ──▶ Controller
                    ▲          │
-                   │          ├──▶ A2 Prompt Shaper → headers
-                   │          ├──▶ A1 DCI → ❖ FILES (lock/full/pack)
-                   │          ├──▶ Retriever → Reranker → A3 NLI Gate → A4 Condenser (S_ctx)
+                   │          ├──▶ A2 Prompt Shaper (pass-1) → advisory headers
+                   │          ├──▶ A1 DCI → ❖ FILES (Exact Lock / FULL / PACK)
+                   │          ├──▶ (if not locked) Retriever → Reranker → A3 NLI Gate → A4 Condenser (S_ctx)
+                   │          ├──▶ A2 Prompt Shaper (audit-2) on S_ctx → header/role refinements
                    │          ├──▶ PromptBuilder (authority order)
-                   │          ├──▶ ToolDispatcher ──▶ {MathTool | PyTool}
-                   │          ├──▶ LLMClient (OpenAI GPT-4o or local)
-                   │          └──▶ Transparency / Cost / Logs
+                   │          ├──▶ ConversationMemory (read-only: recency window + pinned summary)
+                   │          ├──▶ LLMClient (OpenAI or local)
+                   │          └──▶ Transparency (kept/dropped reasons; no persistent logs)
 DocumentLoader ◀───┘
      ▲
      └─ Chunker ─ Embedder ─ VectorStore.add() (.pkl snapshots; Chroma paused)
 ```
 
+Notes:
+• ConversationMemory is a new read-only source feeding A2 and (optionally) PromptBuilder; A1–A4 interfaces remain unchanged.&#x20;
+• Tooling has been removed from scope (no ToolDispatcher/Math/Py).&#x20;
+
 ---
 
 ## 4  Functional Requirements
 
-### 4.1  Ingestion / Memory
+### 4.1  Ingestion / Knowledge Store
 
-| ID     | Requirement                                                           | Priority |
-| ------ | --------------------------------------------------------------------- | -------- |
-| ING-01 | Load `.txt`, `.md`, `.json`, `.yml`.                                  | Must     |
-| ING-02 | Planned: support `.pdf`, `.docx` via drag-and-drop or watched folder. | Planned  |
-| ING-03 | RecursiveTextSplitter (window = 1 024 tok, overlap = 200 tok).        | Must     |
-| ING-04 | Persist vectors as NumPy `.pkl` snapshots.                            | Must     |
-| ING-05 | Planned: Chroma collection on disk once stable.                       | Planned  |
-| ING-06 | Planned: FileManifest with `path`, `sha`, `mtime`, `type`.            | Planned  |
-| ING-07 | Emit ingestion log (docs added / skipped / updated).                  | Should   |
+| ID     | Requirement                                                                            | Priority |
+| ------ | -------------------------------------------------------------------------------------- | -------- |
+| ING-01 | Load `.txt`, `.md`, `.json`, `.yml`.                                                   | Must     |
+| ING-02 | Persist vectors as NumPy `.pkl` snapshots.                                             | Must     |
+| ING-03 | Recursive splitter (target \~1 024 tokens, overlap \~200).                             | Must     |
+| ING-04 | Planned: Chroma on-disk collection once environment allows (unchanged).                | Planned  |
+| ING-05 | Planned: FileManifest with `path`, `sha`, `mtime`, `type` for deterministic inclusion. | Planned  |
+| ING-06 | Ingestion log UI messages may be shown ephemerally; no persistent logs are stored.     | Must     |
 
-### 4.2  Retrieval & Agents
+(ING items are preserved where compatible; only log persistence expectations are clarified per personal-use constraints.)&#x20;
 
-| ID     | Requirement                                                           | Priority |
-| ------ | --------------------------------------------------------------------- | -------- |
-| RET-01 | Cosine top-k search (k = 20) with embedder from 4.1.                  | Must     |
-| RET-02 | Cross-encoder rerank with `mixedbread-ai/mxbai-rerank-xsmall-v1`.     | Must     |
-| RET-03 | Eligibility Pool: ON/OFF checkboxes per file.                         | Must     |
-| RET-04 | Exact File Lock disables retrieval and injects only named ❖ FILES.    | Must     |
-| RET-05 | A3 NLI Gate filters reranked chunks by entailment with strictness θ.  | Must     |
-| RET-06 | A4 Condenser emits cited `S_ctx` (Facts / Constraints / Open Issues). | Must     |
-| RET-07 | Expose retriever latency in the UI status bar.                        | Should   |
+---
 
-### 4.3  Prompt Orchestration
+### 4.2  Conversation History Management (Two-Layer Model)
 
-| ID     | Requirement                                                                                             | Priority |
-| ------ | ------------------------------------------------------------------------------------------------------- | -------- |
-| ORC-01 | Build system prompt with slots: `{{question}}`, `{{❖ FILES}}`, `{{S_ctx}}`, `{{tool_output}}`.          | Must     |
-| ORC-02 | Apply fixed authority order: \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode]. | Must     |
-| ORC-03 | Inject `<source_i>` tags for cited chunks for UI highlighting.                                          | Must     |
-| ORC-04 | Circular limit: prompt ≤ 8 k tokens incl. context & tool output.                                        | Must     |
+**Purpose:** Maintain flow and coherence without re-chunking history, using a small always-present recency window plus a selective episodic layer with fading. (New section replacing the previous implicit omission.)&#x20;
 
-### 4.4  Tooling
+#### Layers & Data
 
-| ID      | Requirement                                                              | Priority |
-| ------- | ------------------------------------------------------------------------ | -------- |
-| TOOL-01 | Parse `calc:` or `py:` prefixes—route remainder to local tool.           | Must     |
-| TOOL-02 | MathTool → evaluate via `sympy.sympify`, return pretty string.           | Must     |
-| TOOL-03 | PyTool → run in `exec` sandbox with `asyncio` timeout = 2 s.             | Should   |
-| TOOL-04 | Register new tools by subclassing `BaseTool`, auto-discover at start-up. | Should   |
+| ID    | Requirement                                                                                                                                                         | Priority |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| CH-01 | Provide Layer-G (recency window): always include the last k user–assistant turns verbatim (k≈3–5; configurable).                                                    | Must     |
+| CH-02 | Provide Layer-E (episodic store): older turns with metadata (turn distance, optional Δt, tags, importance flag, source, version hints). Selection is on-topic only. | Must     |
+| CH-03 | Never vectorize or re-chunk history for retrieval; history is not part of the document store.                                                                       | Must     |
+| CH-04 | Soft fading: prefer nearer/important items; allow older items if clearly on-topic or important.                                                                     | Must     |
+| CH-05 | Importance control: manual “mark important” and gentle auto-promotion when items are reused often.                                                                  | Should   |
+| CH-06 | Deduplicate vs ❖ FILES: if A1 injects a file, drop chat fragments that duplicate or conflict with that file for this turn.                                          | Must     |
+| CH-07 | Conflict policy: explicit ❖ FILES wins this turn; otherwise prefer newer items; surface conflicts in transparency UI.                                               | Must     |
+| CH-08 | Compression: very old spans may be rolled into compact, titled summaries; recent window is never summarized.                                                        | Should   |
+| CH-09 | Token budget first: include fewer, higher-value items; apply smooth keep/drop, not jumpy thresholds.                                                                | Must     |
+| CH-10 | Optional real-time damping: if there’s a long gap between sessions, slightly reduce freshness scores of very old items.                                             | Could    |
+| CH-11 | Exposure: A2 (pass-1) and A2 (audit-2) read Layer-G and eligible Layer-E items; PromptBuilder may include a brief “RECENT HISTORY” block when useful.               | Must     |
 
-### 4.5  LLM Interface
+(Requirements CH-01..CH-11 consolidate the “Layers at a Glance,” metadata, selection, de-duplication, conflict handling, compression, and acceptance-style expectations from the History document.)&#x20;
 
-| ID     | Requirement                                                             | Priority |
-| ------ | ----------------------------------------------------------------------- | -------- |
-| LLM-01 | Default remote client: `gpt-4o` with temperature 0.2, max\_tokens 512.  | Must     |
-| LLM-02 | Pluggable local model via `ollama run llama3:instruct`, flag `--local`. | Should   |
-| LLM-03 | Stream tokens to UI with first byte < 1 s.                              | Must     |
-| LLM-04 | Retry on HTTP 429/5xx with exponential back-off max 3 tries.            | Should   |
-| LLM-05 | Provide estimated cost for composed prompt.                             | Must     |
+---
+
+### 4.3  Retrieval & Agents
+
+| ID     | Requirement                                                                              | Priority |
+| ------ | ---------------------------------------------------------------------------------------- | -------- |
+| RET-01 | Cosine top-k search (k≈20) with the configured embedder.                                 | Must     |
+| RET-02 | Cross-encoder rerank (e.g., `mxbai-rerank-xsmall-v1`).                                   | Must     |
+| RET-03 | Eligibility Pool: ON/OFF per file to bound retrieval.                                    | Must     |
+| RET-04 | Exact File Lock: when ON, retrieval is skipped; only ❖ FILES are injected.               | Must     |
+| RET-05 | A3 NLI Gate drops non-entailed/contradictory candidates with strictness θ.               | Must     |
+| RET-06 | A4 Condenser emits cited `S_ctx` with three sections: Facts / Constraints / Open Issues. | Must     |
+| RET-07 | Transparency view shows kept/dropped with reasons (ephemeral; no persistent logs).       | Must     |
+
+(Identical to earlier functional core, with language tightened for personal use and no logs.)&#x20;
+
+---
+
+### 4.4  Prompt Orchestration & A2 Audit Model
+
+| ID     | Requirement                                                                                                                                                                                                   | Priority |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| ORC-01 | PromptBuilder composes the final prompt with fixed authority order: \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode].                                                                | Must     |
+| ORC-02 | A2 runs **twice at most** per query: (pass-1) before retrieval using {user prompt + Project Memory + Layer-G + eligible Layer-E}; (audit-2) after A4, using {S\_ctx + same anchors}, to refine headers/roles. | Must     |
+| ORC-03 | A2 (audit-2) cannot override Hard Rules, Project Memory, or Exact File Lock; it may adjust tone, audience, depth, and output format; it may change intent/domain **only if** justified by S\_ctx.             | Must     |
+| ORC-04 | Retrieval re-run rule: if A2 (audit-2) changes the **task scope** (intent/domain) materially, allow **one** retrieval → A3 → A4 re-run; otherwise reuse the existing S\_ctx.                                  | Must     |
+| ORC-05 | Schema validation: A4 output must validate against the `Facts / Constraints / Open Issues` schema; on validation failure, apply fallback (see 4.6).                                                           | Must     |
+
+(ORC items formalize the single controlled A2 audit pass and retrieval re-run gate, aligning with our design and the “Missing Safety Elements” need for schema validation.)&#x20;
+
+---
+
+### 4.5  Safety: Guardrails, Brakes, Airbags
+
+These requirements bring in the explicitly missing safety elements while respecting the personal, no-logs scope.&#x20;
+
+#### Guardrails (Policy / Boundaries)
+
+| ID     | Requirement                                                                                                              | Priority |
+| ------ | ------------------------------------------------------------------------------------------------------------------------ | -------- |
+| SAF-G1 | Prompt-injection checks on retrieved text: strip/neutralize instructions that attempt to subvert rules.                  | Must     |
+| SAF-G2 | Enforce A4 schema validation (see ORC-05).                                                                               | Must     |
+| SAF-G3 | Prompt size/cost hard stop: refuse composition if estimated tokens exceed configured ceiling; surface a clear UI reason. | Must     |
+
+#### Brakes (Timeouts / Cancellation)
+
+| ID     | Requirement                                                                                                               | Priority |
+| ------ | ------------------------------------------------------------------------------------------------------------------------- | -------- |
+| SAF-B1 | Controller-level timeouts for retrieval, rerank, A3, and A4; if any stage exceeds limit, cancel stage and apply fallback. | Must     |
+| SAF-B2 | Global cancellation: any stalled agent can be aborted cleanly; user can retry with adjusted settings.                     | Must     |
+
+#### Airbags (Fallbacks / Graceful Degradation)
+
+| ID     | Requirement                                                                                                               | Priority |
+| ------ | ------------------------------------------------------------------------------------------------------------------------- | -------- |
+| SAF-A1 | If A4 fails or its schema validation fails → fallback to showing top reranked, NLI-kept chunks with citations.            | Must     |
+| SAF-A2 | If retrieval fails → proceed with ❖ FILES-only path.                                                                      | Must     |
+| SAF-A3 | If LLM call fails → retry with a smaller/cheaper compatible model once; if still failing, surface reason to user.         | Must     |
+| SAF-A4 | Optional rollback: if A2 (audit-2) changed scope and the re-run produced empty/invalid S\_ctx, revert to previous S\_ctx. | Should   |
+
+---
 
 ### 4.6  UI / App
 
-| ID    | Requirement                                                                                     | Priority |
-| ----- | ----------------------------------------------------------------------------------------------- | -------- |
-| UI-01 | Prompt box, ON/OFF file checkboxes, Exact File Lock, Prompt Shaper panel, Agent toggles, Modes. | Must     |
-| UI-02 | Super-Prompt preview (editable).                                                                | Must     |
-| UI-03 | Transparency panel shows kept/dropped chunks with reasons.                                      | Must     |
-| UI-04 | Show ❖ FILES block and `S_ctx`.                                                                 | Must     |
-| UI-05 | Model picker + cost estimator.                                                                  | Must     |
-| UI-06 | Answer + citations view.                                                                        | Must     |
-| UI-07 | Download chat history as Markdown with citations.                                               | Should   |
-| UI-08 | Dark & light theme auto-switch (`streamlit-theme`).                                             | Could    |
+| ID    | Requirement                                                                                                              | Priority |
+| ----- | ------------------------------------------------------------------------------------------------------------------------ | -------- |
+| UI-01 | Prompt box, ON/OFF eligibility per file, Exact File Lock toggle, Prompt Shaper panel, agent toggles, model picker.       | Must     |
+| UI-02 | Super-Prompt preview (editable before send).                                                                             | Must     |
+| UI-03 | Transparency view of kept/dropped with reasons (ephemeral; no persisted logs).                                           | Must     |
+| UI-04 | Show ❖ FILES and `S_ctx` exactly as composed.                                                                            | Must     |
+| UI-05 | Cost estimator visible pre-send; enforce token/cost ceiling (SAF-G3).                                                    | Must     |
+| UI-06 | Optional “RECENT HISTORY” block visibility and controls: k for Layer-G; token budget for Layer-E; mark-important toggle. | Should   |
+| UI-07 | Optional export of the current answer with citations (on-demand; no background automation).                              | Could    |
+
+(Reminder: no persistent logs, no end-user automation; exports are explicit, on-demand actions.)
 
 ---
 
 ## 5  Non-Functional Requirements
 
-| Category          | Target                                                               |
-| ----------------- | -------------------------------------------------------------------- |
-| **Latency**       | < 3 s p95 prompt→first token with 1 M-token `.pkl` snapshot store.   |
-| **Memory**        | ≤ 6 GB RAM peak (embeddings loaded on demand).                       |
-| **Extensibility** | Add a new tool, agent, or embedding model without touching > 1 file. |
-| **Observability** | Structured logs JSON → `ragstream/utils/logging.py`.                 |
-| **Test coverage** | Unit 80 % (`pytest` + `hypothesis` for splitter & retriever).        |
-| **Security**      | Tool sandbox runs in separate process; no network in math/py tools.  |
-| **Licensing**     | Apache-2.0 except external models retaining original licenses.       |
-## 6  Technology Stack
+| Category          | Target                                                                                               |
+| ----------------- | ---------------------------------------------------------------------------------------------------- |
+| Determinism       | Fixed orchestration; at most one A2 audit; at most one retrieval re-run per query.                   |
+| Latency           | Prompt→first token < 3 s p95 with \~1M-token vector snapshot (CPU-only acceptable).                  |
+| Memory footprint  | ≤ 6 GB peak; embeddings loaded on demand.                                                            |
+| Privacy/Locality  | Personal, single-user workflow; no telemetry; no persistent logs.                                    |
+| Modularity        | Clean boundaries: A1–A4, Retriever/Reranker, PromptBuilder, ConversationMemory, LLMClient.           |
+| Integration Ready | Keep interfaces stable for future AWS TinnyLlama Cloud integration (controllers/adapters swappable). |
 
-| Layer           | Library / Service                                   | Version (Aug 2025)                |
-| --------------- | --------------------------------------------------- | --------------------------------- |
-| GUI             | Streamlit                                           | 1.38                              |
-| Embeddings      | `bge-large-en-v3`, `E5-Mistral` (optional)          | via `sentence_transformers = 3.0` |
-| Vector Store    | NumPy `.pkl` snapshots (current)                    | -                                 |
-| Planned DB      | Chroma                                              | 0.10                              |
-| Cross-encoder   | `mixedbread-ai/mxbai-rerank-xsmall-v1`              | 🤗 `cross-encoder = 0.6`          |
-| LLM API         | OpenAI (`openai>=1.15.0`)                           | GPT-4o                            |
-| Local LLM (opt) | Ollama                                              | 0.2                               |
-| Math            | SymPy                                               | 1.13                              |
-| Testing         | pytest, coverage, hypothesis                        | latest                            |
-| Packaging       | Poetry / PEP 621 (`pyproject.toml`)                 | 1.8                               |
-| CI              | GitHub Actions (`python-versions {3.10,3.11,3.12}`) | -                                 |
+(Observability/logging and test-coverage NFRs are intentionally **removed** per personal-use constraints; functional quality remains a top priority.)&#x20;
 
 ---
 
-## 7  Directory / Module Tree
+## 6  Technology Stack
 
-```
-Here’s the corrected tree with agents in their own files and the controller just orchestrating them:
+| Layer        | Library / Service                    | Notes                          |
+| ------------ | ------------------------------------ | ------------------------------ |
+| GUI          | Streamlit                            | Local desktop use.             |
+| Embeddings   | `bge-large-en-v3` or `E5-Mistral`    | Via `sentence_transformers`.   |
+| Vector Store | NumPy `.pkl` snapshots               | Chroma paused (planned later). |
+| LLM API      | OpenAI (default) or local via Ollama | Pluggable via LLMClient.       |
+
+(Previously listed SymPy, Tooling, Testing/CI entries are removed.)&#x20;
+
+---
+
+## 7  Directory / Module Tree (Informative)
 
 ```
 .
-├── .gitignore
 ├── data/
 │   ├── chroma_db/         # planned
 │   └── doc_raw/
 ├── ragstream/
-│   ├── __init__.py
 │   ├── app/
-│   │   ├── controller.py        # orchestrates agents A1–A4 (implemented in app/agents/)
+│   │   ├── controller.py
 │   │   ├── ui_streamlit.py
 │   │   └── agents/
-│   │       ├── __init__.py
-│   │       ├── a1_dci.py            # A1 Deterministic Code Injector
-│   │       ├── a2_prompt_shaper.py  # A2 Prompt Shaper
-│   │       ├── a3_nli_gate.py       # A3 NLI Gate
-│   │       └── a4_condenser.py      # A4 Context Condenser
-│   ├── config/
-│   │   ├── __init__.py
-│   │   └── settings.py
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── loader.py            # DocumentLoader
-│   │   ├── chunker.py           # Chunker
-│   │   ├── embedder.py          # Embedder
-│   │   └── vector_store.py      # VectorStore
-│   ├── retrieval/
-│   │   ├── __init__.py
-│   │   ├── attention.py         # replaced by eligibility toggles
-│   │   ├── reranker.py          # Reranker
-│   │   └── retriever.py         # Retriever
+│   │       ├── a1_dci.py
+│   │       ├── a2_prompt_shaper.py
+│   │       ├── a3_nli_gate.py
+│   │       └── a4_condenser.py
 │   ├── orchestration/
-│   │   ├── __init__.py
-│   │   ├── prompt_builder.py    # PromptBuilder
-│   │   └── llm_client.py        # LLMClient
-│   ├── tooling/
-│   │   ├── __init__.py
-│   │   ├── base_tool.py         # BaseTool
-│   │   ├── math_tool.py         # MathTool
-│   │   ├── py_tool.py           # PyTool
-│   │   ├── registry.py          # ToolRegistry
-│   │   └── dispatcher.py        # ToolDispatcher
-│   └── utils/
-│       ├── __init__.py
-│       ├── logging.py
-│       └── paths.py
-└── pyproject.toml  (or requirements.txt)
+│   │   ├── prompt_builder.py
+│   │   └── llm_client.py
+│   ├── retrieval/
+│   │   ├── retriever.py
+│   │   └── reranker.py
+│   ├── ingestion/
+│   │   ├── loader.py
+│   │   ├── chunker.py
+│   │   └── embedder.py
+│   └── memory/
+│       └── conversation_memory.py   # new module (read-only views for G/E)
 ```
 
-```
+Note: the former `tooling/` package is removed from requirements scope; if it exists in code, it should be disabled and unused.
 
 ---
 
 ## 8  Open Issues / Risks
 
-| Risk                                                              | Mitigation                                                   |
-| ----------------------------------------------------------------- | ------------------------------------------------------------ |
-| Cross-encoder latency on CPU.                                     | Cache top-32 chunks, run cross-encoder only once.            |
-| SymPy sandbox leakage via `eval`.                                 | Use `sympy.parsing.sympy_parser` + restricted globals.       |
-| Streamlit session state resets when file watcher triggers reload. | Debounce file-watch events; persist state to JSON.           |
-| Embedding model size ≈ 2 GB > memory on low-spec laptops.         | Offer `bge-base-v1` fallback; lazy-load model on first call. |
-| FileManifest not yet implemented.                                 | Plan incremental rollout after `.pkl` stable.                |
-| Chroma paused due to environment issues.                          | Resume once stable in deployment environment.                |
+| Risk                           | Mitigation                                                                 |
+| ------------------------------ | -------------------------------------------------------------------------- |
+| Cross-encoder latency on CPU   | Limit candidates; single pass; cache embeddings where feasible.            |
+| History selection bloat        | Enforce token budgets; smooth fading; manual importance pinning.           |
+| A2 audit causes scope creep    | Single audit only; retrieval re-run allowed once and only on scope change. |
+| Chroma environment instability | Keep `.pkl` snapshots until stable.                                        |
+
+(Updated to match the new history/audit model and removed Tooling/CI/testing risks.)&#x20;
 
 ---
 
-## 9  Acceptance Criteria (5-day MVP)
+## 9  Acceptance Criteria
 
-1. Ingest at least **1 000** Markdown / text pages; run dense + rerank retrieval; answer in ≤ 5 s p95.
-2. ❖ FILES block deterministically injects named files and respects Exact File Lock.
-3. `S_ctx` (Facts / Constraints / Open Issues) generated with citations.
-4. Prompt assembled in fixed authority order.
-5. Transparency panel shows kept/dropped chunks with reasons.
-6. Cost estimator visible and accurate.
-7. `calc: 3*(4+5)` prompt returns `27` inline.
-8. Streamlit UI shows citations and ❖ FILES block.
-9. All unit tests pass; `pytest` reports ≥ 80 % coverage.
+1. Conversation Memory
+   • The last k turns (Layer-G) are always available to A2 and visible in UI if enabled.
+   • Layer-E contributes only clearly on-topic or important items; duplicates of ❖ FILES are suppressed.
+   • Conflicts are resolved by authority and freshness (❖ FILES > newer > older) and surfaced in transparency.&#x20;
 
----
+2. Orchestration & Audit
+   • A2 runs at most twice; audit-2 can refine headers/roles and may change scope only if supported by S\_ctx.
+   • If scope changes, exactly one retrieval→A3→A4 re-run occurs; otherwise S\_ctx is reused.
+   • PromptBuilder applies the fixed authority order precisely.&#x20;
 
-## 10  Glossary
+3. Safety
+   • A4 output always validates against the `Facts / Constraints / Open Issues` schema or triggers SAF-A1 fallback.
+   • Controller timeouts, global cancellation, and cost/token ceilings function as defined.&#x20;
 
-| Term                   | Meaning                                                       |
-| ---------------------- | ------------------------------------------------------------- |
-| **RAG**                | Retrieval-Augmented Generation.                               |
-| **Eligibility Pool**   | ON/OFF per-file toggles controlling retrieval.                |
-| **Exact File Lock**    | Mode skipping retrieval and injecting only named ❖ FILES.     |
-| **❖ FILES**            | Deterministically injected file contents (via A1).            |
-| **S\_ctx**             | Condensed cited context (Facts / Constraints / Open Issues).  |
-| **Prompt Shaper (A2)** | Suggests intent/domain + headers.                             |
-| **NLI Gate (A3)**      | Filters reranked chunks by entailment.                        |
-| **Condenser (A4)**     | Compresses context to `S_ctx`.                                |
-| **ToolDispatcher**     | Router that detects and executes local tools before LLM call. |
-| **Chunk**              | Fixed-size text window (≈ 500 tokens) stored with embedding.  |
+4. UI
+   • Super-Prompt preview shows ❖ FILES and S\_ctx exactly; transparency view explains kept/dropped (no persisted logs).
+   • Cost estimator prevents over-budget sends via hard stop.&#x20;
 
 ---
 
-> **Status:** Spec validated against Architecture\_2.md (commit *HEAD* on 2025-08-25). Any structural change should update sections 4 & 7 and increment spec version.
+## 10  Glossary (Updated)
+
+| Term               | Meaning                                                                    |
+| ------------------ | -------------------------------------------------------------------------- |
+| ConversationMemory | Read-only provider of Layer-G (recency window) and Layer-E (episodic).     |
+| Layer-G            | Always-keep recency window of last k turns.                                |
+| Layer-E            | Episodic store of older turns with metadata and fading.                    |
+| ❖ FILES            | Deterministically injected files by A1; canonical for that turn.           |
+| S\_ctx             | Cited, condensed context emitted by A4 (Facts/Constraints/Open Issues).    |
+| A2 audit           | Second, controlled pass of A2 after A4 to refine headers/roles.            |
+| Authority order    | \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode]. |
+
+---
+
+### Change Log (relative to v1.0)
+
+• Added: Conversation History Management (4.2) with two-layer model and fading.&#x20;
+• Added: A2 audit model, retrieval re-run rule, and A4 schema validation.&#x20;
+• Added: Safety requirements (guardrails, brakes, airbags).&#x20;
+• Removed: Internal Tooling and all associated requirements and stack entries.&#x20;
+• Removed: MVP language, persistent logs, pytest/testing/CI mentions.&#x20;
+
+---
+

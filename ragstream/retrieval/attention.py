@@ -1,12 +1,10 @@
 """
-AttentionWeights (legacy shim)
-==============================
-Kept for legacy tests. In the current design, eligibility is controlled via
-ON/OFF per-file toggles and Exact File Lock in the UI, not sliders.
+AttentionWeights (legacy)
+=========================
+Kept for compatibility; not central in current eligibility model.
 """
 from typing import Dict
 
 class AttentionWeights:
-    """No-op weight application kept for backward compatibility."""
     def weight(self, scores: Dict[str, float]) -> Dict[str, float]:
         return scores

@@ -7,13 +7,12 @@
 """
 Agents (A1..A4)
 ===============
-Controller-side agents:
-- A1 Deterministic Code Injector → builds ❖ FILES (FULL/PACK) and enforces Exact File Lock.
-- A2 Prompt Shaper → suggests intent/domain + headers (advisory).
-- A3 NLI Gate → keep/drop based on entailment with θ strictness.
-- A4 Context Condenser → outputs S_ctx (Facts / Constraints / Open Issues) with citations.
+- A1 Deterministic Code Injector → builds ❖ FILES and enforces Exact File Lock.
+- A2 Prompt Shaper → pass-1 propose headers; audit-2 may trigger one retrieval re-run on scope change.
+- A3 NLI Gate → keep/drop via entailment (θ strictness).
+- A4 Condenser → emits S_ctx (Facts / Constraints / Open Issues) with citations.
 """
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 
 class A1_DCI:
     def build_files_block(self, named_files: List[str], lock: bool) -> str:
@@ -21,7 +20,13 @@ class A1_DCI:
 
 class A2_PromptShaper:
     def propose(self, question: str) -> Dict[str, str]:
-        return {"intent": "explain", "domain": "software"}
+        return {"intent": "explain", "domain": "software", "headers": "H"}
+    def audit_and_rerun(self, shape: Dict[str, str], s_ctx: List[str]) -> bool:
+        """
+        Return True iff audit materially changes task scope (intent/domain),
+        allowing exactly one retrieval→A3→A4 re-run.
+        """
+        return False
 
 class A3_NLIGate:
     def __init__(self, theta: float = 0.6) -> None:
@@ -39,33 +44,58 @@ class A4_Condenser:
 """
 AppController
 =============
-Glue code between Streamlit UI, eligibility controls (ON/OFF + Exact File Lock),
-retrieval pipeline, agents A1..A4, tooling dispatcher, and LLM client.
+Controller orchestrates A1..A4 with ConversationMemory and the retrieval path.
+- Exact File Lock short-circuits retrieval.
+- A2 runs twice (propose → audit); at most one retrieval re-run on scope change.
 """
-from .agents import A1DCI, A2PromptShaper, A3NliGate, A4Condenser
+from typing import List
+from ragstream.retrieval.retriever import Retriever, DocScore
+from ragstream.retrieval.reranker import Reranker
+from ragstream.orchestration.prompt_builder import PromptBuilder
+from ragstream.orchestration.llm_client import LLMClient
+from ragstream.app.agents import A1_DCI, A2_PromptShaper, A3_NLIGate, A4_Condenser
+from ragstream.memory.conversation_memory import ConversationMemory
 
 class AppController:
-def init(self, retriever, reranker, prompt_builder, llm_client):
-self.shaper = A2PromptShaper()
-self.dci = A1DCI()
-self.gate = A3NliGate(theta=0.6)
-self.condenser = A4Condenser()
-self.retriever = retriever
-self.reranker = reranker
-self.prompt_builder = prompt_builder
-self.llm = llm_client
+    def __init__(self) -> None:
+        self.retriever = Retriever()
+        self.reranker = Reranker()
+        self.prompt_builder = PromptBuilder()
+        self.llm_client = LLMClient()
+        self.a1 = A1_DCI()
+        self.a2 = A2_PromptShaper()
+        self.a3 = A3_NLIGate()
+        self.a4 = A4_Condenser()
+        self.convmem = ConversationMemory()
+        self.eligibility_pool = set()  # ON/OFF file gating handled by UI/controller
 
-def handle(self, user_prompt, named_files, exact_lock):
-    shape = self.shaper.suggest(user_prompt)
-    files = self.dci.build_files_block(named_files, exact_lock)
-    kept = []
-    if not exact_lock:
-        dense = self.retriever.search(user_prompt)
-        ranked = self.reranker.rerank(user_prompt, dense)
-        kept = self.gate.filter(user_prompt, ranked)
-    sctx = self.condenser.make_sctx(kept)
-    prompt = self.prompt_builder.build(user_prompt, files, sctx, shape)
-    return self.llm.send(prompt)
+    def handle(self, user_prompt: str, named_files: List[str], exact_lock: bool) -> str:
+        # A2 pass-1
+        _shape = self.a2.propose(user_prompt)
+
+        # A1 — ❖ FILES
+        files_block = self.a1.build_files_block(named_files, exact_lock)
+
+        # Retrieval path (skip if lock)
+        kept_chunks: List[str] = []
+        if not exact_lock:
+            results: List[DocScore] = self.retriever.retrieve(user_prompt, k=10)
+            ids = [r.id for r in results]
+            kept_chunks = self.a3.filter(ids, user_prompt)
+
+        # A4 — condense to S_ctx
+        s_ctx = self.a4.condense(kept_chunks)
+
+        # A2 audit-2 (may trigger one re-run on scope change)
+        if self.a2.audit_and_rerun(_shape, s_ctx) and not exact_lock:
+            results = self.retriever.retrieve(user_prompt, k=10)
+            ids = [r.id for r in results]
+            kept_chunks = self.a3.filter(ids, user_prompt)
+            s_ctx = self.a4.condense(kept_chunks)
+
+        # Compose & send
+        prompt = self.prompt_builder.build(user_prompt, files_block, s_ctx, shape=_shape)
+        return self.llm_client.complete(prompt)
 ```
 
 ### ~\ragstream\app\ui_streamlit.py
@@ -73,22 +103,19 @@ def handle(self, user_prompt, named_files, exact_lock):
 """
 StreamlitUI
 ===========
-Defines the visible Streamlit components (prompt box, file ON/OFF controls,
-Exact File Lock toggle, Prompt Shaper panel, agent toggles, Super-Prompt preview,
-transparency/cost panes) and wires them to `AppController`.
+UI surface: prompt box, ON/OFF eligibility, Exact File Lock, agent toggles,
+Super-Prompt preview, and transparency panel (ephemeral).
 """
 import streamlit as st
 from ragstream.app.controller import AppController
 
 class StreamlitUI:
-    """Thin Streamlit wrapper – all logic stays in **AppController**."""
     def __init__(self) -> None:
         self.ctrl = AppController()
 
     def render(self) -> None:
-        """Draws UI components and handles callbacks."""
-        st.title("RAG Stream")
-        st.write("UI placeholder (Prompt box, ON/OFF file checkboxes, Exact File Lock, agent toggles, Super-Prompt preview)")
+        st.title("RAGstream")
+        st.write("Prompt box, file ON/OFF, Exact File Lock, agent toggles, Super-Prompt preview")
 ```
 
 ### ~\ragstream\app\agents\a1_dci.py
@@ -178,24 +205,16 @@ class A4_Condenser:
 """
 Settings
 ========
-Loads environment variables **once** at start-up so that every module accesses
-configuration via Settings.get("OPENAI_API_KEY") instead of scattered os.getenv.
+Centralised, cached access to environment configuration.
 """
 import os
 from typing import Any, Dict
 
 class Settings:
-    """
-    Thin, immutable wrapper around `os.environ`.
-
-    *Purpose*: centralise **all** config keys (API keys, flags, paths) and offer
-    a single interface for default values & type-checking.
-    """
     _CACHE: Dict[str, Any] = {}
 
     @classmethod
     def get(cls, key: str, default: Any | None = None) -> Any:
-        """Return env value or *default*; cache the lookup."""
         if key not in cls._CACHE:
             cls._CACHE[key] = os.getenv(key, default)
         return cls._CACHE[key]
@@ -489,17 +508,12 @@ class VectorStoreNP:
 """
 LLMClient
 =========
-Thin adapter around OpenAI (or local model) providing streaming & retry.
-Also exposes a basic cost estimator for UI display.
+Adapter for model calls + cost estimate.
 """
 class LLMClient:
-    """Handles completion calls and cost estimation."""
     def complete(self, prompt: str) -> str:
-        """Return LLM answer (dummy)."""
         return "ANSWER"
-
     def estimate_cost(self, tokens: int) -> float:
-        """Rough USD cost estimate based on model pricing."""
         return 0.0
 ```
 
@@ -508,19 +522,14 @@ class LLMClient:
 """
 PromptBuilder
 =============
-Assembles the final Super-Prompt from:
-  - ❖ FILES (deterministic block by A1)
-  - S_ctx (Facts / Constraints / Open Issues by A4)
-  - tool_output (if any)
-and applies the fixed authority order:
+Composes the Super-Prompt with fixed authority order:
 [Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Task/Mode]
+(RECENT HISTORY may be shown for continuity; non-authoritative.)
 """
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 class PromptBuilder:
-    """Template-driven prompt composer."""
-    def build(self, question: str, s_ctx: List[str], files_block: Optional[str] = None, tool: Optional[str] = None) -> str:
-        """Return composed prompt (dummy)."""
+    def build(self, question: str, files_block: Optional[str], s_ctx: List[str], shape: Optional[Dict] = None) -> str:
         return "PROMPT"
 ```
 
@@ -530,15 +539,13 @@ class PromptBuilder:
 ### ~\ragstream\retrieval\attention.py
 ```python
 """
-AttentionWeights (legacy shim)
-==============================
-Kept for legacy tests. In the current design, eligibility is controlled via
-ON/OFF per-file toggles and Exact File Lock in the UI, not sliders.
+AttentionWeights (legacy)
+=========================
+Kept for compatibility; not central in current eligibility model.
 """
 from typing import Dict
 
 class AttentionWeights:
-    """No-op weight application kept for backward compatibility."""
     def weight(self, scores: Dict[str, float]) -> Dict[str, float]:
         return scores
 ```
@@ -548,14 +555,12 @@ class AttentionWeights:
 """
 Reranker
 ========
-Cross-encoder that re-orders the initially retrieved chunks.
+Cross-encoder reranking placeholder.
 """
 from typing import List
 
 class Reranker:
-    """Cross-encoder interface."""
     def rerank(self, ids: List[str], query: str) -> List[str]:
-        """Return list of IDs sorted by relevance (dummy)."""
         return ids
 ```
 
@@ -564,21 +569,17 @@ class Reranker:
 """
 Retriever
 =========
-Coordinates vector search and reranking. In the new design, per-file eligibility
-is handled in the controller (Exact File Lock / ON-OFF pool) before retrieval.
+Coordinates vector search and reranking; controller handles Exact File Lock and eligibility pool.
 """
 from typing import List
 
 class DocScore:
-    """Lightweight value object pairing *doc_id* with *score*."""
     def __init__(self, doc_id: str, score: float) -> None:
         self.id = doc_id
         self.score = score
 
 class Retriever:
-    """End-to-end retrieval pipeline orchestrator."""
     def retrieve(self, query: str, k: int = 10) -> List[DocScore]:
-        """Return reranked `DocScore` list (dummy)."""
         return []
 ```
 
@@ -689,29 +690,25 @@ class ToolRegistry:
 """
 SimpleLogger
 ============
-Ultra-light wrapper around the built-in *logging* module so that the whole
-code-base can depend on **one** unified logger without external config files.
+Ultra-light façade for the standard logging module.
+Use for ephemeral console messages only (no persistent logs by requirement).
 """
 import logging
 
 class SimpleLogger:
-    """Minimal façade for standard logging (single responsibility: output)."""
     _logger = logging.getLogger("ragstream")
     if not _logger.handlers:
         _logger.setLevel(logging.INFO)
-        _handler = logging.StreamHandler()
-        _formatter = logging.Formatter("[%(asctime)s] %(levelname)s : %(message)s")
-        _handler.setFormatter(_formatter)
-        _logger.addHandler(_handler)
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s : %(message)s"))
+        _logger.addHandler(_h)
 
     @classmethod
     def log(cls, msg: str) -> None:
-        """Write an *INFO* message (human-friendly)."""
         cls._logger.info(msg)
 
     @classmethod
     def error(cls, msg: str) -> None:
-        """Write an *ERROR* message (something went wrong)."""
         cls._logger.error(msg)
 ```
 
@@ -720,9 +717,8 @@ class SimpleLogger:
 """
 Paths
 =====
-Centralises all on-disk locations for the project so that a single import
-(`from ragstream.utils.paths import PATHS`) provides **typed** access to
-directories used across ingestion, vector store, caching, and logging.
+Centralises on-disk locations so a single import
+(`from ragstream.utils.paths import PATHS`) gives typed access.
 """
 from pathlib import Path
 from typing import TypedDict
@@ -743,7 +739,7 @@ PATHS: _Paths = {
     "raw_docs":    ROOT / "data" / "doc_raw",
     "chroma_db":   ROOT / "data" / "chroma_db",   # planned
     "vector_pkls": ROOT / "data" / "vector_pkls", # current persistence
-    "logs":        ROOT / "logs",
+    "logs":        ROOT / "logs",                 # present as a path; no persistent logging required
 }
 ```
 
