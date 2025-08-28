@@ -16,7 +16,7 @@ SUBDIRS = [
     "ingestion",
     "orchestration",
     "retrieval",
-    "tooling",
+    "memory",
     "utils",
 ]
 

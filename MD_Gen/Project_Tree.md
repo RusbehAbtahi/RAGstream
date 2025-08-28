@@ -43,13 +43,6 @@ C:\0000\Prompt_Engineering\Projects\GTPRusbeh\RAGstream2
     │   ├── attention.py
     │   ├── reranker.py
     │   └── retriever.py
-    ├── tooling
-    │   ├── __init__.py
-    │   ├── base_tool.py
-    │   ├── dispatcher.py
-    │   ├── math_tool.py
-    │   ├── py_tool.py
-    │   └── registry.py
     └── utils
         ├── __init__.py
         ├── logging.py

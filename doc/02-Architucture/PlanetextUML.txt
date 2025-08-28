@@ -1,13 +1,4 @@
-@startuml RAGstream2_Full
-
-'──────────────────────────────────────────────────────────────
-'  GLOBAL SETTINGS
-'──────────────────────────────────────────────────────────────
-skinparam linetype ortho
-skinparam classAttributeIconSize 0
-skinparam packageStyle rectangle
-hide empty members
-
+@startuml
 '──────────────────────────────────────────────────────────────
 '  0) CONFIG & UTILS
 '──────────────────────────────────────────────────────────────
@@ -17,16 +8,10 @@ package "Config & Utils" {
         - _CACHE : Dict[str,Any]
     }
 
-class Paths {
-  + PATHS : TypedDict
-  + ROOT  : Path
-}
-
-note as N1
-root:Path, data:Path
-raw_docs:Path, chroma_db:Path
-vector_pkls:Path, logs:Path
-end note
+    class Paths {
+        + PATHS : TypedDict
+        + ROOT  : Path
+    }
 
     class SimpleLogger {
         + log(msg:str)   : None
@@ -36,7 +21,7 @@ end note
 }
 
 '──────────────────────────────────────────────────────────────
-'  1) INGESTION & MEMORY LAYER
+'  1) INGESTION / MEMORY
 '──────────────────────────────────────────────────────────────
 package "Ingestion / Memory" {
 
@@ -73,26 +58,22 @@ package "Ingestion / Memory" {
         - _id2idx : Dict[str,int]
     }
 
-    class VectorStoreChroma implements IVectorStore {
-        + add(ids,vectors,meta) : None
-        + query(vector,k=10) : List[str]
-        + snapshot(ts:str) : None
-        - client : chromadb.PersistentClient
-        - collection : chromadb.Collection
-    }
-
-    class VectorStoreRouter {
-        + VectorStore : IVectorStore
-        - select_by_env() : IVectorStore
-    }
-
-    ' --- ConversationMemory (read-only; two-layer, soft fading)
+    ' --- ConversationMemory (read-only; two-layer; Layer-E = selection-only semantic index)
     class ConversationMemory {
         + get_recent(k:int=5) : List[Tuple[str,str]]      ' Layer-G (recency window)
         + get_episodic() : List[Tuple[str,str]]           ' Layer-E (episodic, on-topic)
         - k_default : int
         - soft_fading : bool
         - conflict_policy : str    ' ❖ FILES > newer > older (dedup)
+        - capacity_cap : int       ' hard cap for selection-only vectors (E)
+    }
+
+    ' FileManifest is Must (hash + mtime) for deterministic inclusion/versioning
+    class FileManifest {
+        + path : str
+        + sha  : str              ' sha256 or MD5
+        + mtime: float
+        + type : str
     }
 
     DocumentLoader --> Chunker : raw text
@@ -100,7 +81,6 @@ package "Ingestion / Memory" {
     Embedder --> IVectorStore : ids + vectors
     Paths ..> DocumentLoader : uses PATHS.raw_docs
     Paths ..> VectorStoreNP  : uses PATHS.vector_pkls
-    Paths ..> VectorStoreChroma : uses PATHS.chroma_db
 }
 
 '──────────────────────────────────────────────────────────────
@@ -115,10 +95,6 @@ package "Retrieval & Ranking" {
 
     class Reranker {
         + rerank(ids:List[str], query:str) : List[str]
-    }
-
-    class AttentionWeights <<legacy>> {
-        + weight(scores:Dict[str,float]) : Dict[str,float]
     }
 
     class Retriever {
@@ -147,7 +123,7 @@ package "Agents (app/agents)" {
 
     class A2_PromptShaper {
         + propose(question:str) : Dict[str,str]           ' {intent, domain, headers}
-        + audit_and_rerun(shape:Dict, s_ctx:List[str]) : bool  ' may trigger one retrieval re-run
+        + audit_and_rerun(shape:Dict, s_ctx:List[str]) : bool  ' single bounded re-run gate
     }
 
     class A3_NLIGate {
@@ -199,6 +175,7 @@ package "Application Layer" {
 
     class StreamlitUI {
         + render() : None
+        + send_to_history(text:str) : None   ' UI-09 (append external reply)
         - ctrl : AppController
     }
 
@@ -215,13 +192,16 @@ AppController --> Retriever       : retrieve() [if not exact_lock]
 AppController --> Reranker        : rerank()
 AppController --> A3_NLIGate      : filter()
 AppController --> A4_Condenser    : condense() -> S_ctx
-AppController --> A2_PromptShaper : audit_and_rerun()  ' single bounded re-run gate
+AppController --> A2_PromptShaper : audit_and_rerun()  ' bounded re-run (scope change)
 AppController --> PromptBuilder   : build()
 AppController --> LLMClient       : complete()
 
 ' History exposure (read-only)
 AppController ..> ConversationMemory : reads G/E (non-authoritative)
 PromptBuilder ..> ConversationMemory : may show RECENT HISTORY
+
+' External Reply path (UI-08/09)
+StreamlitUI ..> ConversationMemory : append external reply (source=external)
 
 ' Ingestion path
 DocumentLoader --> Chunker
@@ -235,7 +215,7 @@ PromptBuilder ..> A4_Condenser  : receives S_ctx
 ' Misc
 Settings ..> LLMClient : API keys/config
 Settings ..> Embedder  : API keys/config
-SimpleLogger ..> AllClasses: logging
+SimpleLogger ..> AppController : ephemeral logs/status
 
 note right of AppController
   Authority order in PromptBuilder:
@@ -246,23 +226,11 @@ note right of AppController
 end note
 
 note bottom of VectorStoreNP
-  Current default on Windows:
+  Current default:
   NumPy-backed exact cosine
   with .pkl snapshots.
 end note
-
-note bottom of VectorStoreChroma
-  Planned on-disk Chroma collection
-  (enabled when environment allows).
-end note
-
 A1_DCI -[hidden]down-> A2_PromptShaper
 A2_PromptShaper -[hidden]down-> A3_NLIGate
 A3_NLIGate -[hidden]down-> A4_Condenser
-
-
-Settings -[hidden]down-> SimpleLogger
-Paths -[hidden]down-> Settings
-
-ConversationMemory-[hidden]down->  DocumentLoader
 @enduml

@@ -584,102 +584,31 @@ class Retriever:
 ```
 
 
-## C:\0000\Prompt_Engineering\Projects\GTPRusbeh\RAGstream2\ragstream\tooling
+## C:\0000\Prompt_Engineering\Projects\GTPRusbeh\RAGstream2\ragstream\memory
 
-### ~\ragstream\tooling\base_tool.py
+### ~\ragstream\memory\conversation_memory.py
 ```python
 """
-BaseTool
-========
-Abstract base class for any local executable helper (math, python, shell …).
+ConversationMemory (read-only)
+==============================
+Two-layer history:
+- Layer-G: recency window (last k turns), always available.
+- Layer-E: episodic store with metadata (on-topic, soft fading).
+Not part of the document store; no embeddings/retrieval.
 """
-class BaseTool:
-    """Every concrete tool must implement `__call__`."""
-    name: str = "base"
+from typing import List, Tuple
 
-    def __call__(self, instruction: str) -> str:
-        """Execute the tool and return textual output (dummy)."""
-        return "<tool-output>"
-```
+class ConversationMemory:
+    def __init__(self, k_default: int = 5) -> None:
+        self.k_default = k_default
+        self.soft_fading = True
+        self.conflict_policy = "FILES>newer>older"
 
-### ~\ragstream\tooling\dispatcher.py
-```python
-"""
-ToolDispatcher
-==============
-Detects `calc:` / `py:` prefixes in the user prompt and routes to the tool.
-"""
-from typing import Tuple
+    def get_recent(self, k: int | None = None) -> List[Tuple[str, str]]:
+        return []
 
-class ToolDispatcher:
-    """Front controller for local tool execution."""
-    def maybe_dispatch(self, prompt: str) -> Tuple[str, str]:
-        """
-        Returns (tool_output, stripped_prompt).
-        If no tool prefix detected, tool_output = "".
-        """
-        return ("", prompt)
-```
-
-### ~\ragstream\tooling\math_tool.py
-```python
-"""
-MathTool
-========
-Evaluates arithmetic expressions (safe subset) and returns the result.
-"""
-from ragstream.tooling.base_tool import BaseTool
-
-class MathTool(BaseTool):
-    """Protected SymPy evaluator."""
-    name = "math"
-
-    def __call__(self, instruction: str) -> str:
-        """Parse and compute math expression (dummy)."""
-        return "0"
-```
-
-### ~\ragstream\tooling\py_tool.py
-```python
-"""
-PyTool
-======
-Executes short Python snippets inside a restricted sandbox.
-"""
-from ragstream.tooling.base_tool import BaseTool
-
-class PyTool(BaseTool):
-    """RestrictedPython sandbox executor."""
-    name = "py"
-
-    def __call__(self, instruction: str) -> str:
-        """Execute code and capture stdout (dummy)."""
-        return "<py-result>"
-```
-
-### ~\ragstream\tooling\registry.py
-```python
-"""
-ToolRegistry
-============
-Discovers all subclasses of BaseTool and exposes them via .get(name).
-"""
-from typing import Dict
-from ragstream.tooling.base_tool import BaseTool
-
-class ToolRegistry:
-    """Keeps a mapping `name -> tool_instance`."""
-    _registry: Dict[str, BaseTool] = {}
-
-    @classmethod
-    def discover(cls) -> None:
-        """Populate registry (dummy)."""
-        return
-
-    @classmethod
-    def get(cls, name: str) -> BaseTool:
-        """Return tool instance or raise KeyError."""
-        return cls._registry[name]
+    def get_episodic(self) -> List[Tuple[str, str]]:
+        return []
 ```
 
 
