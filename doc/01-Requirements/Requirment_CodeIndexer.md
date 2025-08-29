@@ -1,7 +1,3 @@
-Here is the exhaustive requirement list you asked for — a standalone spec for a future **CodeIndexer** tool, designed to handle both Python and Terraform (HCL). I wrote it in the same style as your other requirement docs so you can save it directly in Markdown.
-
----
-
 # CodeIndexer — Requirements Specification
 
 *Version 1.0 • 2025-08-29*
