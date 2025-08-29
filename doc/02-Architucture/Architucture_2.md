@@ -1,6 +1,7 @@
+
 # Architecture – RAGstream (Aug 2025)
 
-This document shows the end-to-end architecture for RAGstream, aligned with the updated **Requirements (v2.2)**. It removes internal Tooling, adds **ConversationMemory** (two-layer, soft-fading, read-only with a **selection-only Layer-E semantic index** kept separate from the document store), formalizes **A2’s post-audit** with a **single bounded re-run** of the retrieval path (with a clear trigger rubric), and preserves deterministic authority order and Exact File Lock semantics. Vectors persist as NumPy `.pkl` snapshots (Chroma paused), and ingestion targets clean text. Personal-use only: no persistent logs, no pytest/CI/DevOps; functional quality remains production-grade. **FileManifest** is a **Must** for deterministic inclusion/versioning.&#x20;
+This document shows the end-to-end architecture for RAGstream, aligned with the updated **Requirements (v2.2)**. It removes internal Tooling, adds **ConversationMemory** (two-layer, soft-fading, read-only with a **selection-only Layer-E semantic index** kept separate from the document store), formalizes **A2’s post-audit** with a **single bounded re-run** of the retrieval path (with a clear trigger rubric), and preserves deterministic authority order and Exact File Lock semantics. Vectors persist as NumPy `.pkl` snapshots (Chroma paused), and ingestion targets clean text. Personal-use only. **FileManifest** is a **Must** for deterministic inclusion/versioning.&#x20;
 
 ```text
                                      ┌───────────────────────────────────┐
@@ -53,7 +54,7 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
              (G = recency window; E = episodic w/ metadata + selection-only semantic index; soft fading)
 ```
 
-*Notes:* **ConversationMemory** is a **controller-side, read-only** source used by A2 (pre and post) and optionally surfaced by PromptBuilder; it **does not change A1–A4 interfaces**. **External replies** can be pasted (UI-08) and appended (UI-09) with `source=external`. **❖ FILES** remain authoritative over history.
+*Notes:* **ConversationMemory** is a **controller-side, read-only** source used by A2 (pre and post) and optionally surfaced by PromptBuilder; it **does not change A1–A4 interfaces**. **External replies** can be pasted (UI-08) and appended (UI-09) with `source=external`. **❖ FILES** remain authoritative over history.&#x20;
 
 ---
 
@@ -68,7 +69,7 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
 
 ### Conversation Memory (read-only; two-layer, soft fading)
 
-**Purpose.** Maintain flow/coherence without re-chunking chat; history remains **separate from the document store**. **Layer-E maintains a *small, append-only, selection-only* semantic index (embeddings) used solely to *score* episodic turns for inclusion (never to populate `S_ctx`).**&#x20;
+**Purpose.** Maintain flow/coherence without re-chunking chat; history remains **separate from the document store**. **Layer-E maintains a small, append-only, selection-only semantic index (embeddings) used solely to score episodic turns for inclusion (never to populate `S_ctx`).**&#x20;
 
 **Layers.**
 
@@ -96,6 +97,64 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
 
 ---
 
+## Feature-1 — Conversation History **Persistence** & **Async Layer-E Embedding**
+
+> **Goal:** Make history durable on disk and keep Layer-E selection deterministic via snapshot publishing; never block the prompt path on embeddings.
+
+**(F1-1) Append-only conversation log (single source of truth).**
+
+* Path: `PATHS.logs/conversation.log`.
+* After each completed turn (user prompt + assistant reply), the controller **appends both texts** in order, then **flushes + fsyncs** before accepting the next prompt.
+* If the reply comes from outside (UI-08/09), the controller appends the pasted text with `source=external`.
+* **Layer-G is reconstructed from the tail of this file** on each prompt; no RAM-only history.&#x20;
+
+**(F1-2) Layer-G read path.**
+
+* On each prompt, parse the tail of `conversation.log` to build the last *k* user/assistant pairs (verbatim, no summarization).
+* G is visible in UI if enabled; it remains **non-authoritative** in PromptBuilder.&#x20;
+
+**(F1-3) Layer-E embedding store (separate from documents).**
+
+* Maintain a dedicated **NumPy** vector store snapshot for history (e.g., `history_store.pkl`).
+* **Append-only; selection-only:** used to **score** episodic turns for inclusion and **never** injected into `S_ctx`.
+* **Completely separate** from the document vector snapshots.
+* Enforce **capacity caps** and token budgets per guardrails.&#x20;
+
+**(F1-4) Async delta embedding worker.**
+
+* After the synchronous log append completes, enqueue the **new tail** for background processing:
+
+  1. read only the unprocessed tail with a **small overlap** (one last chunk) for boundary stability;
+  2. split into chunks;
+  3. embed the **new chunks**;
+  4. write to a **staging** `.pkl`.
+* Use **stable IDs** (e.g., `<log_offset>::chunk_n`) and content-hash de-duplication.
+* This ensures we never re-embed the whole log.&#x20;
+
+**(F1-5) Atomic snapshot publishing.**
+
+* Writers only touch `history_store_dynamic.pkl`.
+* When a batch is complete, **flush+fsync** and then **publish** via `os.replace(history_store_dynamic.pkl → history_store.pkl)`.
+* Readers always open `history_store.pkl` and therefore see either the old or the new snapshot — **never a half-write**.&#x20;
+
+**(F1-6) Read paths per prompt.**
+
+* **G:** tail of `conversation.log` (synchronous).
+* **E:** open current `history_store.pkl` (latest published snapshot).
+* The prompt path **never blocks** on embedding; it uses the last published E snapshot.&#x20;
+
+**(F1-7) Startup & failure behavior.**
+
+* On startup, open/create `conversation.log`, build G from tail, and try to open `history_store.pkl`.
+* If E is missing, start empty and let the worker backfill from the log.
+* If the worker fails, the last published snapshot remains valid; retry next cycle.&#x20;
+
+**(F1-8) Authority, eligibility, dedup unaffected.**
+
+* Exact File Lock and authority order remain unchanged; A3 suppresses history fragments that duplicate injected ❖ FILES; **Eligibility Pool** still bounds retrieval candidates.&#x20;
+
+---
+
 ## Agent-by-agent (precise responsibilities)
 
 ### A1 — Deterministic Code Injector (DCI)  ➜ “❖ FILES” section
@@ -115,50 +174,19 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
 
 ### A3 — NLI Gate (semantic filter)
 
-**What:** Drops candidates not **entailed** by the query/task; adjustable strictness θ.
-**Role with history & files:** Suppresses chat fragments overlapping with ❖ FILES; enforces conflict policy (**FILES > newer > older**).&#x20;
+**What:** Drops candidates not **entailed** by the query/task; adjustable strictness θ; obeys ❖ FILES precedence and dedup rules.&#x20;
 
-### A4 — Condenser (composer of `S_ctx`)
+### A4 — Condenser (context composer)
 
-**What:** Produces compact, cited **`S_ctx`** with **Facts / Constraints / Open Issues**; output **must validate to schema**; on failure the controller falls back to showing top reranked, NLI-kept chunks.&#x20;
+**What:** Emits `S_ctx` with **Facts / Constraints / Open Issues** (cited).
+**Guarantee:** Every Fact carries ≥1 citation; if schema fails, controller triggers fallback (SAF-A1).&#x20;
 
 ---
 
 ## Prompt Orchestration
 
-**Fixed authority order** (facts over style):
-
-```
-[Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Your Task/Format/Mode]
-```
-
-*Notes:* **RECENT HISTORY**, when shown, is **non-authoritative** and cannot overrule ❖ FILES or `S_ctx`. Exact File Lock continues to short-circuit retrieval.&#x20;
-
----
-
-## Deterministic vs. Model-Driven
-
-* **Deterministic:** A1 (DCI), File ON/OFF eligibility, PromptBuilder authority application, Exact File Lock, bounded re-run rule cap.
-* **Model-driven:** A2 (both passes), Reranker, A3 (NLI Gate), A4 (Condenser). The pipeline order and “one audit + optional one re-run” cap preserve **determinism of flow**.&#x20;
-
----
-
-## End-to-End Narrative (what happens when you click)
-
-1. You type a prompt, optionally name files, set Exact File Lock, pick model, see cost.
-2. **A2 pass-1** proposes intent/domain + headers using Project Memory + ConversationMemory (G/E).
-3. **A1** emits **❖ FILES** (FULL/PACK). If **locked**, skip retrieval.
-4. If unlocked, **Retriever → Reranker → A3 → A4** produce **`S_ctx`** with citations.
-5. **A2 audit-2** reads `S_ctx` and may refine headers/roles. If **material scope change**, the controller permits **one** bounded re-run of retrieval→A4; otherwise reuse `S_ctx`.
-6. **PromptBuilder** composes the final Super-Prompt (authority order); optionally includes a brief RECENT HISTORY block (non-authoritative).
-7. **LLMClient** sends the prompt; the UI shows answer + citations; transparency panel lists kept/dropped reasons (ephemeral).
-8. Optional: If you pasted an **External Reply** (UI-08) and clicked **Send to History** (UI-09), it’s appended to ConversationMemory (`source=external`) and considered for future Layer-E selection/dedup.&#x20;
-
----
-
-## Exact File Lock
-
-When enabled, retrieval is skipped. Only **❖ FILES** are injected deterministically (FULL or PACK). History remains non-authoritative and is used only by A2 for shaping; A3 suppresses overlapping history when files are injected to avoid echoing.&#x20;
+**Authority order (fixed):** \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode].
+**PromptBuilder** assembles the final system/user messages; it may optionally show a **“RECENT HISTORY”** block (non-authoritative). **Exact File Lock** injects only ❖ FILES and skips retrieval entirely.&#x20;
 
 ---
 
@@ -168,28 +196,50 @@ ON/OFF checkboxes constrain which files are eligible for retrieval (when not loc
 
 ---
 
+## Feature-2 — Debug Logger (developer-oriented; optional)
+
+**Purpose:** Deterministic developer logs separate from ConversationMemory.
+**Files:** Each GUI session creates new logs under `PATHS.logs/` with a common timestamped stem:
+
+* `debug_trace_YYYYmmdd-HHMMSS_sessNN.log` — compact actions/steps/explanations.
+* `debug_vars_YYYYmmdd-HHMMSS_sessNN.log` — variable dumps (only if `vars_enabled=True`).
+
+**Methods:**
+
+* `logWriteText(msg, level="INFO")` → `[ts] [LEVEL] msg` to `debug_trace`; mirror to `debug_vars` if vars enabled.
+* `logWriteVar(name1, value1, ...)` → always writes an explanation line to `debug_trace`; if `vars_enabled=True`, writes `name=value` pairs to `debug_vars`.
+
+**Truncation:** default max 200 chars/items; per-variable override by passing `(name, maxlen)`; truncated dumps include ellipsis & length metadata.
+**Levels:** at least `INFO` and `DEBUG`; `min_level` drops lower-priority lines before enqueue.
+**Rotation:** append-only by default; optional rollover when file size > N MB using atomic replace (rotate `.1`…`.K`).
+**Serialization:** dict/list to safe JSON-like form; large/numpy/pandas/torch objects → type + shape/len + preview; otherwise `repr()`.
+**Crash-survivability:** writer flushes + fsyncs each line; if `vars_enabled=False`, no `debug_vars` file is produced.&#x20;
+
+---
+
 ## Persistence & Modularity
 
-Vectors persist as **NumPy `.pkl` snapshots**; Chroma on-disk collection is planned once stable in your environment. The system remains modular to enable future AWS TinnyLlama Cloud integration (swap embedding models, LLMs, or vector store without touching UI/controller surfaces).&#x20;
+Vectors persist as **NumPy `.pkl` snapshots**; Chroma on-disk collection is planned once stable in your environment. **ConversationMemory** persists text in `conversation.log` and publishes **Layer-E** snapshots via atomic swap. The system remains modular to enable future AWS TinnyLlama Cloud integration (swap embedding models, LLMs, or vector store without touching UI/controller surfaces).&#x20;
 
 ---
 
 # Sync Report
 
-**Imported from Requirements v2.2:**
+**Integrated features (per Requirements v2.2):**
 
-* ConversationMemory with **Layer-G + Layer-E (selection-only semantic index with guardrails)**; explicit separation from the document store; capacity/budget; fusion (embeddings + synonym/acronym list + recency + importance); authority/dedup; integrity/version metadata; determinism; transparency; acceptance.&#x20;
-* **A2 audit + single bounded re-run** with **material scope change rubric**.&#x20;
-* **UI-08/UI-09** external reply → history import (`source=external`).&#x20;
-* **FileManifest is Must** (sha256/MD5, mtime).&#x20;
-* Authority order **❖ FILES > newer > older** preserved; no Tooling/MVP; personal-use only; modular/TinnyLlama-ready.&#x20;
+* **Feature-1:** Durable `conversation.log`, Layer-G tail read, dedicated Layer-E **selection-only** embedding store, async delta worker, **atomic** snapshot publishing, per-prompt read paths (G from log, E from latest snapshot), startup/backfill behavior, and preservation of authority/eligibility/dedup rules.&#x20;
+* **Feature-2:** **Debug Logger** with trace/vars files, methods, truncation, levels, optional rollover, serialization rules, and crash-survivability semantics.&#x20;
+* **UI-08/09:** External reply import path (`source=external`) into ConversationMemory and participation in Layer-E selection/dedup.&#x20;
+* **FileManifest = Must**; authority order **❖ FILES > newer > older**; Exact File Lock; Eligibility Pool; A2 audit with **single bounded re-run** and **material scope change** rubric.
 
-**Updated/added lines & blocks:**
+**Sections/diagrams updated:**
 
-* Main diagram: added **External Reply box (UI-08/09)** and annotated ConversationMemory as **selection-only** for Layer-E.&#x20;
-* Ingestion & Memory: **FileManifest** upgraded to **required**; clarified `.pkl` persistence.&#x20;
-* Conversation Memory subsection: replaced “no embedding chat” with **selection-only semantic index**; added guardrails bullets.&#x20;
-* A2 section: inserted **material scope change rubric** and one-re-run cap.&#x20;
-* End-to-End Narrative: appended **external reply path**.&#x20;
+* Main query-flow diagram (added UI-08/09 and explicit ConversationMemory note).&#x20;
+* Conversation Memory subsection (expanded for persistence + async Layer-E embedding + atomic swap).&#x20;
+* New Feature-1 and Feature-2 sections without altering agent interfaces.
+* Persistence & Modularity paragraph (clarified CM persistence).&#x20;
 
-**No contradictions detected** between `Requirements.md v2.2` and this `Architecture_2.md`. The document keeps the original structure and ASCII style; unchanged parts are preserved verbatim. The next step is to **sync `PlanetextUML.md`** to reflect: ConversationMemory (Layer-G/E selection-only), FileManifest=Must, UI-08/09 link to ConversationMemory, and the A2 audit re-run rubric.&#x20;
+**Alignment confirmation:**
+`Architecture_2.md` now reflects **all** requirements pertaining to Layer-E selection-only embeddings, durability, external reply import, the bounded A2 audit re-run, Eligibility Pool, authority order, FileManifest, and Debug Logger. **No contradictions detected** with the current `Requirements.md`.&#x20;
+
+---

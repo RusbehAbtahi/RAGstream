@@ -1,4 +1,12 @@
-@startuml
+@startuml RAGstream2_Full
+'──────────────────────────────────────────────────────────────
+'  GLOBAL SETTINGS
+'──────────────────────────────────────────────────────────────
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
 '──────────────────────────────────────────────────────────────
 '  0) CONFIG & UTILS
 '──────────────────────────────────────────────────────────────
@@ -18,10 +26,22 @@ package "Config & Utils" {
         + error(msg:str) : None
         - _logger : logging.Logger
     }
+
+    ' Feature-2: Debug Logger (developer-oriented; optional)
+    class DebugLogger {
+        + logWriteText(msg:str, level:str="INFO") : None
+        + logWriteVar(pairs:Any) : None
+        + rotate_if_needed() : None
+        - vars_enabled : bool
+        - min_level : str
+        - session_id : str
+        - trace_path : Path
+        - vars_path  : Path
+    }
 }
 
 '──────────────────────────────────────────────────────────────
-'  1) INGESTION / MEMORY
+'  1) INGESTION & MEMORY LAYER
 '──────────────────────────────────────────────────────────────
 package "Ingestion / Memory" {
 
@@ -58,29 +78,72 @@ package "Ingestion / Memory" {
         - _id2idx : Dict[str,int]
     }
 
-    ' --- ConversationMemory (read-only; two-layer; Layer-E = selection-only semantic index)
+    ' Feature-1: Conversation Memory (read-only; two-layer, soft-fading)
     class ConversationMemory {
-        + get_recent(k:int=5) : List[Tuple[str,str]]      ' Layer-G (recency window)
-        + get_episodic() : List[Tuple[str,str]]           ' Layer-E (episodic, on-topic)
+        + get_recent(k:int=5) : List[Tuple[str,str]]       ' Layer-G (recency window)
+        + get_episodic() : List[Tuple[str,str]]            ' Layer-E (episodic, on-topic)
         - k_default : int
         - soft_fading : bool
         - conflict_policy : str    ' ❖ FILES > newer > older (dedup)
-        - capacity_cap : int       ' hard cap for selection-only vectors (E)
     }
 
-    ' FileManifest is Must (hash + mtime) for deterministic inclusion/versioning
-    class FileManifest {
-        + path : str
-        + sha  : str              ' sha256 or MD5
-        + mtime: float
-        + type : str
+    ' Feature-1: Append-only conversation log (single source of truth)
+    class ConversationLog {
+        + append_turn(user_text:str, assistant_text:str, source:str="chat") : None
+        + tail_pairs(k:int=5) : List[Tuple[str,str]]
+        - path : Path            ' PATHS.logs/conversation.log
+        - fsync : bool
+    }
+
+    ' Feature-1: Layer-E dedicated store (separate from document vectors)
+    class HistoryStoreNP implements IVectorStore {
+        + add(ids,vectors,meta) : None
+        + query(vector,k=10) : List[str]
+        + snapshot(ts:str) : None
+        - persist_path : Path     ' PATHS.logs/history_store.pkl
+        - db_file : Path
+        - _ids : List[str]
+        - _meta : List[Dict]
+        - _emb : ndarray
+        - _id2idx : Dict[str,int]
+    }
+
+    ' Feature-1: Async delta embedding worker for Layer-E (staging + atomic publish)
+    class HistoryEmbeddingWorker {
+        + enqueue_tail() : None
+        + process() : None
+        + publish() : None          ' os.replace(dynamic → stable)
+        - staging_path : Path       ' history_store_dynamic.pkl
+        - stable_path  : Path       ' history_store.pkl
+        - last_offset  : int
+        - overlap_chunks : int
+    }
+
+    ' Feature-1: Persistent metadata store for E-items (optional helper)
+    class ConvMemStore {
+        + load() : List[Tuple[str,str,Dict]]
+        + save(items:List[Tuple[str,str,Dict]]) : None
+        + append(item:Tuple[str,str,Dict]) : None
+        + evict(ids:List[str]) : None
+        - path : Path            ' e.g., PATHS.logs/convmem_e.json
+        - backend : str          ' "json" | "sqlite"
     }
 
     DocumentLoader --> Chunker : raw text
     Chunker --> Embedder : chunks
     Embedder --> IVectorStore : ids + vectors
-    Paths ..> DocumentLoader : uses PATHS.raw_docs
+
+    ' History persistence and selection-only index
+    ConversationMemory --> ConversationLog : reads G tail
+    ConversationMemory --> HistoryStoreNP  : reads E snapshot
+    HistoryEmbeddingWorker --> ConversationLog : read new tail
+    HistoryEmbeddingWorker --> HistoryStoreNP  : write staging + publish
+    ConversationMemory --> ConvMemStore : uses (metadata; capacity/fading)
+
+    Paths ..> DocumentLoader : uses PATHS.doc_raw
     Paths ..> VectorStoreNP  : uses PATHS.vector_pkls
+    Paths ..> ConversationLog : uses PATHS.logs
+    Paths ..> HistoryStoreNP  : uses PATHS.logs
 }
 
 '──────────────────────────────────────────────────────────────
@@ -122,7 +185,7 @@ package "Agents (app/agents)" {
     }
 
     class A2_PromptShaper {
-        + propose(question:str) : Dict[str,str]           ' {intent, domain, headers}
+        + propose(question:str) : Dict[str,str]                ' {intent, domain, headers}
         + audit_and_rerun(shape:Dict, s_ctx:List[str]) : bool  ' single bounded re-run gate
     }
 
@@ -171,11 +234,13 @@ package "Application Layer" {
         - eligibility_pool : Set[str]
         - exact_lock : bool
         - convmem : ConversationMemory
+        - debug_logger : DebugLogger
     }
 
     class StreamlitUI {
         + render() : None
-        + send_to_history(text:str) : None   ' UI-09 (append external reply)
+        + external_reply_box() : str    ' UI-08
+        + send_to_history(text:str) : None  ' UI-09
         - ctrl : AppController
     }
 
@@ -192,7 +257,7 @@ AppController --> Retriever       : retrieve() [if not exact_lock]
 AppController --> Reranker        : rerank()
 AppController --> A3_NLIGate      : filter()
 AppController --> A4_Condenser    : condense() -> S_ctx
-AppController --> A2_PromptShaper : audit_and_rerun()  ' bounded re-run (scope change)
+AppController --> A2_PromptShaper : audit_and_rerun()  ' single bounded re-run gate
 AppController --> PromptBuilder   : build()
 AppController --> LLMClient       : complete()
 
@@ -200,8 +265,9 @@ AppController --> LLMClient       : complete()
 AppController ..> ConversationMemory : reads G/E (non-authoritative)
 PromptBuilder ..> ConversationMemory : may show RECENT HISTORY
 
-' External Reply path (UI-08/09)
-StreamlitUI ..> ConversationMemory : append external reply (source=external)
+' External reply import (UI-08/09)
+StreamlitUI --> AppController : send_to_history()
+AppController --> ConversationLog : append_turn(source="external")
 
 ' Ingestion path
 DocumentLoader --> Chunker
@@ -212,17 +278,22 @@ Embedder --> IVectorStore
 PromptBuilder ..> A1_DCI        : receives ❖ FILES
 PromptBuilder ..> A4_Condenser  : receives S_ctx
 
+' Debug logging
+AppController --> DebugLogger : logWriteText()/logWriteVar()
+StreamlitUI --> DebugLogger   : logWriteText()
+
 ' Misc
 Settings ..> LLMClient : API keys/config
 Settings ..> Embedder  : API keys/config
-SimpleLogger ..> AppController : ephemeral logs/status
+SimpleLogger ..> AppController : errors only
+Paths ..> AppController : PATHS used across
 
 note right of AppController
   Authority order in PromptBuilder:
   [Hard Rules] → [Project Memory] → [❖ FILES]
   → [S_ctx] → [Task/Mode]
   (RECENT HISTORY is optional & non-authoritative)
-  Personal use only: no Tooling, no MVP, no persistent logs.
+  Personal use only: no MVP; no Tooling package.
 end note
 
 note bottom of VectorStoreNP
@@ -230,7 +301,19 @@ note bottom of VectorStoreNP
   NumPy-backed exact cosine
   with .pkl snapshots.
 end note
+
+note bottom of HistoryStoreNP
+  Layer-E selection-only index
+  persisted under PATHS.logs
+  (history_store.pkl with atomic swap).
+end note
+
 A1_DCI -[hidden]down-> A2_PromptShaper
 A2_PromptShaper -[hidden]down-> A3_NLIGate
 A3_NLIGate -[hidden]down-> A4_Condenser
+
+Settings -[hidden]down-> SimpleLogger
+Paths -[hidden]down-> Settings
+
+ConversationMemory-[hidden]down->  DocumentLoader
 @enduml
