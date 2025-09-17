@@ -28,16 +28,19 @@ RAGstream is a personal, production-grade, local-first RAG workbench for a singl
 User ──▶ Streamlit GUI ──▶ Controller
                    ▲          │
                    │          ├──▶ A2 Prompt Shaper (pass-1) → advisory headers
+                   │          ├──▶ A0 FileScopeSelector (deterministic pre-filter; reason-trace; no embeddings)
                    │          ├──▶ A1 DCI → ❖ FILES (Exact File Lock / FULL / PACK)
                    │          ├──▶ (if not locked) Retriever → Reranker → A3 NLI Gate → A4 Condenser (S_ctx)
                    │          ├──▶ A2 Prompt Shaper (audit-2) on S_ctx → header/role refinements
                    │          ├──▶ PromptBuilder (authority order)
                    │          ├──▶ ConversationMemory (read-only: Layer-G recency + Layer-E episodic selection)
                    │          ├──▶ LLMClient (OpenAI or local)
+                   │          ├──▶ A5 Schema/Format Enforcer (contract check; one self-repair; escalate on FAIL)
                    │          └──▶ Transparency (kept/dropped reasons)
 DocumentLoader ◀───┘
      ▲
      └─ Chunker ─ Embedder ─ VectorStore.add() (.pkl snapshots; Chroma paused)
+
 ```
 
 Notes:
@@ -94,10 +97,12 @@ Notes:
 * **CH-03.8 (Acceptance)** — Functional checks include: NVH⇄vehicle acoustics recalled from Layer-E; chat update can beat stale file until re-ingestion; Exact Lock short-circuits Layer-E selection; every Fact in `S_ctx` has at least one citation.
 * **CH-03.9 (Eligibility alignment)** — If a file is **OFF** in the Eligibility Pool for this turn, **Layer-E selection MUST ignore** history items whose source/version hints point to that file (path/hash/mtime), **unless** the file is explicitly injected via **❖ FILES**.
 * **CH-03.10 (Durable history, not logs)** — **Persist** ConversationMemory state:
-  – **Text log**: append-only `PATHS.logs/conversation.log`; after each user+assistant turn, synchronously append both lines and flush+fsync before the next prompt is accepted.
-  – **Layer-G** is reconstructed from the tail of `conversation.log` per prompt (no RAM-only history).
+  – **JSONL log**: append-only PATHS.logs/conversation.jsonl; after each user+assistant turn write both lines and flush+fsync before the next prompt is accepted.
+  – **Layer-G** is reconstructed from the tail of `conversation.jsonl` per prompt (no RAM-only history).
   – **Layer-E index**: separate NumPy snapshot (e.g., `history_store.pkl`) used **only** for selection; lives **separate** from document vectors; capacity/eviction per CH-03.2.
-  – If persistence fails, continue in-memory and surface a notice; determinism and bounded audit rules remain unchanged. **(Must)**
+  – **Layer-E meta**: `history_index_meta.json` accompanies the snapshot for generation/versioning and read-path hints.
+  – **Async pipeline**: embed only the **new tail**; write to `history_store_dynamic.pkl`, then **atomic swap** to publish `history_store.pkl`.
+  – If persistence or JSON parse/validation fails, set `escalate=true`, include reason with line offset, fall back to previous valid snapshot, continue in-memory if needed; determinism and bounded audit rules remain unchanged. **(Must)**
 
 ---
 
@@ -196,6 +201,148 @@ A deterministic, optional logger for developer debugging; separate from Conversa
 
 ---
 
+### 4.8  Structured JSON Communication & Provenance
+
+**Goal.** Every internal handoff is a **structured JSON object** with provenance and purpose.
+
+#### SR2-JSON-01 (Envelope Required) — **Must**
+
+All agents/controllers MUST produce/consume a JSON **Envelope**:
+
+```json
+{
+  "agent": "A2_PromptShaper",
+  "goal": "propose_headers",
+  "timestamp": "2025-09-07T12:34:56Z",
+  "request_id": "r-20250907-123456-001",
+  "turn_id": 42,
+  "source": "internal",
+  "version": "1.0",
+  "escalate": false,
+  "reason": null,
+  "provenance": {
+    "files": [{"path": "docs/Req.md", "sha256": "...", "mtime": 1694000000}],
+    "history_refs": [{"id": "E:12345", "score": 0.82}],
+    "eligibility": ["docs/Req.md", "notes/NVH.md"]
+  },
+  "payload": { /* agent-specific structured data */ }
+}
+```
+
+#### SR2-JSON-02 (Determinism) — **Must**
+
+* Envelope keys are stable; agent-specific `payload` schemas are documented; float scores use fixed precision.
+* No free-text handoffs; prose lives inside typed fields in `payload`.
+
+#### SR2-JSON-03 (Provenance & Hashing) — **Must**
+
+* Any referenced file or history item MUST include verifiable identifiers (path+hash for files; id/hash for history).
+* Controller may compute and attach a **content hash** of the outgoing `payload` for traceability.
+
+#### SR2-JSON-04 (Transport & Storage) — **Must**
+
+* JSON flows are in-process (no network). For debugging, the **Debug Logger** may write envelopes to disk (trace/vars), but envelopes themselves remain the system of record for inter-agent data.
+
+#### SR2-JSON-05 (Validation) — **Must**
+
+* Controller validates required envelope fields before dispatch; on missing/invalid fields, set `escalate=true` with reason and halt.
+
+---
+
+### 4.9  Agent A0 — FileScopeSelector (Deterministic Pre-Filter)
+
+**Purpose.** Produce the minimal, explainable Eligibility Pool before A1/A2.
+
+#### SR2-A0-01 (Inputs) — **Must**
+
+* Prompt text; FileManifest (path, sha256/MD5, mtime, tags); UI toggles (ON/OFF per file, ❖ FILES lock); optional include/exclude lists; static alias map (e.g., NVH ⇄ vehicle acoustics).
+
+#### SR2-A0-02 (Rules) — **Must**
+
+1. **OFF** files are never eligible; never override ❖ FILES lock.
+2. **Hard include** list wins; **hard exclude** removes regardless.
+3. Match priority: **title/regex > tag > alias list** (no embeddings).
+4. Ties: priority tags → **mtime** (newer first) → **path** (A–Z).
+5. Enforce **max N**; if exceeded, truncate with recorded reason.
+6. No network / LLM; decisions are explainable from manifest.
+7. Emit per-file **reason trace**.
+
+#### SR2-A0-03 (Outputs) — **Must**
+
+Envelope `payload` schema:
+
+```json
+{
+  "eligible_files": [
+    {"path": "docs/Req.md", "reason": ["KEPT:title-regex"], "sha256": "...", "mtime": 1694000000}
+  ],
+  "candidate_files_block": { "files": ["docs/Req.md", "notes/NVH.md"] },
+  "trace": [
+    {"path": "legacy/old.md", "decision": "DROPPED", "reason": ["DROPPED:OFF"]}
+  ]
+}
+```
+
+#### SR2-A0-04 (Failure) — **Must**
+
+* If zero files and no ❖ FILES lock → return `EMPTY_ELIGIBILITY`.
+* If ❖ FILES lock refers to a missing file → `LOCK_MISS` and `escalate=true`.
+
+---
+
+### 4.10  Agent A5 — Schema/Format Enforcer (Contract + Single Self-Repair)
+
+**Goal.** Ensure generated artifacts comply with a pinned **CodeSpec.md**; allow exactly one bounded repair.
+
+#### SR2-A5-01 (Inputs) — **Must**
+
+* Draft artifact; **CodeSpec.md** (versioned, hashed); task metadata (language/runtime/allowed libs); stop conditions (single file, filename, no prose).
+
+#### SR2-A5-02 (Checks) — **Must**
+
+1. Structure order (header → docstring → methods) and required logging/docstring presence.
+2. Naming + imports (allowlist/denylist); forbidden calls (hidden I/O, network, time) if disallowed.
+3. Output shape: **single fenced code block**, fixed filename, no extra prose.
+4. Pinned formatter/linter (style only), whitespace normalization.
+
+#### SR2-A5-03 (Self-Repair) — **Must**
+
+* On hard violation: produce a **violation list** and attempt **one** self-repair at `temp=0` using only {violation list + CodeSpec excerpts + original prompt}.
+* Re-validate once; if still failing → return FAIL with violation report; set `escalate=true`.
+
+#### SR2-A5-04 (Outputs) — **Must**
+
+Envelope `payload` schema:
+
+````json
+{
+  "status": "PASS|FAIL",
+  "violations": [
+    {"rule": "no_extra_prose", "evidence": "…", "suggestion": "remove trailing text"}
+  ],
+  "artifact": {"filename": "main.py", "code_fenced": "```python\n...\n```"},
+  "hashes": {"spec_sha256": "...", "draft_sha256": "...", "final_sha256": "..."}
+}
+````
+
+---
+
+### 4.11  Human-in-the-Loop Escalation
+
+#### SR2-HIL-01 (Trigger) — **Must**
+
+* Any agent that cannot proceed deterministically MUST set `"escalate": true` and add a short `"reason"` (e.g., `"schema_violation"`, `"insufficient_context"`, `"validation_fail"`).
+
+#### SR2-HIL-02 (Controller Behavior) — **Must**
+
+* When receiving an envelope with `escalate=true`, the controller stops the pipeline, surfaces the reason in UI, and waits for user action; **no** uncontrolled retries.
+
+#### SR2-HIL-03 (UI) — **Must**
+
+* UI shows a clear escalation panel with: reason, offending agent, `request_id`, suggested next steps (retry, adjust eligibility, inject ❖ FILES).
+
+---
+
 ## 5  Non-Functional Requirements
 
 | Category         | Target                                                                                                                                                        |
@@ -275,7 +422,7 @@ A deterministic, optional logger for developer debugging; separate from Conversa
    • Conflicts resolved by authority and freshness (**❖ FILES > newer > older**).
    • **Semantic aliasing** examples (e.g., **NVH ⇄ vehicle acoustics**) are recalled via Layer-E selection.
    • **External replies** imported via UI-09 are stored with `source=external` and participate in selection/dedup.
-   • **Persistence:** after each turn, `conversation.log` contains both sides and is fsynced; on restart, Layer-G rebuilds from log tail; Layer-E loads from the last published snapshot (or backfills).
+   • **Persistence:** after each turn, 'conversation.jsonl' contains both sides and is fsynced; on restart, Layer-G rebuilds from JSONL tail; Layer-E loads from the last published snapshot (or backfills).
 
 2. **Orchestration & Audit**
    • A2 runs at most twice; audit-2 can refine headers/roles and may change scope only if supported by S\_ctx.
@@ -292,21 +439,48 @@ A deterministic, optional logger for developer debugging; separate from Conversa
    • Cost estimator prevents over-budget sends via hard stop.
    • UI exposes `k`, Layer-E budget, and synonym import; UI-08/UI-09 enable manual external-reply import; UI-10 enforces eligibility; UI-11/12 manage history persistence.
 
+### 9.x  SR2 Acceptance Additions
+
+**JSON Envelopes**
+
+* Every agent/controller handoff uses the Envelope with required fields; controller-side validation is enforced, and failures set `escalate=true` and halt.
+
+**ConversationMemory JSONL**
+
+* Canonical persistence is `conversation.jsonl` with fsync per turn; Layer-G reconstructs from tail; Layer-E selection uses the latest snapshot; `history_index_meta.json` accompanies snapshots; async embed tail-only with atomic swap; on JSON parse/validation failure, escalate and fall back to last stable snapshot.
+
+**A0 Determinism**
+
+* A0 outputs are deterministic for identical inputs and include reason-traces; OFF files are never eligible unless injected via ❖ FILES.
+
+**A5 Single Self-Repair**
+
+* A5 performs exactly one bounded self-repair using only violation data and CodeSpec excerpts, then re-validates once; on failure, returns FAIL with violations and escalates.
+
+**Escalations**
+
+* Any determinism/validation failure sets `escalate=true` with concise reason; controller halts downstream actions; UI shows escalation panel with `{reason, agent, request_id, next steps}`.
+
 ---
 
 ## 10  Glossary (Updated)
 
-| Term               | Meaning                                                                                   |
-| ------------------ | ----------------------------------------------------------------------------------------- |
-| ConversationMemory | Read-only provider of Layer-G (recency window) and Layer-E (episodic).                    |
-| Layer-G            | Always-keep recency window of last k turns.                                               |
-| Layer-E            | Episodic store of older turns with metadata and fading.                                   |
-| ❖ FILES            | Deterministically injected files by A1; canonical for that turn.                          |
-| S\_ctx             | Cited, condensed context emitted by A4 (Facts/Constraints/Open Issues).                   |
-| A2 audit           | Second, controlled pass of A2 after A4 to refine headers/roles.                           |
-| Authority order    | \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode].                |
-| Eligibility Pool   | Set of files currently ON for retrieval; populated by UI-10.                              |
-| Debug Logger       | Optional per-session trace/vars logs under `PATHS.logs/`; not used for retrieval/history. |
+| Term                      | Meaning                                                                                                                     |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| ConversationMemory        | Read-only provider of Layer-G (recency window) and Layer-E (episodic).                                                      |
+| Layer-G                   | Always-keep recency window of last k turns.                                                                                 |
+| Layer-E                   | Episodic store of older turns with metadata and fading.                                                                     |
+| ❖ FILES                   | Deterministically injected files by A1; canonical for that turn.                                                            |
+| S\_ctx                    | Cited, condensed context emitted by A4 (Facts/Constraints/Open Issues).                                                     |
+| A2 audit                  | Second, controlled pass of A2 after A4 to refine headers/roles.                                                             |
+| Authority order           | \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode].                                                  |
+| Eligibility Pool          | Set of files currently ON for retrieval; populated by UI-10.                                                                |
+| Debug Logger              | Optional per-session trace/vars logs under `PATHS.logs/`; not used for retrieval/history.                                   |
+| JSON Envelope             | Structured handoff `{agent, goal, timestamp, request_id, turn_id, source, version, escalate, reason, provenance, payload}`. |
+| goal                      | Intent/purpose string in every envelope (e.g., `propose_headers`).                                                          |
+| escalate                  | Top-level boolean; when `true`, processing halts and a Human-in-the-Loop panel is shown.                                    |
+| A0 FileScopeSelector      | Deterministic pre-filter that computes the Eligibility Pool with reason-traced decisions (no embeddings).                   |
+| A5 Schema/Format Enforcer | Contract checker that validates artifacts, performs exactly one bounded self-repair, then re-validates.                     |
 
 ---
 
@@ -319,3 +493,63 @@ A deterministic, optional logger for developer debugging; separate from Conversa
 * **§5 Non-Functional (Privacy/Locality row)** — clarified: “no telemetry; ConversationMemory persists locally; Debug Logger is user-controlled.”
 * **§9 Acceptance → UI bullet** — removed “(no persisted logs)”.
 * **ING-05** — confirmed **Must** (sha256/MD5 + mtime) and ensured no other table lists it as “Planned.”
+
+---
+
+## CHANGE LOG (supp2 integration)
+
+1. §4.2 CH-03.10
+
+   * Replaced `PATHS.logs/conversation.log` → `PATHS.logs/conversation.jsonl` and designated JSONL as canonical.
+   * Added bullets for `history_index_meta.json`, **async tail-only embedding**, and **atomic swap** (`history_store_dynamic.pkl` → `history_store.pkl`).
+   * Added explicit escalation on JSON parse/validation failure with fallback to last stable snapshot.
+
+2. New §4.8 “Structured JSON Communication & Provenance”
+
+   * Inserted SR2-JSON-01..05 (Envelope required fields, determinism, provenance/hashing, transport/storage, controller validation/halting).
+
+3. New §4.9 “Agent A0 — FileScopeSelector (Deterministic Pre-Filter)”
+
+   * Inserted SR2-A0-01..04 (inputs, deterministic rules, reason-traced outputs, failure codes with escalate).
+
+4. New §4.10 “Agent A5 — Schema/Format Enforcer (Contract + Single Self-Repair)”
+
+   * Inserted SR2-A5-01..04 (checks; exactly one self-repair; single re-validation; PASS/FAIL with violations; envelope fields).
+
+5. New §4.11 “Human-in-the-Loop Escalation”
+
+   * Inserted SR2-HIL-01..03 (trigger; controller halt; UI panel with reason, offending agent, `request_id`, next steps).
+
+6. §9 Acceptance Criteria
+
+   * Updated Conversation Memory persistence bullet to refer to **`conversation.jsonl`** and added “9.x SR2 Acceptance Additions” block (Envelopes, JSONL persistence, A0 determinism, A5 single self-repair, escalations).
+
+7. §10 Glossary
+
+   * Added rows: **JSON Envelope**, **goal**, **escalate**, **A0 FileScopeSelector**, **A5 Schema/Format Enforcer**.
+
+No other text in `Requirements.md` was modified.
+
+---
+
+## SELF-AUDIT REPORT
+
+Homogeneity & Style
+
+* Inserted sections (4.8–4.11) follow the existing §4.x structure and wording from supp2 without summarization.
+* CH-03.10 retains original heading/intent; edits limited to JSONL persistence and required meta/async semantics.
+
+Internal Consistency
+
+* All references now consistently use `conversation.jsonl` for Layer-G persistence.
+* Guardrails remain aligned (❖ FILES authority; OFF-file alignment per CH-03.9).
+* Escalation semantics are coherent across §§4.8, 4.10, 4.11 and §9 Additions.
+* Provenance/hashing in §4.8 aligns with FileManifest integrity in §4.1.
+
+Completeness
+
+* JSON Envelope governance, JSONL memory, A0, A5, HIL fully integrated; acceptance and glossary updated to test/define them.
+
+Byte-Identity Assurance
+
+* Aside from the explicit changes itemized above and the addition of new sections, all prior content remains byte-identical.

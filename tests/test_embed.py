@@ -6,11 +6,16 @@ import time
 from ragstream.ingestion.loader import DocumentLoader
 from ragstream.ingestion.chunker import Chunker
 from ragstream.ingestion.embedder import Embedder
-from ragstream.ingestion.vector_store_np import VectorStoreNP
+from ragstream.ingestion.vector_store_np import VectorStoreNP  # keep if your module is named this way
 
-ROOT = Path(__file__).resolve().parent
-RAW_DIR = ROOT / "ragstream" / "data" / "doc_raw" / "project1"
-DB_DIR  = ROOT / "ragstream" / "data" / "np_store" / "project1"
+# tests/ is one level below repo root
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR  = REPO_ROOT / "data"
+
+WORKSPACE = "project1"  # or pass via CLI/ENV
+
+RAW_DIR = DATA_DIR / "doc_raw"      / WORKSPACE
+DB_DIR  = DATA_DIR / "np_store"     / WORKSPACE   # or DATA_DIR / "vector_pkls" / WORKSPACE to match Requirements
 
 def stable_id(path: str, chunk_text: str) -> str:
     h = blake2b(digest_size=16)
@@ -22,13 +27,13 @@ def main():
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("ROOT:", ROOT)
+    print("REPO_ROOT:", REPO_ROOT)
     print("RAW_DIR:", RAW_DIR)
     print("DB_DIR:", DB_DIR)
 
-    # 1) Load docs from ragstream/data/doc_raw/project1
-    loader = DocumentLoader(Path("ragstream/data/doc_raw"))
-    docs = loader.load_documents("project1")
+    # 1) Load docs from data/doc_raw/<workspace>
+    loader = DocumentLoader(DATA_DIR / "doc_raw")
+    docs = loader.load_documents(WORKSPACE)
     print("Loaded docs:", len(docs))
 
     # 2) Chunk
@@ -49,7 +54,7 @@ def main():
     t2 = time.perf_counter()
     print("Embeddings returned:", len(vectors), "embed_time_s:", round(t2 - t1, 3))
 
-    # 4) Save to NumPy VectorStore under ragstream/data/np_store/project1
+    # 4) Save to NumPy VectorStore under data/np_store/<workspace>
     ids = [stable_id(path, chunk_text) for path, chunk_text in chunks]
     meta = [{"source": path} for path, _ in chunks]
 

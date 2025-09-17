@@ -1,0 +1,203 @@
+@startuml RAGstream2_Simplified
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+package "Config & Utils" {
+    class Settings {
+        + get()
+    }
+
+    class Paths {
+        + PATHS
+        + ROOT
+    }
+
+    class SimpleLogger {
+        + log()
+        + error()
+    }
+
+    class DebugLogger {
+        + logWriteText()
+        + logWriteVar()
+        + rotate_if_needed()
+    }
+}
+
+package "Ingestion / Memory" {
+    class DocumentLoader {
+        + load_documents()
+    }
+
+    class Chunker {
+        + split()
+    }
+
+    class Embedder {
+        + embed()
+    }
+
+    interface IVectorStore {
+        + add()
+        + query()
+        + snapshot()
+    }
+
+    class VectorStoreNP implements IVectorStore {
+        + add()
+        + query()
+        + snapshot()
+    }
+
+    class ConversationMemory {
+        + get_recent()
+        + get_episodic()
+    }
+
+    class ConversationLog {
+        + append_turn()
+        + tail_pairs()
+    }
+
+    class HistoryStoreNP implements IVectorStore {
+        + add()
+        + query()
+        + snapshot()
+    }
+
+    class HistoryEmbeddingWorker {
+        + enqueue_tail()
+        + process()
+        + publish()
+    }
+
+    class ConvMemStore {
+        + load()
+        + save()
+        + append()
+        + evict()
+    }
+
+    DocumentLoader --> Chunker
+    Chunker --> Embedder
+    Embedder --> IVectorStore
+    ConversationMemory --> ConversationLog
+    ConversationMemory --> HistoryStoreNP
+    HistoryEmbeddingWorker --> ConversationLog
+    HistoryEmbeddingWorker --> HistoryStoreNP
+    ConversationMemory --> ConvMemStore
+}
+
+package "Retrieval & Ranking" {
+    class DocScore
+    class Reranker {
+        + rerank()
+    }
+    class Retriever {
+        + retrieve()
+    }
+
+    Retriever --> IVectorStore
+    Retriever --> Embedder
+    Retriever --> Reranker
+    Retriever ..> DocScore
+}
+
+package "Agents (app/agents)" {
+    class A0_FileScopeSelector {
+        + filter()
+    }
+
+    class A1_DCI {
+        + build_files_block()
+    }
+
+    class A2_PromptShaper {
+        + propose()
+        + audit_and_rerun()
+    }
+
+    class A3_NLIGate {
+        + filter()
+    }
+
+    class A4_Condenser {
+        + condense()
+    }
+
+    class A5_SchemaEnforcer {
+        + validate()
+    }
+}
+
+package "Prompt Orchestration" {
+    class PromptBuilder {
+        + build()
+    }
+
+    class LLMClient {
+        + complete()
+        + estimate_cost()
+    }
+
+    class JSONEnvelope
+}
+
+package "Application Layer" {
+    class AppController {
+        + handle()
+    }
+
+    class StreamlitUI {
+        + render()
+        + external_reply_box()
+        + send_to_history()
+        + persist_history_toggle()
+        + clear_history()
+        + set_history_controls()
+        + export_with_citations()
+    }
+
+    StreamlitUI --> AppController
+}
+
+' Controller flow and dependencies
+AppController --> A2_PromptShaper
+AppController --> A0_FileScopeSelector
+AppController --> A1_DCI
+AppController --> Retriever
+AppController --> Reranker
+AppController --> A3_NLIGate
+AppController --> A4_Condenser
+AppController --> A2_PromptShaper
+AppController --> A5_SchemaEnforcer
+AppController --> PromptBuilder
+AppController --> LLMClient
+
+' History exposure (read-only)
+AppController ..> ConversationMemory
+PromptBuilder ..> ConversationMemory
+
+' External reply import (UI-08/09)
+StreamlitUI --> AppController
+AppController --> ConversationLog
+
+' PromptBuilder inputs
+PromptBuilder ..> A1_DCI
+PromptBuilder ..> A4_Condenser
+
+' Debug logging
+AppController --> DebugLogger
+StreamlitUI --> DebugLogger
+
+' Config wiring
+Settings ..> LLMClient
+Settings ..> Embedder
+SimpleLogger ..> AppController
+Paths ..> AppController
+A0_FileScopeSelector -[hidden]down-> A5_SchemaEnforcer
+
+A2_PromptShaper -[hidden]down-> A3_NLIGate
+@enduml

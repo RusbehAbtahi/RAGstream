@@ -91,7 +91,7 @@ package "Ingestion / Memory" {
     class ConversationLog {
         + append_turn(user_text:str, assistant_text:str, source:str="chat") : None
         + tail_pairs(k:int=5) : List[Tuple[str,str]]
-        - path : Path            ' PATHS.logs/conversation.log
+        - path : Path            ' PATHS.logs/conversation.jsonl
         - fsync : bool
     }
 
@@ -125,7 +125,7 @@ package "Ingestion / Memory" {
         + save(items:List[Tuple[str,str,Dict]]) : None
         + append(item:Tuple[str,str,Dict]) : None
         + evict(ids:List[str]) : None
-        - path : Path            ' e.g., PATHS.logs/convmem_e.json
+        - path : Path            ' e.g. PATHS.logs/convmem_e.json
         - backend : str          ' "json" | "sqlite"
     }
 
@@ -140,10 +140,10 @@ package "Ingestion / Memory" {
     HistoryEmbeddingWorker --> HistoryStoreNP  : write staging + publish
     ConversationMemory --> ConvMemStore : uses (metadata; capacity/fading)
 
-    Paths ..> DocumentLoader : uses PATHS.doc_raw
-    Paths ..> VectorStoreNP  : uses PATHS.vector_pkls
-    Paths ..> ConversationLog : uses PATHS.logs
-    Paths ..> HistoryStoreNP  : uses PATHS.logs
+    Paths .> DocumentLoader : uses PATHS.doc_raw
+    Paths .> VectorStoreNP  : uses PATHS.vector_pkls
+    Paths .> ConversationLog : uses PATHS.logs
+    Paths .> HistoryStoreNP  : uses PATHS.logs
 }
 
 '──────────────────────────────────────────────────────────────
@@ -170,13 +170,19 @@ package "Retrieval & Ranking" {
     Retriever --> IVectorStore
     Retriever --> Embedder
     Retriever --> Reranker
-    Retriever ..> DocScore
+    Retriever .> DocScore
 }
 
 '──────────────────────────────────────────────────────────────
-'  3) AGENTS (A1–A4)
+'  3) AGENTS (A0–A5)
 '──────────────────────────────────────────────────────────────
 package "Agents (app/agents)" {
+
+    class A0_FileScopeSelector {
+        + filter(manifest:List[Dict], toggles:Dict, lock:bool) : Dict
+        - alias_map : Dict[str,str]
+        - reason_trace : List[str]
+    }
 
     class A1_DCI {
         + build_files_block(named_files:List[str], lock:bool) : str
@@ -197,6 +203,12 @@ package "Agents (app/agents)" {
     class A4_Condenser {
         + condense(kept:List[str]) : List[str]   ' S_ctx lines: Facts/Constraints/Open Issues
     }
+
+    class A5_SchemaEnforcer {
+        + validate(artifact:str, spec:str) : Dict
+        - max_repairs : int
+        - last_result : Dict
+    }
 }
 
 '──────────────────────────────────────────────────────────────
@@ -213,6 +225,20 @@ package "Prompt Orchestration" {
         + complete(prompt:str) : str
         + estimate_cost(tokens:int) : float
         - model : str
+    }
+
+    class JSONEnvelope {
+        + agent : str
+        + goal : str
+        + timestamp : str
+        + request_id : str
+        + turn_id : int
+        + source : str
+        + version : str
+        + escalate : bool
+        + reason : str
+        + provenance : Dict
+        + payload : Dict
     }
 }
 
@@ -235,12 +261,18 @@ package "Application Layer" {
         - exact_lock : bool
         - convmem : ConversationMemory
         - debug_logger : DebugLogger
+        - file_scope : A0_FileScopeSelector
+        - schema_enforcer : A5_SchemaEnforcer
     }
 
     class StreamlitUI {
         + render() : None
-        + external_reply_box() : str    ' UI-08
-        + send_to_history(text:str) : None  ' UI-09
+        + external_reply_box() : str                          ' UI-08
+        + send_to_history(text:str) : None                    ' UI-09
+        + persist_history_toggle(on:bool) : None              ' UI-11
+        + clear_history() : None                              ' UI-12
+        + set_history_controls(k:int, e_budget:int, synonyms:List[str], mark_important:bool) : None  ' UI-06 / CH-03.7/CH-05
+        + export_with_citations() : Path                      ' UI-07
         - ctrl : AppController
     }
 
@@ -252,18 +284,20 @@ package "Application Layer" {
 '──────────────────────────────────────────────────────────────
 ' Controller Orchestration
 AppController --> A2_PromptShaper : propose()
+AppController --> A0_FileScopeSelector : filter()
 AppController --> A1_DCI          : build_files_block()
 AppController --> Retriever       : retrieve() [if not exact_lock]
 AppController --> Reranker        : rerank()
 AppController --> A3_NLIGate      : filter()
 AppController --> A4_Condenser    : condense() -> S_ctx
 AppController --> A2_PromptShaper : audit_and_rerun()  ' single bounded re-run gate
+AppController --> A5_SchemaEnforcer : validate()
 AppController --> PromptBuilder   : build()
 AppController --> LLMClient       : complete()
 
 ' History exposure (read-only)
-AppController ..> ConversationMemory : reads G/E (non-authoritative)
-PromptBuilder ..> ConversationMemory : may show RECENT HISTORY
+AppController .> ConversationMemory : reads G/E (non-authoritative)
+PromptBuilder .> ConversationMemory : may show RECENT HISTORY
 
 ' External reply import (UI-08/09)
 StreamlitUI --> AppController : send_to_history()
@@ -275,18 +309,18 @@ Chunker --> Embedder
 Embedder --> IVectorStore
 
 ' PromptBuilder inputs
-PromptBuilder ..> A1_DCI        : receives ❖ FILES
-PromptBuilder ..> A4_Condenser  : receives S_ctx
+PromptBuilder .> A1_DCI        : receives ❖ FILES
+PromptBuilder .> A4_Condenser  : receives S_ctx
 
 ' Debug logging
 AppController --> DebugLogger : logWriteText()/logWriteVar()
 StreamlitUI --> DebugLogger   : logWriteText()
 
 ' Misc
-Settings ..> LLMClient : API keys/config
-Settings ..> Embedder  : API keys/config
-SimpleLogger ..> AppController : errors only
-Paths ..> AppController : PATHS used across
+Settings .> LLMClient : API keys/config
+Settings .> Embedder  : API keys/config
+SimpleLogger .> AppController : errors only
+Paths .> AppController : PATHS used across
 
 note right of AppController
   Authority order in PromptBuilder:
@@ -308,12 +342,16 @@ note bottom of HistoryStoreNP
   (history_store.pkl with atomic swap).
 end note
 
+
+A0_FileScopeSelector -[hidden]down-> A1_DCI
 A1_DCI -[hidden]down-> A2_PromptShaper
 A2_PromptShaper -[hidden]down-> A3_NLIGate
 A3_NLIGate -[hidden]down-> A4_Condenser
+A4_Condenser -[hidden]down-> A5_SchemaEnforcer
 
 Settings -[hidden]down-> SimpleLogger
 Paths -[hidden]down-> Settings
 
 ConversationMemory-[hidden]down->  DocumentLoader
+ LLMClient -[hidden]down-> JSONEnvelope  
 @enduml
