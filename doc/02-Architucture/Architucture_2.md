@@ -1,6 +1,7 @@
-# Architecture – RAGstream (Aug 2025)
+````markdown
+# Architecture – RAGstream (Oct 2025)
 
-This document shows the end-to-end architecture for RAGstream, aligned with the main Requirements. It uses a local-first design with deterministic context construction, authority ordering, bounded audits, and transparent reasoning. **FileManife­st** is a **Must** for deterministic inclusion/versioning.
+This document shows the end-to-end architecture for RAGstream, aligned with the main Requirements. It uses a local-first design with deterministic context construction, authority ordering, bounded audits, and transparent reasoning. **FileManifest** is a **Must** for deterministic inclusion/versioning.
 
 ```text
                                      ┌───────────────────────────────────┐
@@ -8,13 +9,13 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
                                      │───────────────────────────────────│
  User adds / updates docs  ─────────►│ 1  DocumentLoader (paths / watch) │
                                      │ 2  Chunker  (recursive splitter)  │
-                                     │ 3  Embedder (E5 / BGE model)      │
-                                     │ 4  VectorStore.add() (NumPy .pkl) │
+                                     │ 3  Embedder (OpenAI embeddings)   │
+                                     │ 4  VectorStore.add() (Chroma DB)  │
                                      └───────────────────────────────────┘
                          ▲              ▲
                          │ builds       │ required
                          │              │
-                         │              └──▶ 📇 FileManifest (path, sha256/MD5, mtime, type)
+                         │              └──▶ 📇 FileManifest (path, sha256, mtime, size)
                          │
 ╔═════════════════════════════════════════════════════════════════════════════╗
 ║                               MAIN QUERY FLOW                               ║
@@ -57,7 +58,7 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
                     │
              🗂️ ConversationMemory
              (G = recency window; E = episodic w/ metadata + selection-only semantic index; soft fading)
-```
+````
 
 *Notes:* **ConversationMemory** is a **controller-side, read-only** source exposed to A2 and PromptBuilder; ❖ FILES and authority order remain decisive. External replies are ingested via UI-08/09 with `source=external`. **❖ FILES** remain authoritative over history.
 
@@ -67,79 +68,34 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
 
 **DocumentLoader** discovers files under `data/doc_raw/`.
 • Current: `.txt`, `.md`, `.json`, `.yml`.
-• **FileManifest is Must**: `path`, `sha256` (or MD5), `mtime`, `type` for deterministic inclusion/versioning.
-**Chunker**: token-aware overlapping windows (≈1 024 tokens, overlap ≈200).
-**Embedder**: E5/BGE family (configurable).
-**VectorStore**: **NumPy `.pkl` snapshots** (Chroma paused; on-disk collection planned later).
+
+**FileManifest is Must:** per-file ledger `{path, sha256, mtime, size}` for deterministic inclusion/versioning. Hash (`sha256`) is computed on file bytes; unchanged files are skipped deterministically; manifest is published via atomic swap.
+
+**Chunker**: overlapping windows (configurable; default ≈500 chars with overlap ≈100; deterministic boundaries).
+
+**Embedder**: OpenAI embeddings (default `text-embedding-3-large`), batch API, returns 1536-D vectors.
+
+**VectorStore**: **Chroma persistent on-disk DB** via `PersistentClient` under `data/chroma_db/<project>/` (per-project isolation).
+• Upsert/query by ID and metadata.
+• Chunk IDs are stable: `"{rel_path}::{sha256}::{chunk_idx}"`.
+• Metadata saved per chunk: `{"path", "sha256", "chunk_idx", "mtime"}`.
+• Deletion uses metadata filters (e.g., old versions by `{path AND sha256}`); file-level tombstones optional.
+• `snapshot()` creates filesystem snapshots of the DB directory.
+
+**IngestionManager**: Orchestrates `scan → diff → chunk → embed → add → publish`.
+• Processes only `to_process` files (new/changed by hash).
+• Optionally deletes **old versions** for the same `path` (different `sha256`).
+• Emits `IngestionStats` (files scanned, to_process, unchanged, tombstones, chunks_added, vectors_upserted, deleted_old_versions, deleted_tombstones, published_manifest_path, **embedded_bytes**).
 
 ### Conversation Memory (read-only; two-layer, soft fading)
 
 **Purpose.** Maintain flow/coherence without re-chunking chat; history is durable; Layer-E embeddings are **selection-only** and kept **separate** from document vectors. The Layer-E semantic index is used **only to score episodic turns for inclusion (never to populate `S_ctx`).**
 
 **Layers.**
+**G — Recency window (configurable k).**
+**E — Episodic store (older turns + metadata: turn distance, Δt, tags, importance, source, version hints).** Soft fading and token budgets apply; duplicates vs ❖ FILES are suppressed; ❖ FILES > newer > older.
 
-**G — Recency window (always included; configurable k).**
-**E — Episodic store (older turns + metadata: turn distance, Δt?, tags, importance, source, version hints).** Soft fading and token budgets apply; duplicates vs ❖ FILES are suppressed; ❖ FILES > newer > older.
-
-#### Feature-1: Conversation History **Persistence** & **Async Layer-E Embedding**
-
-> **Goal:** Make history durable on disk and keep Layer-E selection-only embeddings current without blocking the prompt path; ensure atomic snapshot publishing; never block the prompt path on embeddings.
-
-**(F1-1) Append-only conversation log (single source of truth).**
-
-* Path: `PATHS.logs/conversation.jsonl`.
-* After each completed turn (user prompt + assistant reply), the controller appends both lines and the writer **flushes + fsyncs** before accepting the next prompt.
-* If the reply comes from outside (UI-08/09), the controller appends the pasted text with `source=external`.
-* **Layer-G is reconstructed from the tail of this file** on each prompt; no RAM-only history.
-
-**(F1-2) Guardrails unchanged.**
-
-* ❖ FILES, newer-over-older, dedup vs ❖ FILES, and Eligibility Pool rules remain unchanged.
-
-**(F1-3) Layer-E embedding store (separate from documents).**
-
-* Maintain a dedicated **NumPy** vector store snapshot for history (e.g., `history_store.pkl`).
-* **Append-only; selection-only:** used to **score** episodic turns for inclusion and **never** injected into `S_ctx`.
-* **Completely separate** from the document vector snapshots.
-* Enforce **capacity caps** and token budgets per guardrails.
-
-**(F1-4) Async delta embedding worker.**
-
-* After the synchronous log append completes, enqueue the **new tail** for background processing:
-
-  1. read only the unprocessed tail with a **small overlap** (one last chunk) for boundary stability;
-  2. split into chunks;
-  3. embed the **new chunks**;
-  4. write to a **staging** `.pkl`.
-* Use **stable IDs** (e.g., `<log_offset>::chunk_n`) and content-hash de-duplication.
-* This ensures we never re-embed the whole log.
-
-**(F1-5) Atomic snapshot publishing.**
-
-* Writers only touch `history_store_dynamic.pkl`.
-* When a batch is complete, **flush+fsync** and then **publish** via `os.replace(history_store_dynamic.pkl → history_store.pkl)`.
-* Readers always open `history_store.pkl` and therefore see either the old or the new snapshot — **never a half-write**.
-* A companion `history_index_meta.json` stores versioning/read-path hints to aid deterministic recovery.
-
-**(F1-6) Read paths per prompt.**
-
-* **G:** tail of `conversation.jsonl` (synchronous).
-* **E:** open current `history_store.pkl` (latest published snapshot).
-* The prompt path **never blocks** on embedding; it uses the last published E snapshot.
-
-**(F1-7) Startup & failure behavior.**
-
-* On startup, open/create `conversation.jsonl`, build G from tail, and try to open `history_store.pkl`.
-* If E is missing, start empty and let the worker backfill from the log.
-* If the worker fails, the last published snapshot remains valid; retry next cycle.
-
-**(F1-8) Authority, eligibility, dedup unaffected.**
-
-* Exact File Lock and the Eligibility Pool continue to bound retrieval; A3 suppresses any history text that duplicates an injected ❖ FILES item.
-
-**(F1-9) Eligibility alignment with history (CH-03.9).**
-
-* If a file is **OFF** in the Eligibility Pool for this turn, **Layer-E selection ignores** history items whose source/version hints point to that file (path/hash/mtime), **unless** that file is explicitly injected via **❖ FILES** for this turn.
+*(Implementation of G/E is planned; document ingestion is complete.)*
 
 ---
 
@@ -149,7 +105,7 @@ This document shows the end-to-end architecture for RAGstream, aligned with the 
 
 **What:** Deterministic pre-filter that computes the Eligibility Pool from FileManifest, ON/OFF, and ❖ FILES; no embeddings; emits reason-trace.
 
-Outputs (envelope): eligible\_files\[{path, sha256, mtime, reason\[]}], candidate\_files\_block{files\[]}, trace\[{path, decision, reason\[]}]; failure codes: EMPTY\_ELIGIBILITY, LOCK\_MISS (escalate=true).
+Outputs (envelope): eligible_files[{path, sha256, mtime, reason[]}], candidate_files_block{files[]}, trace[{path, decision, reason[]}]; failure codes: EMPTY_ELIGIBILITY, LOCK_MISS (escalate=true).
 
 ### A1 — Deterministic Code Injector (❖ FILES)
 
@@ -178,12 +134,11 @@ Outputs (envelope): eligible\_files\[{path, sha256, mtime, reason\[]}], candidat
 
 Outputs (envelope): status PASS|FAIL; violations[{rule, evidence, suggestion}]; hashes{spec_sha256, draft_sha256, final_sha256}; artifact{filename, code_fenced}; exactly one self-repair then re-validate once; on FAIL → escalate=true.
 
-
 ---
 
 ## Prompt Orchestration
 
-**Authority order (fixed):** \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode].
+**Authority order (fixed):** [Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Task/Mode].
 **PromptBuilder** assembles the final system/user messages; it may optionally show a **“RECENT HISTORY”** block (non-authoritative). **Exact File Lock** injects only ❖ FILES and skips retrieval entirely.
 
 ---
@@ -218,17 +173,13 @@ ON/OFF checkboxes constrain which files are eligible for retrieval (when not loc
 **Envelope Required (SR2-JSON-01).** Every inter-agent handoff uses a structured JSON **Envelope** with stable top-level keys:
 `agent, goal, timestamp, request_id, turn_id, source, version, escalate, reason, provenance, payload`.
 
-**Determinism (SR2-JSON-02).**
-Envelope keys are stable; each agent’s `payload` schema is documented; float scores use fixed precision; no free-text handoffs (prose lives inside typed fields in `payload`).
+**Determinism (SR2-JSON-02).** Envelope keys are stable; each agent’s `payload` schema is documented; float scores use fixed precision; no free-text handoffs (prose lives inside typed fields in `payload`).
 
-**Provenance & Hashing (SR2-JSON-03).**
-Referenced files include `path+hash+mtime`; history items include `id/hash`; the controller may attach a content hash of `payload` for traceability.
+**Provenance & Hashing (SR2-JSON-03).** Referenced files include `path+hash+mtime`; history items include `id/hash`; the controller may attach a content hash of `payload` for traceability.
 
-**Transport & Storage (SR2-JSON-04).**
-JSON flows are in-process; for debugging, the **Debug Logger** may write envelopes to disk (trace/vars), but envelopes remain the system of record for inter-agent data.
+**Transport & Storage (SR2-JSON-04).** JSON flows are in-process; for debugging, the **Debug Logger** may write envelopes to disk (trace/vars), but envelopes remain the system of record for inter-agent data.
 
-**Validation (SR2-JSON-05).**
-Controller validates required envelope fields before dispatch; on missing/invalid fields, set `escalate=true` with reason and halt (Human-in-the-Loop).
+**Validation (SR2-JSON-05).** Controller validates required envelope fields before dispatch; on missing/invalid fields, set `escalate=true` with reason and halt (Human-in-the-Loop).
 
 ---
 
@@ -255,7 +206,7 @@ Controller validates required envelope fields before dispatch; on missing/invali
 
 ## Persistence & Modularity
 
-Vectors persist as **NumPy `.pkl` snapshots**; Chroma on-disk collection is planned once stable in your environment. **ConversationMemory** persists JSONL in `conversation.jsonl` and publishes **Layer-E** snapshots via atomic swap. The system remains modular to enable future AWS TinnyLlama Cloud integration (swap embedding models, LLMs, or vector store without touching UI/controller surfaces).
+Vectors persist as **Chroma on-disk collections** (`data/chroma_db/<project>/`), managed by `PersistentClient` (no telemetry). `snapshot()` provides filesystem-level backups. **ConversationMemory** persists JSONL in `conversation.jsonl` and publishes Layer-E snapshots via atomic swap (selection-only). The system remains modular to enable future model or store swaps without touching UI/controller surfaces.
 
 ---
 
@@ -264,31 +215,46 @@ Vectors persist as **NumPy `.pkl` snapshots**; Chroma on-disk collection is plan
 | Category         | Target                                                                                                                                                        |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Determinism      | Fixed orchestration; at most one A2 audit; at most one retrieval re-run per query.                                                                            |
-| Latency          | Prompt→first token < 3 s p95 with \~1M-token vector snapshot (CPU-only acceptable).                                                                           |
+| Latency          | Prompt→first token < 3 s p95 with ~1M-token vector snapshot (CPU-only acceptable).                                                                            |
 | Memory footprint | ≤ 6 GB peak; embeddings loaded on demand.                                                                                                                     |
 | Privacy/Locality | Personal, single-user workflow; **no telemetry**; **ConversationMemory persists locally** (Layer-G log + Layer-E store); **Debug Logger is user-controlled**. |
 | Extensibility    | Add a new agent or embedding model without touching > 1 file.                                                                                                 |
 
-## Technology Stack (mirror)
+## Technology Stack (updated)
 
-| Layer           | Library / Service                          | Version (Aug 2025)         |
-| --------------- | ------------------------------------------ | -------------------------- |
-| GUI             | Streamlit                                  | 1.38                       |
-| Embeddings      | `bge-large-en-v3`, `E5-Mistral` (optional) | sentence\_transformers 3.0 |
-| Vector Store    | NumPy `.pkl` snapshots (current)           | –                          |
-| Planned DB      | Chroma                                     | 0.10                       |
-| Cross-encoder   | `mixedbread-ai/mxbai-rerank-xsmall-v1`     | 🤗 cross-encoder 0.6       |
-| LLM API         | OpenAI (`openai>=1.15.0`)                  | GPT-4o                     |
-| Local LLM (opt) | Ollama                                     | 0.2                        |
+| Layer           | Library / Service               | Version (Oct 2025) |
+| --------------- | ------------------------------- | ------------------ |
+| GUI             | Streamlit                       | 1.38               |
+| Embeddings      | OpenAI `text-embedding-3-large` | openai >= 1.15     |
+| Vector Store    | **Chroma (persistent on-disk)** | 0.10               |
+| Reranker        | (configurable)                  | —                  |
+| LLM API         | OpenAI                          | GPT-4o class       |
+| Local LLM (opt) | Ollama                          | 0.2                |
 
-## Directory / Module Tree (mirror)
+## Directory / Module Tree (updated)
 
 ```
 .
 ├── data/
-│   ├── chroma_db/         # planned
+│   ├── chroma_db/
+│   │   └── <project>/           # per-project Chroma DB (e.g., project1/)
 │   └── doc_raw/
+│       └── <project>/           # raw documents per project
 ├── ragstream/
+│   ├── ingestion/
+│   │   ├── loader.py
+│   │   ├── chunker.py
+│   │   ├── embedder.py
+│   │   ├── chroma_vector_store_base.py
+│   │   ├── vector_store_chroma.py
+│   │   ├── file_manifest.py
+│   │   └── ingestion_manager.py
+│   ├── retrieval/
+│   │   ├── retriever.py
+│   │   └── reranker.py
+│   ├── orchestration/
+│   │   ├── prompt_builder.py
+│   │   └── llm_client.py
 │   ├── app/
 │   │   ├── controller.py
 │   │   ├── ui_streamlit.py
@@ -297,61 +263,29 @@ Vectors persist as **NumPy `.pkl` snapshots**; Chroma on-disk collection is plan
 │   │       ├── a2_prompt_shaper.py
 │   │       ├── a3_nli_gate.py
 │   │       └── a4_condenser.py
-│   ├── orchestration/
-│   │   ├── prompt_builder.py
-│   │   └── llm_client.py
-│   ├── retrieval/
-│   │   ├── retriever.py
-│   │   └── reranker.py
-│   ├── ingestion/
-│   │   ├── loader.py
-│   │   ├── chunker.py
-│   │   └── embedder.py
 │   └── memory/
-│       └── conversation_memory.py   # read-only views for G/E
+│       └── conversation_memory.py   # read-only views for G/E (planned)
 ```
 
-## Open Issues / Risks (mirror)
-
-| Risk                           | Mitigation                                                                 |
-| ------------------------------ | -------------------------------------------------------------------------- |
-| Cross-encoder latency on CPU   | Limit candidates; single pass; cache embeddings where feasible.            |
-| History selection bloat        | Enforce token budgets; smooth fading; manual importance pinning.           |
-| A2 audit causes scope creep    | Single audit only; retrieval re-run allowed once and only on scope change. |
-| Chroma environment instability | Keep `.pkl` snapshots until stable.                                        |
-
 ---
 
-# Sync Report
-
-**Integrated features (per Requirements v2.3):**
-
-* **Feature-1:** Durable `conversation.jsonl`, Layer-G tail read, dedicated Layer-E **selection-only** embedding store, async delta worker, **atomic** snapshot publishing, per-prompt read paths (G from JSONL tail, E from latest snapshot), startup/backfill behavior, and preservation of authority/eligibility/dedup rules; **CH-03.9** eligibility alignment for history respected.
-* **Feature-2:** **Debug Logger** with trace/vars files, methods, truncation, levels, optional rollover, serialization rules, and crash-survivability semantics.
-* **UI-08/09:** External reply import path (`source=external`) into ConversationMemory and participation in Layer-E selection/dedup.
-* **UI-11/12:** Persist History toggle (default ON) and Clear History control for Layer-E store management.
-* **FileManifest = Must**; authority order **❖ FILES > newer > older**; Exact File Lock; Eligibility Pool; A2 audit with **single bounded re-run** and **material scope change** rubric.
-* **A0 FileScopeSelector**: deterministic pre-filter runs before A1; honors ❖ FILES and ON/OFF; emits reason-trace.
-* **A5 Schema/Format Enforcer**: contract check with exactly one self-repair; escalates on FAIL.
-* **JSON envelopes & HIL**: all inter-agent handoffs use JSON envelopes; schema/determinism failures set `escalate=true` and halt.
-* **Safety set:** Guardrails (SAF-G1..G3), Brakes (SAF-B1..B2), Airbags/Fallbacks (SAF-A1..A4) explicitly included.
-* **Non-Functional Requirements:** determinism, latency, memory footprint, privacy/locality, and extensibility targets stated.
-
-**Alignment confirmation:**
-`Architecture_2.md` reflects Layer-E selection-only embeddings, durable JSONL history, external reply import, bounded A2 audit, Eligibility Pool, authority order, FileManifest, Debug Logger, JSON envelopes/HIL, **Safety guardrails/brakes/airbags**, **UI-11/12**, and **Non-Functional** targets, with prior text preserved except for the minimal additions above.
-
----
-
-## Sync Report (this update)
+# Sync Report (this update)
 
 **Precisely applied changes (minimal edits only):**
 
-* Added two GUI bullets for **UI-06** (history controls) and **UI-07** (optional export with citations).
-* Added two GUI bullets previously present for **UI-11** (Persist History toggle) and **UI-12** (Clear History).
-* Inserted **Safety (Guardrails / Brakes / Airbags)** section with SAF-G1..G3, SAF-B1..B2, SAF-A1..A4.
-* Added **Structured JSON Communication & Provenance** section (SR2-JSON-01..05).
-* Appended **(F1-9)** to Conversation Memory to capture **CH-03.9** eligibility alignment for history.
-* Expanded **Sync Report** to reflect Safety, UI-06/07/11/12, JSON Envelopes, and Non-Functional coverage.
+* In the Ingestion Pipeline diagram, replaced “VectorStore.add() (NumPy .pkl)” with **“VectorStore.add() (Chroma DB)”** and “Embedder (OpenAI embeddings)”.
+* In **Ingestion & Memory**, updated:
 
-**Conformance confirmation:**
-This `Architecture_2.md` now mirrors `Requirements.md` v2.3, with all missing items integrated and existing content left otherwise byte-identical.
+  * `FileManifest` fields to `{path, sha256, mtime, size}` and atomic publish.
+  * `Embedder` to OpenAI (`text-embedding-3-large`).
+  * `VectorStore` to **Chroma persistent on-disk DB** with per-project directories, stable IDs, metadata, deletion by metadata, and `snapshot()`.
+  * Added `IngestionManager` orchestration and `IngestionStats.embedded_bytes`.
+* In **Persistence & Modularity**, set vectors to persist as **Chroma collections**.
+* In **Technology Stack**, set Vector Store to **Chroma (current)**; embeddings to OpenAI.
+* In **Directory / Module Tree**, added `chroma_vector_store_base.py`, `vector_store_chroma.py`, `file_manifest.py`, and `ingestion_manager.py`; added `data/chroma_db/<project>/`.
+
+**Compatibility confirmation:** This `Architecture_2.md` matches `PlanetextUML.txt` (full UML) and the Python modules now implemented.
+
+```
+::contentReference[oaicite:0]{index=0}
+```

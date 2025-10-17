@@ -1,0 +1,120 @@
+{
+  "files": [
+    {
+      "mtime": 1753457022.0,
+      "path": "project1/11-Dynamic_Session_Tracker.md",
+      "sha256": "ddbf5c4f90d4d806db9363dec99846bf69569fd4c84fd3c920d36da2bfe8dc8d",
+      "size": 2595
+    },
+    {
+      "mtime": 1749051668.0,
+      "path": "project1/09-Sum_PE_Musical_Identity.md",
+      "sha256": "bd0851bb5aa0502042b9c108f6f57f9941096e0788e30d001f6329b6355642c0",
+      "size": 2102
+    },
+    {
+      "mtime": 1748963076.0,
+      "path": "project1/06-Simple_Ti_Mode.md",
+      "sha256": "c155103aaf3c822e0999dc18a31276e8193d7e549d63f4ecca35a8bb73d79f80",
+      "size": 3667
+    },
+    {
+      "mtime": 1749737306.0,
+      "path": "project1/16-AWS_Learning_Map.md",
+      "sha256": "8bec3a727b2857cf8ccf7f5aa53dffdb1d2b68d701a4250cfacf2670d8d3e023",
+      "size": 5153
+    },
+    {
+      "mtime": 1749731904.0,
+      "path": "project1/13-PromptEng_ActualKnowledge.md",
+      "sha256": "8076b9e7363d5b28a24cd63dd637a6cc60009fd723d024a992a21f5743b39f85",
+      "size": 6596
+    },
+    {
+      "mtime": 1750393658.0,
+      "path": "project1/00-Absolute_Master_Guide.md",
+      "sha256": "41104d4721646cb8d65cb99c1544c99858f0b477543177dc121a0c159e018ea3",
+      "size": 6849
+    },
+    {
+      "mtime": 1749671036.0,
+      "path": "project1/03-Cognitive_Profile_Interaction_Guide.md",
+      "sha256": "1b6a2be73cbee61177267cfa7bd5924e1f36e061ac6da1654b84a47d733a7a78",
+      "size": 7734
+    },
+    {
+      "mtime": 1749737516.0,
+      "path": "project1/17-AWS_ActualKnowledge.md",
+      "sha256": "62541e6084935eef4b154a48ed155d8d6031b0bf08db10f8a010f7a6a67a0ba0",
+      "size": 9610
+    },
+    {
+      "mtime": 1749051668.0,
+      "path": "project1/12-Prompt_Eng_Learning_Map.md",
+      "sha256": "704c26953788400f8609d8c7690b9efb2077df64b156e82fcde96620a73bc32b",
+      "size": 4287
+    },
+    {
+      "mtime": 1750150744.0,
+      "path": "project1/22-RQL_Intermediate_State.md",
+      "sha256": "4b9a861d5b056a1a1e07c74d6def98bdf04fa5c67d72749376aa23865ab64913",
+      "size": 19986
+    },
+    {
+      "mtime": 1749134004.0,
+      "path": "project1/21-Bootstrap_MVP.md",
+      "sha256": "b3ec6dbd45990d26df8acdd59db2094eaa2cb1d2ffd7557cdea00a13b0d33311",
+      "size": 7736
+    },
+    {
+      "mtime": 1758029726.0,
+      "path": "project1/02-Chronological_Progress_Log.md",
+      "sha256": "d60ae8994af088cf8349e1fb9f874daa04c1f6fda06fe3d5864d48b13ad24d9b",
+      "size": 11737
+    },
+    {
+      "mtime": 1749654792.0,
+      "path": "project1/20-TinyLlama_Architecture_and_Roadmap.md",
+      "sha256": "79d0b8f5d1fb8175cc09584b84e98a3b391631dc648ff54ce17f7e33259c4a97",
+      "size": 5900
+    },
+    {
+      "mtime": 1758027480.0,
+      "path": "project1/02_Patch.md",
+      "sha256": "2c152128cde3973ae6b318173770f824d3e344414fcf65d354dc218a7ed44208",
+      "size": 1927
+    },
+    {
+      "mtime": 1760532652.7908604,
+      "path": "project1/01-Technical_Profile_Rusbeh.md",
+      "sha256": "4884d338f0ef967f68cc16cbaabdb98840069bc40fe870af71f9ecf1dee831b2",
+      "size": 5681
+    },
+    {
+      "mtime": 1749051668.0,
+      "path": "project1/05-Cognitive_Management_Modes.md",
+      "sha256": "3c2f7f77ad8654db336cd06ecd0e34c2c39e5702eceb24569ac7d54927f24a72",
+      "size": 18606
+    },
+    {
+      "mtime": 1751282874.0,
+      "path": "project1/50-PromptGenerator.md",
+      "sha256": "b2cc16c773a1ba6595bb964e10c8baa16834643e6a635f1338695eceb546030b",
+      "size": 9682
+    },
+    {
+      "mtime": 1749051668.0,
+      "path": "project1/04-My_Cognitive_Profile_Summary.md",
+      "sha256": "4fe0c57a3a8c294150be60c13e97f12911b5a6691940efd922001e900aa3872e",
+      "size": 10678
+    },
+    {
+      "mtime": 1749051668.0,
+      "path": "project1/10-Musical_Identity.md",
+      "sha256": "5ea43534deda440cf7963b11c6f6200e62315bb55e5875ee578513bfcfe2c6e4",
+      "size": 2386
+    }
+  ],
+  "generated_at": "2025-10-17T12:31:55Z",
+  "version": "1"
+}

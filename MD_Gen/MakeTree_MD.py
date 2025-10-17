@@ -10,9 +10,12 @@ import os
 import fnmatch
 
 # --- CONFIGURATION ---
+from pathlib import Path
 
+# Project root = parent of MD_Gen
+base_path_obj = Path(__file__).resolve().parent.parent
 # Base path for the project tree
-base_path = r"C:\0000\Prompt_Engineering\Projects\GTPRusbeh\RAGstream2"
+base_path=str(base_path_obj)
 
 # Directories (relative to base_path) to include when only_dirs is empty
 #include_dirs = [

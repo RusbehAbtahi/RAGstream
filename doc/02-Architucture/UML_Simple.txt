@@ -1,4 +1,5 @@
 @startuml RAGstream2_Simplified
+left to right direction
 skinparam linetype ortho
 skinparam classAttributeIconSize 0
 skinparam packageStyle rectangle
@@ -8,17 +9,14 @@ package "Config & Utils" {
     class Settings {
         + get()
     }
-
     class Paths {
         + PATHS
         + ROOT
     }
-
     class SimpleLogger {
         + log()
         + error()
     }
-
     class DebugLogger {
         + logWriteText()
         + logWriteVar()
@@ -30,49 +28,47 @@ package "Ingestion / Memory" {
     class DocumentLoader {
         + load_documents()
     }
-
     class Chunker {
         + split()
     }
-
     class Embedder {
         + embed()
     }
 
-    interface IVectorStore {
+    class FileManifest {
+        + load()
+        + diff()
+        + publish_atomic()
+        + compute_sha256()
+    }
+
+    class IngestionManager {
+        + run()
+        + diff()
+    }
+
+    class ChromaVectorStoreBase {
         + add()
         + query()
         + snapshot()
     }
 
-    class VectorStoreNP implements IVectorStore {
-        + add()
-        + query()
-        + snapshot()
-    }
+    class VectorStoreChroma extends ChromaVectorStoreBase
+    class HistoryStoreChroma extends ChromaVectorStoreBase
 
     class ConversationMemory {
         + get_recent()
         + get_episodic()
     }
-
     class ConversationLog {
         + append_turn()
         + tail_pairs()
     }
-
-    class HistoryStoreNP implements IVectorStore {
-        + add()
-        + query()
-        + snapshot()
-    }
-
     class HistoryEmbeddingWorker {
         + enqueue_tail()
         + process()
         + publish()
     }
-
     class ConvMemStore {
         + load()
         + save()
@@ -82,11 +78,18 @@ package "Ingestion / Memory" {
 
     DocumentLoader --> Chunker
     Chunker --> Embedder
-    Embedder --> IVectorStore
+
+    IngestionManager --> DocumentLoader
+    IngestionManager --> Chunker
+    IngestionManager --> Embedder
+    IngestionManager --> ChromaVectorStoreBase
+    IngestionManager --> FileManifest
+    Paths .> FileManifest
+
     ConversationMemory --> ConversationLog
-    ConversationMemory --> HistoryStoreNP
+    ConversationMemory --> HistoryStoreChroma
     HistoryEmbeddingWorker --> ConversationLog
-    HistoryEmbeddingWorker --> HistoryStoreNP
+    HistoryEmbeddingWorker --> HistoryStoreChroma
     ConversationMemory --> ConvMemStore
 }
 
@@ -98,8 +101,7 @@ package "Retrieval & Ranking" {
     class Retriever {
         + retrieve()
     }
-
-    Retriever --> IVectorStore
+    Retriever --> ChromaVectorStoreBase
     Retriever --> Embedder
     Retriever --> Reranker
     Retriever ..> DocScore
@@ -109,24 +111,19 @@ package "Agents (app/agents)" {
     class A0_FileScopeSelector {
         + filter()
     }
-
     class A1_DCI {
         + build_files_block()
     }
-
     class A2_PromptShaper {
         + propose()
         + audit_and_rerun()
     }
-
     class A3_NLIGate {
         + filter()
     }
-
     class A4_Condenser {
         + condense()
     }
-
     class A5_SchemaEnforcer {
         + validate()
     }
@@ -136,12 +133,10 @@ package "Prompt Orchestration" {
     class PromptBuilder {
         + build()
     }
-
     class LLMClient {
         + complete()
         + estimate_cost()
     }
-
     class JSONEnvelope
 }
 
@@ -149,7 +144,6 @@ package "Application Layer" {
     class AppController {
         + handle()
     }
-
     class StreamlitUI {
         + render()
         + external_reply_box()
@@ -159,7 +153,6 @@ package "Application Layer" {
         + set_history_controls()
         + export_with_citations()
     }
-
     StreamlitUI --> AppController
 }
 
@@ -197,7 +190,10 @@ Settings ..> LLMClient
 Settings ..> Embedder
 SimpleLogger ..> AppController
 Paths ..> AppController
-A0_FileScopeSelector -[hidden]down-> A5_SchemaEnforcer
 
-A2_PromptShaper -[hidden]down-> A3_NLIGate
+' --- layout anchors (hidden, cosmetic only) ---
+DocumentLoader -[hidden]-> Retriever
+Retriever -[hidden]-> A0_FileScopeSelector
+A5_SchemaEnforcer -[hidden]-> PromptBuilder
+PromptBuilder -[hidden]-> StreamlitUI
 @enduml

@@ -1,7 +1,8 @@
+```markdown
 # RAGstream — Comprehensive Requirements Specification (Updated)
 
-*Version 2.3 • 2025-08-29*
-*This document supersedes v2.2 and integrates (a) **Feature-1: Conversation History Persistence & Async Layer-E Embedding** and (b) **Feature-2: Debug Logger**, while preserving structure and all prior requirements. It maintains the selection-only Layer-E semantic index, external-reply import, bounded A2 audit, and personal-use scope.*
+*Version 2.4 • 2025-10-17*
+*This document supersedes v2.3 and integrates (a) **Feature-1: Conversation History Persistence & selection-only Layer-E index** and (b) **Feature-2: Debug Logger**, while preserving structure and all prior requirements. It also reflects the migration to **Chroma** as the persistent vector store and the introduction of **FileManifest** and **IngestionManager** for deterministic ingestion.*
 
 ---
 
@@ -25,23 +26,26 @@ RAGstream is a personal, production-grade, local-first RAG workbench for a singl
 ## 3  System Context
 
 ```
-User ──▶ Streamlit GUI ──▶ Controller
-                   ▲          │
-                   │          ├──▶ A2 Prompt Shaper (pass-1) → advisory headers
-                   │          ├──▶ A0 FileScopeSelector (deterministic pre-filter; reason-trace; no embeddings)
-                   │          ├──▶ A1 DCI → ❖ FILES (Exact File Lock / FULL / PACK)
-                   │          ├──▶ (if not locked) Retriever → Reranker → A3 NLI Gate → A4 Condenser (S_ctx)
-                   │          ├──▶ A2 Prompt Shaper (audit-2) on S_ctx → header/role refinements
-                   │          ├──▶ PromptBuilder (authority order)
-                   │          ├──▶ ConversationMemory (read-only: Layer-G recency + Layer-E episodic selection)
-                   │          ├──▶ LLMClient (OpenAI or local)
-                   │          ├──▶ A5 Schema/Format Enforcer (contract check; one self-repair; escalate on FAIL)
-                   │          └──▶ Transparency (kept/dropped reasons)
-DocumentLoader ◀───┘
-     ▲
-     └─ Chunker ─ Embedder ─ VectorStore.add() (.pkl snapshots; Chroma paused)
 
-```
+User ──▶ Streamlit GUI ──▶ Controller
+▲          │
+│          ├──▶ A2 Prompt Shaper (pass-1) → advisory headers
+│          ├──▶ A0 FileScopeSelector (deterministic pre-filter; reason-trace; no embeddings)
+│          ├──▶ A1 DCI → ❖ FILES (Exact File Lock / FULL / PACK)
+│          ├──▶ (if not locked) Retriever → Reranker → A3 NLI Gate → A4 Condenser (S_ctx)
+│          ├──▶ A2 Prompt Shaper (audit-2) on S_ctx → header/role refinements
+│          ├──▶ PromptBuilder (authority order)
+│          ├──▶ ConversationMemory (read-only: Layer-G recency + Layer-E episodic selection)
+│          ├──▶ LLMClient (OpenAI or local)
+│          ├──▶ A5 Schema/Format Enforcer (contract check; one self-repair; escalate on FAIL)
+│          └──▶ Transparency (kept/dropped reasons)
+DocumentLoader ◀───┘
+▲
+└─ Chunker ─ Embedder ─ VectorStore.add() (Chroma DB; per-project on-disk)
+▲
+└── FileManifest (path, sha256, mtime, size) + IngestionManager
+
+````
 
 Notes:
 • ConversationMemory is a read-only source feeding A2 and (optionally) PromptBuilder; A1–A4 interfaces remain unchanged.
@@ -53,14 +57,14 @@ Notes:
 
 ### 4.1  Ingestion / Knowledge Store
 
-| ID     | Requirement                                                                                              | Priority |
-| ------ | -------------------------------------------------------------------------------------------------------- | -------- |
-| ING-01 | Load `.txt`, `.md`, `.json`, `.yml`.                                                                     | Must     |
-| ING-02 | Persist vectors as NumPy `.pkl` snapshots.                                                               | Must     |
-| ING-03 | Recursive splitter (target \~1 024 tokens, overlap \~200).                                               | Must     |
-| ING-04 | Planned: Chroma on-disk collection once environment allows (unchanged).                                  | Planned  |
-| ING-05 | **FileManifest with `path`, `sha256` (or MD5), `mtime`, `type` for deterministic inclusion/versioning.** | **Must** |
-| ING-06 | Ingestion UI messages may be shown; ingestion events MAY be persisted via Debug Logger per Feature-2.    | Must     |
+| ID     | Requirement                                                                                                                        | Priority |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| ING-01 | Load `.txt`, `.md`, `.json`, `.yml`.                                                                                               | Must     |
+| ING-02 | Persist vectors as **Chroma** persistent on-disk collections under `data/chroma_db/<project>/` (no telemetry).                     | Must     |
+| ING-03 | Deterministic character-window splitter (target ≈500 chars, overlap ≈100; configurable).                                           | Must     |
+| ING-04 | **IngestionManager** orchestrates: scan → hash → diff → chunk → embed → upsert → (optional delete old versions) → publish manifest. | Must     |
+| ING-05 | **FileManifest** with `path`, `sha256`, `mtime`, `size` for deterministic inclusion/versioning; atomic publish (tmp → replace).    | Must     |
+| ING-06 | Ingestion UI messages may be shown; ingestion events MAY be persisted via Debug Logger per Feature-2.                              | Must     |
 
 ---
 
@@ -99,10 +103,10 @@ Notes:
 * **CH-03.10 (Durable history, not logs)** — **Persist** ConversationMemory state:
   – **JSONL log**: append-only PATHS.logs/conversation.jsonl; after each user+assistant turn write both lines and flush+fsync before the next prompt is accepted.
   – **Layer-G** is reconstructed from the tail of `conversation.jsonl` per prompt (no RAM-only history).
-  – **Layer-E index**: separate NumPy snapshot (e.g., `history_store.pkl`) used **only** for selection; lives **separate** from document vectors; capacity/eviction per CH-03.2.
-  – **Layer-E meta**: `history_index_meta.json` accompanies the snapshot for generation/versioning and read-path hints.
-  – **Async pipeline**: embed only the **new tail**; write to `history_store_dynamic.pkl`, then **atomic swap** to publish `history_store.pkl`.
-  – If persistence or JSON parse/validation fails, set `escalate=true`, include reason with line offset, fall back to previous valid snapshot, continue in-memory if needed; determinism and bounded audit rules remain unchanged. **(Must)**
+  – **Layer-E semantic index**: separate **Chroma collection** (selection-only; persisted independently from document vectors); capacity/eviction per CH-03.2.
+  – **Layer-E meta**: a small JSON accompanies the index for generation/versioning and read-path hints.
+  – **Staging/publish**: index updates write to a staging alias then publish via atomic pointer/alias swap to the stable collection.
+  – If persistence or JSON parse/validation fails, set `escalate=true`, include reason with line offset, fall back to previous valid state, continue in-memory if needed; determinism and bounded audit rules remain unchanged. **(Must)**
 
 ---
 
@@ -227,7 +231,7 @@ All agents/controllers MUST produce/consume a JSON **Envelope**:
   },
   "payload": { /* agent-specific structured data */ }
 }
-```
+````
 
 #### SR2-JSON-02 (Determinism) — **Must**
 
@@ -255,7 +259,7 @@ All agents/controllers MUST produce/consume a JSON **Envelope**:
 
 #### SR2-A0-01 (Inputs) — **Must**
 
-* Prompt text; FileManifest (path, sha256/MD5, mtime, tags); UI toggles (ON/OFF per file, ❖ FILES lock); optional include/exclude lists; static alias map (e.g., NVH ⇄ vehicle acoustics).
+* Prompt text; FileManifest (path, sha256, mtime, tags); UI toggles (ON/OFF per file, ❖ FILES lock); optional include/exclude lists; static alias map (e.g., NVH ⇄ vehicle acoustics).
 
 #### SR2-A0-02 (Rules) — **Must**
 
@@ -348,7 +352,7 @@ Envelope `payload` schema:
 | Category         | Target                                                                                                                                                        |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Determinism      | Fixed orchestration; at most one A2 audit; at most one retrieval re-run per query.                                                                            |
-| Latency          | Prompt→first token < 3 s p95 with \~1M-token vector snapshot (CPU-only acceptable).                                                                           |
+| Latency          | Prompt→first token < 3 s p95 with ~1M-token vector snapshot (CPU-only acceptable).                                                                            |
 | Memory footprint | ≤ 6 GB peak; embeddings loaded on demand.                                                                                                                     |
 | Privacy/Locality | Personal, single-user workflow; **no telemetry**; **ConversationMemory persists locally** (Layer-G log + Layer-E store); **Debug Logger is user-controlled**. |
 | Extensibility    | Add a new agent or embedding model without touching > 1 file.                                                                                                 |
@@ -357,15 +361,15 @@ Envelope `payload` schema:
 
 ## 6  Technology Stack
 
-| Layer           | Library / Service                          | Version (Aug 2025)         |
-| --------------- | ------------------------------------------ | -------------------------- |
-| GUI             | Streamlit                                  | 1.38                       |
-| Embeddings      | `bge-large-en-v3`, `E5-Mistral` (optional) | sentence\_transformers 3.0 |
-| Vector Store    | NumPy `.pkl` snapshots (current)           | –                          |
-| Planned DB      | Chroma                                     | 0.10                       |
-| Cross-encoder   | `mixedbread-ai/mxbai-rerank-xsmall-v1`     | 🤗 cross-encoder 0.6       |
-| LLM API         | OpenAI (`openai>=1.15.0`)                  | GPT-4o                     |
-| Local LLM (opt) | Ollama                                     | 0.2                        |
+| Layer           | Library / Service                        | Version (Oct 2025)   |
+| --------------- | ---------------------------------------- | -------------------- |
+| GUI             | Streamlit                                | 1.38                 |
+| Embeddings      | OpenAI `text-embedding-3-large`          | openai ≥ 1.15        |
+| Vector Store    | **Chroma (persistent on-disk; current)** | 0.10                 |
+| Planned DB      | —                                        | —                    |
+| Cross-encoder   | `mixedbread-ai/mxbai-rerank-xsmall-v1`   | 🤗 cross-encoder 0.6 |
+| LLM API         | OpenAI (`openai>=1.15.0`)                | GPT-4o               |
+| Local LLM (opt) | Ollama                                   | 0.2                  |
 
 ---
 
@@ -374,8 +378,10 @@ Envelope `payload` schema:
 ```
 .
 ├── data/
-│   ├── chroma_db/         # planned
+│   ├── chroma_db/
+│   │   └── <project>/           # per-project Chroma DB (e.g., project1/)
 │   └── doc_raw/
+│       └── <project>/           # raw documents per project
 ├── ragstream/
 │   ├── app/
 │   │   ├── controller.py
@@ -394,7 +400,11 @@ Envelope `payload` schema:
 │   ├── ingestion/
 │   │   ├── loader.py
 │   │   ├── chunker.py
-│   │   └── embedder.py
+│   │   ├── embedder.py
+│   │   ├── chroma_vector_store_base.py
+│   │   ├── vector_store_chroma.py
+│   │   ├── file_manifest.py
+│   │   └── ingestion_manager.py
 │   └── memory/
 │       └── conversation_memory.py   # read-only views for G/E
 ```
@@ -410,7 +420,7 @@ Envelope `payload` schema:
 | Cross-encoder latency on CPU   | Limit candidates; single pass; cache embeddings where feasible.            |
 | History selection bloat        | Enforce token budgets; smooth fading; manual importance pinning.           |
 | A2 audit causes scope creep    | Single audit only; retrieval re-run allowed once and only on scope change. |
-| Chroma environment instability | Keep `.pkl` snapshots until stable.                                        |
+| Chroma environment instability | Version-pin; per-project isolation; use `snapshot()` for backups.          |
 
 ---
 
@@ -422,11 +432,11 @@ Envelope `payload` schema:
    • Conflicts resolved by authority and freshness (**❖ FILES > newer > older**).
    • **Semantic aliasing** examples (e.g., **NVH ⇄ vehicle acoustics**) are recalled via Layer-E selection.
    • **External replies** imported via UI-09 are stored with `source=external` and participate in selection/dedup.
-   • **Persistence:** after each turn, 'conversation.jsonl' contains both sides and is fsynced; on restart, Layer-G rebuilds from JSONL tail; Layer-E loads from the last published snapshot (or backfills).
+   • **Persistence:** after each turn, 'conversation.jsonl' contains both sides and is fsynced; on restart, Layer-G rebuilds from JSONL tail; **Layer-E selection uses the Chroma collection** (or backfills). On JSON parse/validation failure, escalate and fall back to last stable state.
 
 2. **Orchestration & Audit**
-   • A2 runs at most twice; audit-2 can refine headers/roles and may change scope only if supported by S\_ctx.
-   • If scope changes, exactly one retrieval→A3→A4 re-run occurs; otherwise S\_ctx is reused.
+   • A2 runs at most twice; audit-2 can refine headers/roles and may change scope only if supported by S_ctx.
+   • If scope changes, exactly one retrieval→A3→A4 re-run occurs; otherwise S_ctx is reused.
    • PromptBuilder applies the fixed authority order precisely.
 
 3. **Safety**
@@ -435,7 +445,7 @@ Envelope `payload` schema:
    • **Every Fact in `S_ctx` has at least one citation.**
 
 4. **UI**
-   • Super-Prompt preview shows ❖ FILES and S\_ctx exactly; transparency view explains kept/dropped.
+   • Super-Prompt preview shows ❖ FILES and S_ctx exactly; transparency view explains kept/dropped.
    • Cost estimator prevents over-budget sends via hard stop.
    • UI exposes `k`, Layer-E budget, and synonym import; UI-08/UI-09 enable manual external-reply import; UI-10 enforces eligibility; UI-11/12 manage history persistence.
 
@@ -447,7 +457,7 @@ Envelope `payload` schema:
 
 **ConversationMemory JSONL**
 
-* Canonical persistence is `conversation.jsonl` with fsync per turn; Layer-G reconstructs from tail; Layer-E selection uses the latest snapshot; `history_index_meta.json` accompanies snapshots; async embed tail-only with atomic swap; on JSON parse/validation failure, escalate and fall back to last stable snapshot.
+* Canonical persistence is `conversation.jsonl` with fsync per turn; Layer-G reconstructs from tail; **Layer-E selection uses the Chroma collection**; a small meta JSON accompanies the index; on failure, escalate and fall back to last stable snapshot/state.
 
 **A0 Determinism**
 
@@ -469,11 +479,11 @@ Envelope `payload` schema:
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
 | ConversationMemory        | Read-only provider of Layer-G (recency window) and Layer-E (episodic).                                                      |
 | Layer-G                   | Always-keep recency window of last k turns.                                                                                 |
-| Layer-E                   | Episodic store of older turns with metadata and fading.                                                                     |
+| Layer-E                   | Episodic store of older turns with metadata and fading; **selection-only** semantic index (Chroma).                         |
 | ❖ FILES                   | Deterministically injected files by A1; canonical for that turn.                                                            |
-| S\_ctx                    | Cited, condensed context emitted by A4 (Facts/Constraints/Open Issues).                                                     |
+| S_ctx                     | Cited, condensed context emitted by A4 (Facts/Constraints/Open Issues).                                                     |
 | A2 audit                  | Second, controlled pass of A2 after A4 to refine headers/roles.                                                             |
-| Authority order           | \[Hard Rules] → \[Project Memory] → \[❖ FILES] → \[S\_ctx] → \[Task/Mode].                                                  |
+| Authority order           | [Hard Rules] → [Project Memory] → [❖ FILES] → [S_ctx] → [Task/Mode].                                                        |
 | Eligibility Pool          | Set of files currently ON for retrieval; populated by UI-10.                                                                |
 | Debug Logger              | Optional per-session trace/vars logs under `PATHS.logs/`; not used for retrieval/history.                                   |
 | JSON Envelope             | Structured handoff `{agent, goal, timestamp, request_id, turn_id, source, version, escalate, reason, provenance, payload}`. |
@@ -484,72 +494,3 @@ Envelope `payload` schema:
 
 ---
 
-### Change Log (edits to remove anti-logging language; FileManifest status)
-
-* **§3 System Context** — removed “ephemeral” qualifier from “Transparency (kept/dropped reasons)”.
-* **ING-06** — changed to allow persistence via Debug Logger (“…MAY be persisted via Debug Logger per Feature-2”).
-* **RET-07** — removed “(ephemeral; no persistent logs)”.
-* **UI-03** — removed “(ephemeral; no persisted logs)”.
-* **§5 Non-Functional (Privacy/Locality row)** — clarified: “no telemetry; ConversationMemory persists locally; Debug Logger is user-controlled.”
-* **§9 Acceptance → UI bullet** — removed “(no persisted logs)”.
-* **ING-05** — confirmed **Must** (sha256/MD5 + mtime) and ensured no other table lists it as “Planned.”
-
----
-
-## CHANGE LOG (supp2 integration)
-
-1. §4.2 CH-03.10
-
-   * Replaced `PATHS.logs/conversation.log` → `PATHS.logs/conversation.jsonl` and designated JSONL as canonical.
-   * Added bullets for `history_index_meta.json`, **async tail-only embedding**, and **atomic swap** (`history_store_dynamic.pkl` → `history_store.pkl`).
-   * Added explicit escalation on JSON parse/validation failure with fallback to last stable snapshot.
-
-2. New §4.8 “Structured JSON Communication & Provenance”
-
-   * Inserted SR2-JSON-01..05 (Envelope required fields, determinism, provenance/hashing, transport/storage, controller validation/halting).
-
-3. New §4.9 “Agent A0 — FileScopeSelector (Deterministic Pre-Filter)”
-
-   * Inserted SR2-A0-01..04 (inputs, deterministic rules, reason-traced outputs, failure codes with escalate).
-
-4. New §4.10 “Agent A5 — Schema/Format Enforcer (Contract + Single Self-Repair)”
-
-   * Inserted SR2-A5-01..04 (checks; exactly one self-repair; single re-validation; PASS/FAIL with violations; envelope fields).
-
-5. New §4.11 “Human-in-the-Loop Escalation”
-
-   * Inserted SR2-HIL-01..03 (trigger; controller halt; UI panel with reason, offending agent, `request_id`, next steps).
-
-6. §9 Acceptance Criteria
-
-   * Updated Conversation Memory persistence bullet to refer to **`conversation.jsonl`** and added “9.x SR2 Acceptance Additions” block (Envelopes, JSONL persistence, A0 determinism, A5 single self-repair, escalations).
-
-7. §10 Glossary
-
-   * Added rows: **JSON Envelope**, **goal**, **escalate**, **A0 FileScopeSelector**, **A5 Schema/Format Enforcer**.
-
-No other text in `Requirements.md` was modified.
-
----
-
-## SELF-AUDIT REPORT
-
-Homogeneity & Style
-
-* Inserted sections (4.8–4.11) follow the existing §4.x structure and wording from supp2 without summarization.
-* CH-03.10 retains original heading/intent; edits limited to JSONL persistence and required meta/async semantics.
-
-Internal Consistency
-
-* All references now consistently use `conversation.jsonl` for Layer-G persistence.
-* Guardrails remain aligned (❖ FILES authority; OFF-file alignment per CH-03.9).
-* Escalation semantics are coherent across §§4.8, 4.10, 4.11 and §9 Additions.
-* Provenance/hashing in §4.8 aligns with FileManifest integrity in §4.1.
-
-Completeness
-
-* JSON Envelope governance, JSONL memory, A0, A5, HIL fully integrated; acceptance and glossary updated to test/define them.
-
-Byte-Identity Assurance
-
-* Aside from the explicit changes itemized above and the addition of new sections, all prior content remains byte-identical.

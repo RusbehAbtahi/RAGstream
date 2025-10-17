@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 import os
+
 import json
+from pathlib import Path
+# Project root = parent of MD_Gen
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 
 # === Configuration ===
 # Absolute path to your project root
-PROJECT_ROOT = r"C:\0000\Prompt_Engineering\Projects\GTPRusbeh\RAGstream2"
+
 
 # Base package to scan
 PACKAGE_BASE = os.path.join(PROJECT_ROOT, "ragstream")

@@ -2,6 +2,7 @@
 '──────────────────────────────────────────────────────────────
 '  GLOBAL SETTINGS
 '──────────────────────────────────────────────────────────────
+left to right direction
 skinparam linetype ortho
 skinparam classAttributeIconSize 0
 skinparam packageStyle rectangle
@@ -60,25 +61,71 @@ package "Ingestion / Memory" {
         - client : OpenAI
     }
 
-    interface IVectorStore {
-        + add(ids:List[str], vectors:List[List[float]], meta:List[Dict]) : None
-        + query(vector:List[float], k:int=10) : List[str]
-        + snapshot(timestamp:str) : None
+    '── New: manifest/ledger for skip logic
+    class FileManifest {
+        + compute_sha256(file_path:str) : str
+        + load_manifest(manifest_path:str) : Dict
+        + diff(records_now:List[Record], manifest_prev:Dict) : Tuple[List[Record],List[Record],List[Record]]
+        + publish_atomic(manifest_dict:Dict, manifest_path:str) : None
     }
 
-    class VectorStoreNP implements IVectorStore {
-        + add(ids,vectors,meta) : None
-        + query(vector,k=10) : List[str]
-        + snapshot(ts:str) : None
+    note right of FileManifest
+      Record schema (per file):
+      {
+        "path": str,     ' relative to doc_root
+        "sha256": str,   ' content hash
+        "mtime": float,  ' UNIX mtime
+        "size": int      ' bytes
+      }
+    end note
+
+    '── New: central orchestrator for documents ingestion
+    class IngestionManager {
+        + run(subfolder:str, store:ChromaVectorStoreBase, chunker:Chunker, embedder:Embedder, manifest_path:str, chunk_size:int=500, overlap:int=100, delete_old_versions:bool=True, delete_tombstones:bool=False) : IngestionStats
+        - doc_root : Path
+        - loader   : DocumentLoader
+    }
+
+    class IngestionStats {
+        + files_scanned        : int
+        + to_process           : int
+        + unchanged            : int
+        + tombstones           : int
+        + chunks_added         : int
+        + vectors_upserted     : int
+        + deleted_old_versions : int
+        + deleted_tombstones   : int
+        + published_manifest_path : str
+        + embedded_bytes       : int
+    }
+
+    '── Replaced NP stores with Chroma-backed stores
+    class ChromaVectorStoreBase {
+        + add(ids:List[str], vectors:List[List[float]], metadatas:List[Dict]=None) : None
+        + query(vector:List[float], k:int=10, where:Dict=None) : List[str]
+        + delete_where(where:Dict) : None
+        + snapshot(timestamp:str=None) : Path
+        + collection() : Any
         - persist_path : Path
-        - db_file : Path
-        - _ids : List[str]
-        - _meta : List[Dict]
-        - _emb : ndarray
-        - _id2idx : Dict[str,int]
+        - collection_name : str
+        - _client : chromadb.PersistentClient
+        - _col : chromadb.Collection
+        - _pre_add(...) : tuple
+        - _post_add(...) : None
+        - _pre_query(...) : tuple
+        - _post_query(ids:List[str], raw_result:Dict) : List[str]
     }
 
-    ' Feature-1: Conversation Memory (read-only; two-layer, soft-fading)
+    class VectorStoreChroma extends ChromaVectorStoreBase {
+        + make_chunk_id(rel_path:str, sha256:str, chunk_idx:int) : str
+        + name() : str
+        + persist_root() : Path
+        + count() : int
+    }
+
+    class HistoryStoreChroma extends ChromaVectorStoreBase
+
+    '── Conversation memory (postponed in implementation; kept as spec)
     class ConversationMemory {
         + get_recent(k:int=5) : List[Tuple[str,str]]       ' Layer-G (recency window)
         + get_episodic() : List[Tuple[str,str]]            ' Layer-E (episodic, on-topic)
@@ -87,7 +134,6 @@ package "Ingestion / Memory" {
         - conflict_policy : str    ' ❖ FILES > newer > older (dedup)
     }
 
-    ' Feature-1: Append-only conversation log (single source of truth)
     class ConversationLog {
         + append_turn(user_text:str, assistant_text:str, source:str="chat") : None
         + tail_pairs(k:int=5) : List[Tuple[str,str]]
@@ -95,31 +141,16 @@ package "Ingestion / Memory" {
         - fsync : bool
     }
 
-    ' Feature-1: Layer-E dedicated store (separate from document vectors)
-    class HistoryStoreNP implements IVectorStore {
-        + add(ids,vectors,meta) : None
-        + query(vector,k=10) : List[str]
-        + snapshot(ts:str) : None
-        - persist_path : Path     ' PATHS.logs/history_store.pkl
-        - db_file : Path
-        - _ids : List[str]
-        - _meta : List[Dict]
-        - _emb : ndarray
-        - _id2idx : Dict[str,int]
-    }
-
-    ' Feature-1: Async delta embedding worker for Layer-E (staging + atomic publish)
     class HistoryEmbeddingWorker {
         + enqueue_tail() : None
         + process() : None
         + publish() : None          ' os.replace(dynamic → stable)
-        - staging_path : Path       ' history_store_dynamic.pkl
-        - stable_path  : Path       ' history_store.pkl
+        - staging_path : Path
+        - stable_path  : Path
         - last_offset  : int
         - overlap_chunks : int
     }
 
-    ' Feature-1: Persistent metadata store for E-items (optional helper)
     class ConvMemStore {
         + load() : List[Tuple[str,str,Dict]]
         + save(items:List[Tuple[str,str,Dict]]) : None
@@ -129,21 +160,27 @@ package "Ingestion / Memory" {
         - backend : str          ' "json" | "sqlite"
     }
 
+    ' Ingestion flow wiring (real)
     DocumentLoader --> Chunker : raw text
     Chunker --> Embedder : chunks
-    Embedder --> IVectorStore : ids + vectors
+
+    IngestionManager --> DocumentLoader
+    IngestionManager --> Chunker
+    IngestionManager --> Embedder
+    IngestionManager --> ChromaVectorStoreBase
+    IngestionManager --> FileManifest
+    Paths .> FileManifest
 
     ' History persistence and selection-only index
     ConversationMemory --> ConversationLog : reads G tail
-    ConversationMemory --> HistoryStoreNP  : reads E snapshot
-    HistoryEmbeddingWorker --> ConversationLog : read new tail
-    HistoryEmbeddingWorker --> HistoryStoreNP  : write staging + publish
+    ConversationMemory --> HistoryStoreChroma  : reads E snapshot
+    HistoryEmbeddingWorker --> ConversationLog  : read new tail
+    HistoryEmbeddingWorker --> HistoryStoreChroma : write/publish
     ConversationMemory --> ConvMemStore : uses (metadata; capacity/fading)
 
-    Paths .> DocumentLoader : uses PATHS.doc_raw
-    Paths .> VectorStoreNP  : uses PATHS.vector_pkls
+    ' Config wiring for storage paths
+    Paths .> ChromaVectorStoreBase : uses PATHS.chroma_db
     Paths .> ConversationLog : uses PATHS.logs
-    Paths .> HistoryStoreNP  : uses PATHS.logs
 }
 
 '──────────────────────────────────────────────────────────────
@@ -162,12 +199,12 @@ package "Retrieval & Ranking" {
 
     class Retriever {
         + retrieve(query:str, k:int=10) : List[DocScore]
-        - _vs : IVectorStore
+        - _vs : ChromaVectorStoreBase
         - _emb : Embedder
         - _reranker : Reranker
     }
 
-    Retriever --> IVectorStore
+    Retriever --> ChromaVectorStoreBase
     Retriever --> Embedder
     Retriever --> Reranker
     Retriever .> DocScore
@@ -303,10 +340,12 @@ PromptBuilder .> ConversationMemory : may show RECENT HISTORY
 StreamlitUI --> AppController : send_to_history()
 AppController --> ConversationLog : append_turn(source="external")
 
-' Ingestion path
-DocumentLoader --> Chunker
-Chunker --> Embedder
-Embedder --> IVectorStore
+' Ingestion path (updated)
+IngestionManager --> DocumentLoader
+IngestionManager --> Chunker
+IngestionManager --> Embedder
+IngestionManager --> ChromaVectorStoreBase
+IngestionManager --> FileManifest
 
 ' PromptBuilder inputs
 PromptBuilder .> A1_DCI        : receives ❖ FILES
@@ -330,18 +369,23 @@ note right of AppController
   Personal use only: no MVP; no Tooling package.
 end note
 
-note bottom of VectorStoreNP
-  Current default:
-  NumPy-backed exact cosine
-  with .pkl snapshots.
+note bottom of ChromaVectorStoreBase
+  Default now: Chroma-backed persistent store
+  (on-disk under PATHS.chroma_db) with
+  upsert/query/snapshot and metadata filters.
 end note
 
-note bottom of HistoryStoreNP
+note bottom of HistoryStoreChroma
   Layer-E selection-only index
-  persisted under PATHS.logs
-  (history_store.pkl with atomic swap).
+  persisted as a Chroma collection
+  (e.g., collection "history").
 end note
 
+' --- layout anchors (hidden, cosmetic only) ---
+DocumentLoader -[hidden]-> Retriever
+Retriever -[hidden]-> A0_FileScopeSelector
+A5_SchemaEnforcer -[hidden]-> PromptBuilder
+PromptBuilder -[hidden]-> StreamlitUI
 
 A0_FileScopeSelector -[hidden]down-> A1_DCI
 A1_DCI -[hidden]down-> A2_PromptShaper
@@ -353,5 +397,5 @@ Settings -[hidden]down-> SimpleLogger
 Paths -[hidden]down-> Settings
 
 ConversationMemory-[hidden]down->  DocumentLoader
- LLMClient -[hidden]down-> JSONEnvelope  
+LLMClient -[hidden]down-> JSONEnvelope
 @enduml
