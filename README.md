@@ -11,13 +11,14 @@ At a high level, RAGstream keeps ingestion and retrieval modular, adds focused a
 ```mermaid
 flowchart TD
   subgraph "Ingestion / Memory"
+    IM["IngestionManager"]
     LDR["DocumentLoader"]
     CHK["Chunker"]
-    EMB["Embedder"]
+    EMB["Embedder (OpenAI text-embedding-3-large)"]
     VS["VectorStore (Chroma, on-disk)"]
-    FM["(Planned) FileManifest (path, sha256, mtime, size)"]
-    LDR --> CHK --> EMB --> VS
-    LDR --> FM
+    FM["FileManifest (path, sha256, mtime, size)"]
+    IM --> LDR --> CHK --> EMB --> VS
+    IM --> FM
   end
 
   subgraph "Application"
