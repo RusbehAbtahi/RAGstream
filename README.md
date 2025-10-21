@@ -174,6 +174,21 @@ data/
   doc_raw/        # source documents (plain text supported today)
   chroma_db/      # current on-disk store (Chroma)
 ```
+## GUI (Streamlit)
+
+RAGstream includes a custom-built GUI developed with **Streamlit**, designed to make each stage of the retrieval pipeline transparent and interactive. The first working prototype (`doc/04-GUI/Dev1.png`) introduces eight functional buttons under the **Prompt** box—each corresponding to a specific agent stage (PreProcessing, A2 PromptShaper, Retrieval, ReRanker, A3 NLI Gate, A4 Condenser, A5 Format Enforcer, and Prompt Builder). This modular design lets users run each step manually and observe how the **Super-Prompt** evolves at every phase.
+
+The second image (`doc/04-GUI/Vision1.png`) presents a **conceptual vision** of some parts of the final product—a unified, feature-rich interface where all pipeline stages operate seamlessly in an automated mode. It’s a mock-up, not a commitment, showing the intended direction for RAGstream’s UX.
+
+<p align="center">
+  <img src="doc/04-GUI/Dev1.png" alt="Development prototype – manual 8-button mode">
+  <br/><em>Figure 1 – Development view (manual 8-button mode)</em>
+</p>
+
+<p align="center">
+  <img src="doc/04-GUI/Vision1.png" alt="Vision mock-up – complete GUI">
+  <br/><em>Figure 2 – Conceptual vision of the complete RAGstream GUI</em>
+</p>
 
 ---
 
