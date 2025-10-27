@@ -6,6 +6,8 @@ Run on a free port, e.g.:
 
 from __future__ import annotations
 import streamlit as st
+from ragstream.app.controller import AppController
+from ragstream.orchestration.super_prompt import SuperPrompt
 
 def main() -> None:
     st.set_page_config(page_title="RAGstream", layout="wide")
@@ -44,6 +46,13 @@ def main() -> None:
     )
 
     st.title("RAGstream")
+    # one controller + one SuperPrompt per user session
+    if "controller" not in st.session_state:
+        st.session_state.controller = AppController()
+    if "sp" not in st.session_state:
+        st.session_state.sp = SuperPrompt()
+    if "super_prompt_text" not in st.session_state:
+        st.session_state["super_prompt_text"] = ""
 
     # Layout: gutters left/right, two main columns, small spacer between
     gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
@@ -67,7 +76,17 @@ def main() -> None:
         # Row 1: 4 buttons
         b1c1, b1c2, b1c3, b1c4 = st.columns(4, gap="small")
         with b1c1:
-            st.button("PreProcessing", key="btn_preproc", use_container_width=True)
+            clicked = st.button("PreProcessing", key="btn_preproc", use_container_width=True)
+            if clicked:
+                ctrl: AppController = st.session_state.controller
+                sp: SuperPrompt = st.session_state.sp
+                user_text = st.session_state.get("prompt_text", "")
+                sp = ctrl.preprocess(user_text, sp)
+                st.session_state.sp = sp
+                # keep the right box in sync with the processed prompt
+                st.session_state["super_prompt_text"] = sp.prompt_ready
+
+
         with b1c2:
             st.button("A2 PromptShaper", key="btn_a2", use_container_width=True)
         with b1c3:

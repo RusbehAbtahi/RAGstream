@@ -1,0 +1,6 @@
+source /home/rusbeh_ab/venvs/ragstream/bin/activate   %Activate your virtual Environment
+cd /home/rusbeh_ab/project/RAGstream
+
+/home/rusbeh_ab/venvs/ragstream/bin/python -m streamlit run /home/rusbeh_ab/project/RAGstream/ragstream/app/ui_streamlit_2.py --server.port 8503
+
+
