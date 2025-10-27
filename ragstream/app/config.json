@@ -1,0 +1,225 @@
+```json
+{
+  "version": "1.0.0",
+
+  "canonical_keys": [
+    "system",
+    "audience",
+    "purpose",
+    "tone",
+    "confidence",
+    "response_depth",
+    "task",
+    "context",
+    "constraints",
+    "output_format",
+    "reference_materials",
+    "example",
+    "checklist",
+    "out_of_scope",
+    "deterministic_rules",
+    "deterministic_codes",
+    "knowledge_graph_pins",
+    "retrieved_elements",
+    "attachments"
+  ],
+
+  "must_keys": [
+    "system",
+    "task",
+    "context",
+    "constraints",
+    "output_format",
+    "audience",
+    "purpose",
+    "tone"
+  ],
+
+  "defaults": {
+    "system": "consultant",
+    "audience": "general audience",
+    "purpose": "inform",
+    "tone": "neutral",
+    "confidence": "",
+    "response_depth": "high",
+    "task": "",
+    "context": "",
+    "constraints": "Follow instructions precisely; be accurate and non-fabricated; cite sources when appropriate; adhere to safety policies.",
+    "output_format": "free_text",
+    "reference_materials": "",
+    "example": "",
+    "checklist": "",
+    "out_of_scope": "",
+    "deterministic_rules": "",
+    "deterministic_codes": "",
+    "knowledge_graph_pins": "",
+    "retrieved_elements": "",
+    "attachments": ""
+  },
+
+  "aliases": {
+    "llm role": "system",
+    "role": "system",
+    "persona": "system",
+    "assistant role": "system",
+    "reader": "audience",
+    "target audience": "audience",
+    "audience type": "audience",
+    "stakeholders": "audience",
+    "goal": "purpose",
+    "objective": "purpose",
+    "aim": "purpose",
+    "style": "tone",
+    "voice": "tone",
+    "register": "tone",
+    "depth": "response_depth",
+    "level of detail": "response_depth",
+    "user request": "task",
+    "user prompt": "task",
+    "request": "task",
+    "wish": "task",
+    "wishes": "task",
+    "thing to be done": "task",
+    "background": "context",
+    "notes": "context",
+    "assumptions": "context",
+    "rules": "constraints",
+    "guidelines": "constraints",
+    "policies": "constraints",
+    "format": "output_format",
+    "output schema": "output_format",
+    "json schema": "output_format",
+    "markdown format": "output_format",
+    "sources": "reference_materials",
+    "references": "reference_materials",
+    "sample": "example",
+    "example output": "example",
+    "few-shot": "example",
+    "non-goals": "out_of_scope",
+    "not in scope": "out_of_scope",
+    "exclusions": "out_of_scope"
+  },
+
+  "bilingual": {
+    "de": {
+      "aufgabe": "task",
+      "zweck": "purpose",
+      "zielgruppe": "audience",
+      "kontext": "context",
+      "hinweise": "context",
+      "annahmen": "context",
+      "einschränkungen": "constraints",
+      "regeln": "constraints",
+      "vorgaben": "constraints",
+      "format": "output_format",
+      "ausgabeformat": "output_format",
+      "ton": "tone",
+      "beispiel": "example",
+      "quellen": "reference_materials",
+      "referenzen": "reference_materials",
+      "außerhalb des umfangs": "out_of_scope",
+      "nicht im umfang": "out_of_scope"
+    }
+  },
+
+  "templates": {
+    "task": [
+      "user request",
+      "user prompt",
+      "wishes",
+      "thing to be done",
+      "what to do"
+    ],
+    "audience": [
+      "who is this for",
+      "target readers",
+      "stakeholders"
+    ],
+    "constraints": [
+      "rules",
+      "guidelines",
+      "do nots",
+      "limitations"
+    ],
+    "output_format": [
+      "formatting",
+      "output schema",
+      "json schema",
+      "markdown format",
+      "table format"
+    ],
+    "context": [
+      "background",
+      "additional information",
+      "notes",
+      "assumptions"
+    ],
+    "purpose": [
+      "goal",
+      "why",
+      "intention",
+      "objective"
+    ],
+    "tone": [
+      "style",
+      "voice",
+      "register"
+    ],
+    "response_depth": [
+      "level of detail",
+      "depth"
+    ],
+    "out_of_scope": [
+      "non-goals",
+      "not included",
+      "exclude"
+    ],
+    "example": [
+      "example output",
+      "sample",
+      "few-shot"
+    ],
+    "reference_materials": [
+      "sources",
+      "references",
+      "citations",
+      "attachments"
+    ],
+    "confidence": [
+      "uncertainty reporting",
+      "confidence level",
+      "probability"
+    ]
+  },
+
+  "keyword_cues": {
+    "system": ["role", "persona", "assistant"],
+    "task": ["task", "do", "implement", "analyze", "build", "write"],
+    "context": ["context", "background", "assumptions", "notes"],
+    "constraints": ["constraints", "rules", "guidelines", "policy", "must", "forbid", "avoid"],
+    "output_format": ["format", "json", "markdown", "table", "yaml", "csv", "bullet"],
+    "tone": ["tone", "style", "voice", "register"],
+    "audience": ["audience", "stakeholder", "reader", "target"],
+    "purpose": ["purpose", "goal", "objective", "why", "intention"],
+    "response_depth": ["depth", "detail", "concise", "brief", "comprehensive", "thorough"],
+    "out_of_scope": ["out of scope", "non-goals", "exclude", "not included"],
+    "example": ["example", "sample", "few-shot"],
+    "reference_materials": ["reference", "sources", "docs", "citations", "attachments"],
+    "confidence": ["confidence", "uncertainty", "probability"]
+  },
+
+  "typo_max_distance": 2,
+
+  "modes": {
+    "strict_mode": false
+  },
+
+  "tone_presets": {
+    "analytic": "Define terms, surface assumptions, compare alternatives, show derivations, justify each step.",
+    "direct_constructive": "Imperative, numbered steps, defaults and trade-offs, code/config first, minimize theory, include acceptance criteria.",
+    "exploratory": "Generate diverse options and analogies, explore edge cases, branch into what-if scenarios, label uncertainties.",
+    "vision_to_plan": "State target end-state first, then backward-plan milestones, owners, and risks; provide an executive summary.",
+    "empathic": "Restate goals and constraints, explain implications for the audience in plain language, call out risks and next actions."
+  }
+}
+```
