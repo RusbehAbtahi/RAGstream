@@ -23,7 +23,7 @@ class SuperPrompt:
 
         # canonical prompt data
         "body",                  # dict: canonical fields from user (system, task, audience, tone, depth, context, purpose, format, text)
-        "extras",                # dict: user-defined/experimental fields kept separate from body
+        "extras",                # dict: user-defined fields
 
         # retrieval artifacts
         "base_context_chunks",   # list[Chunk]: authoritative set of retrieved Chunk objects (combined from history + long-term memory)

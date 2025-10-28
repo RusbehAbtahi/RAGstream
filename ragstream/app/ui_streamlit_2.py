@@ -83,9 +83,7 @@ def main() -> None:
                 user_text = st.session_state.get("prompt_text", "")
                 sp = ctrl.preprocess(user_text, sp)
                 st.session_state.sp = sp
-                # keep the right box in sync with the processed prompt
                 st.session_state["super_prompt_text"] = sp.prompt_ready
-
 
         with b1c2:
             st.button("A2 PromptShaper", key="btn_a2", use_container_width=True)
