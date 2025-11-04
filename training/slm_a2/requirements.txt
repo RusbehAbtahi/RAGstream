@@ -1,0 +1,6 @@
+transformers
+peft
+accelerate
+datasets
+safetensors
+tqdm

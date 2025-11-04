@@ -211,3 +211,14 @@ __marimo__/
 
 .idea/
 *.iml
+# SLM A2 training
+training/slm_a2/models_local/**
+training/slm_a2/runs/**
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.npz
+*.npy
+.huggingface/
+.cache/
