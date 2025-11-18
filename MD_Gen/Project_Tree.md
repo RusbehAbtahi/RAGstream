@@ -69,6 +69,7 @@
 │       └── paths.py
 ├── training/slm_a2/data
 │   ├── processed
+│   │   ├── finetuned_model_id.txt
 │   ├── processed_win384
 │   └── raw
 │       ├── A2_dataset_list.json
@@ -83,7 +84,12 @@
 │       ├── tokenizer_config.json
 │       └── vocab.json
 └── training/slm_a2/scripts
+    ├── a2_convert_for_openai.py
+    ├── a2_finetune.py
     ├── clean_and_split_dataset.py
     ├── clean_and_window_384.py
+    ├── hello_qwen.py
+    ├── infer_base.py
+    ├── test_a2_ft.py
     └── train_lora.py
 ```
