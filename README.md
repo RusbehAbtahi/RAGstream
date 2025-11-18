@@ -389,7 +389,11 @@ RAGstream includes a custom-built GUI developed with Streamlit. The intermediate
 
 The idea is to let the user run each stage manually, inspect the intermediate SuperPrompt in the right-hand box, and understand exactly what each component is doing before moving to a fully automated flow.
 
-![Intermediate Streamlit GUI](doc\04-GUI\Dev1.png)
+<p align="center">
+  <img src="doc/04-GUI/Dev1.png" alt="Development prototype – manual 8-button mode">
+  <br/><em>Figure 1 – Development view (manual 8-button mode)</em>
+</p>
+
 
 ### Planned GUI (Phase 2 – history + tagging)
 
@@ -415,7 +419,10 @@ A much more advanced “Phase 3” GUI is sketched in the backlog:
 - V-model-inspired tools for software development (link requirements, UML, code, and tests).
 - Multi-agent views where different agents (PromptShaper, Judge, Planner, Coder) can be inspected separately.
 
-![Planned multi-panel GUI concept](docs/gui_mock_v2.png)
+<p align="center">
+  <img src="doc/04-GUI/Vision1.png" alt="Vision mock-up – complete GUI">
+  <br/><em>Figure 2 – Conceptual vision of the complete RAGstream GUI</em>
+</p>)
 
 ---
 
@@ -426,4 +433,5 @@ This is a personal research project by **Rusbeh Abtahi**.
 The project is currently shared under an MIT-style license. The intention is not to build a polished library, but a clear, inspectable reference implementation of a modern, agentic RAG system that can evolve over time.
 
 Feedback, issues, and thoughtful critique are very welcome.
+
 
