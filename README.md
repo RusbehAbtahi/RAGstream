@@ -389,7 +389,7 @@ RAGstream includes a custom-built GUI developed with Streamlit. The intermediate
 
 The idea is to let the user run each stage manually, inspect the intermediate SuperPrompt in the right-hand box, and understand exactly what each component is doing before moving to a fully automated flow.
 
-![Intermediate Streamlit GUI](docs/gui_mock_streamlit.png)
+![Intermediate Streamlit GUI](doc\04-GUI\Dev1.png)
 
 ### Planned GUI (Phase 2 – history + tagging)
 
@@ -426,3 +426,4 @@ This is a personal research project by **Rusbeh Abtahi**.
 The project is currently shared under an MIT-style license. The intention is not to build a polished library, but a clear, inspectable reference implementation of a modern, agentic RAG system that can evolve over time.
 
 Feedback, issues, and thoughtful critique are very welcome.
+
