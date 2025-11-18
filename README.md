@@ -2,7 +2,7 @@
 
 RAGstream is a local-first RAG workbench for building transparent, controllable multi-agent pipelines around large language models. It ingests project documents into local vector stores (Chroma), runs a deterministic retrieval and reranking pipeline, and then assembles an explicit Super-Prompt that can be sent either to the ChatGPT UI or to APIs. Each intelligent step (prompt shaping, semantic gating, condensation, format enforcement) is implemented as a stateless agent whose behaviour is defined as data rather than hard-coded logic: JSON configurations are interpreted by an AgentFactory, so agents can be versioned and evolved like a small database. On top of this, the project is evolving toward a richer GUI where multi-project database selection, tagged conversation history (e.g. GOLD / SILVER / RED / BLUE), and V-model-inspired tooling for software-engineering tasks are orchestrated through the same agent stack.
 
-The emphasis here is on *transparent RAG*: human-in-the-loop, deterministic where possible, and explicit about which parts are LLM-driven and which are pure retrieval / control logic.
+The emphasis here is on *transparent RAG*: human-agent orchestration, deterministic where possible, and explicit about which parts are LLM-driven and which are pure retrieval / control logic.
 
 ---
 
