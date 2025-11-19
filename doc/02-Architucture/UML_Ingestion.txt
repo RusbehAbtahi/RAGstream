@@ -1,0 +1,122 @@
+@startuml RAGstream2_Ingestion
+'──────────────────────────────────────────────────────────────
+'  INGESTION / MEMORY – DOCUMENT PIPELINE (DETAILED VIEW)
+'──────────────────────────────────────────────────────────────
+left to right direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+package "Ingestion / Memory" {
+
+    class DocumentLoader {
+        + load_documents(subfolder:str) : List[Tuple[str,str]]
+        - root : Path
+    }
+
+    class Chunker {
+        + split(file_path:str, text:str, chunk_size:int=500, overlap:int=100) : List[Tuple[str,str]]
+    }
+
+    class Embedder {
+        + embed(texts:List[str]) : List[List[float]]
+        - model : str
+        - client : OpenAI
+    }
+
+    class FileManifest {
+        + compute_sha256(file_path:str) : str
+        + load_manifest(manifest_path:str) : Dict
+        + diff(records_now:List[Record], manifest_prev:Dict) : Tuple[List[Record],List[Record],List[Record]]
+        + publish_atomic(manifest_dict:Dict, manifest_path:str) : None
+    }
+
+    note right of FileManifest
+      Record (TypedDict):
+      {
+        "path":   str,   ' relative to doc_root
+        "sha256": str,
+        "mtime":  float,
+        "size":   int
+      }
+    end note
+
+    class IngestionStats {
+        + files_scanned        : int
+        + to_process           : int
+        + unchanged            : int
+        + tombstones           : int
+        + chunks_added         : int
+        + vectors_upserted     : int
+        + deleted_old_versions : int
+        + deleted_tombstones   : int
+        + published_manifest_path : str
+        + embedded_bytes       : int
+    }
+
+    class IngestionManager {
+        + run(
+            subfolder:str,
+            store:VectorStoreChroma,
+            chunker:Chunker,
+            embedder:Embedder,
+            manifest_path:str,
+            chunk_size:int=500,
+            overlap:int=100,
+            delete_old_versions:bool=True,
+            delete_tombstones:bool=False
+          ) : IngestionStats
+        - doc_root : Path
+        - loader   : DocumentLoader
+    }
+
+    class ChromaVectorStoreBase {
+        + add(ids:List[str], vectors:List[List[float]], metadatas:List[Dict]=None) : None
+        + query(vector:List[float], k:int=10, where:Dict=None) : List[str]
+        + delete_where(where:Dict) : None
+        + snapshot(timestamp:str=None) : Path
+        + collection() : Any
+        - persist_path    : Path
+        - collection_name : str
+        - _client : chromadb.PersistentClient
+        - _col    : chromadb.Collection
+        - _pre_add(.) : tuple
+        - _post_add(.) : None
+        - _pre_query(.) : tuple
+        - _post_query(ids:List[str], raw_result:Dict) : List[str]
+    }
+
+    class VectorStoreChroma extends ChromaVectorStoreBase {
+        + make_chunk_id(rel_path:str, sha256:str, chunk_idx:int) : str
+        + name() : str
+        + persist_root() : Path
+        + count() : int
+    }
+
+    '── Ingestion flow (documents only)
+    DocumentLoader --> Chunker : raw text
+    Chunker --> Embedder       : chunks
+
+    IngestionManager --> DocumentLoader
+    IngestionManager --> Chunker
+    IngestionManager --> Embedder
+    IngestionManager --> VectorStoreChroma
+    IngestionManager --> FileManifest
+}
+
+'──────────────────────────────────────────────────────────────
+'  EXTERNAL CONFIG / CALLERS (SMALL BOXES, NO DETAIL)
+'──────────────────────────────────────────────────────────────
+package "Config (external)" {
+    class Paths {
+        + PATHS : TypedDict
+        + ROOT  : Path
+    }
+}
+
+Paths .> ChromaVectorStoreBase : uses PATHS.chroma_db
+Paths .> IngestionManager      : provides doc_root/manifest_path
+
+@enduml
+

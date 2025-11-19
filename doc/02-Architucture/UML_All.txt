@@ -1,0 +1,168 @@
+@startuml RAGstream_Overview_Skeleton
+
+left to right direction
+skinparam linetype ortho
+skinparam packageStyle rectangle
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+' 0) CONFIG & UTILS
+'──────────────────────────────────────────────────────────────
+package "Config & Utils" {
+    class Settings
+    class Paths
+    class SimpleLogger
+    class DebugLogger
+}
+
+'──────────────────────────────────────────────────────────────
+' 1) INGESTION & MEMORY LAYER
+'──────────────────────────────────────────────────────────────
+package "Ingestion & Memory" {
+
+    class DocumentLoader
+    class Chunker
+    class Embedder
+
+    class FileManifest
+    class IngestionManager
+    class IngestionStats
+
+    class ChromaVectorStoreBase
+    class VectorStoreChroma
+    class HistoryStoreChroma
+
+    class ConversationLog
+    class ConversationMemory
+    class HistoryIngestionWorker
+    class ConvMemStore
+}
+
+'──────────────────────────────────────────────────────────────
+' 2) RAG PIPELINE & RETRIEVAL (A0…A5 + Retrieval/ReRanker)
+'──────────────────────────────────────────────────────────────
+package "RAG Pipeline & Retrieval" {
+
+    class DocScore
+    class Reranker
+    class Retriever
+
+    class A0_FileScopeSelector
+    class A1_DCI
+    class A2_PromptShaper
+    class A3_NLIGate
+    class A4_Condenser
+    class A5_SchemaEnforcer
+
+    class PromptBuilder
+}
+
+'──────────────────────────────────────────────────────────────
+' 3) AGENT STACK (neutral, stateless)
+'──────────────────────────────────────────────────────────────
+package "Agent Stack" {
+
+    class AgentConfig
+    class AgentFactory
+    class AgentPrompt
+    class AgentPromptValidationError
+    class UnknownAgentConfigError
+
+    class LLMClient
+    class JSONEnvelope
+}
+
+'──────────────────────────────────────────────────────────────
+' 4) SUPERPROMPT MODEL (shared state)
+'──────────────────────────────────────────────────────────────
+package "SuperPrompt Model" {
+    class SuperPrompt
+}
+
+'──────────────────────────────────────────────────────────────
+' 5) CONTROLLER & GUI
+'──────────────────────────────────────────────────────────────
+package "Controller & GUI" {
+    class AppController
+    class StreamlitUI
+}
+
+'──────────────────────────────────────────────────────────────
+' 6) STRUCTURAL RELATIONSHIPS (NO CONTROLLER/GUI LINES)
+'──────────────────────────────────────────────────────────────
+
+' Inheritance for vector stores
+VectorStoreChroma -|> ChromaVectorStoreBase : specializes
+HistoryStoreChroma -|> ChromaVectorStoreBase : specializes
+
+'──────────────────────────────────────────────────────────────
+' INGESTION & MEMORY – FLOWS
+'──────────────────────────────────────────────────────────────
+
+DocumentLoader --> Chunker        : raw files → text chunks
+Chunker        --> Embedder       : chunks → vectors
+Embedder       --> VectorStoreChroma : vectors → Chroma collection
+
+IngestionManager --> DocumentLoader      : orchestrates load
+IngestionManager --> Chunker            : orchestrates split
+IngestionManager --> Embedder           : orchestrates embed
+IngestionManager --> VectorStoreChroma  : writes chunk vectors
+IngestionManager --> FileManifest       : diff & publish
+
+FileManifest --> DocumentLoader   : provides relative paths
+
+Paths ..> DocumentLoader          : doc_root paths
+Paths ..> VectorStoreChroma       : chroma_db path
+Paths ..> ConversationLog         : logs path
+Paths ..> ConvMemStore            : convmem path
+
+ConversationMemory --> ConversationLog       : reads recent (G)
+ConversationMemory --> HistoryStoreChroma    : reads episodic (E)
+ConversationMemory --> ConvMemStore          : metadata / fading
+
+HistoryIngestionWorker --> ConversationLog    : read new tail
+HistoryIngestionWorker --> HistoryStoreChroma : write snapshots
+
+'──────────────────────────────────────────────────────────────
+' RETRIEVAL – FLOWS
+'──────────────────────────────────────────────────────────────
+
+Retriever --> ChromaVectorStoreBase : vector search
+Retriever --> Embedder              : encode query
+Retriever --> Reranker              : pass candidates
+Retriever .> DocScore               : returns scored docs
+
+'──────────────────────────────────────────────────────────────
+' RAG PIPELINE (A0…A5) & SUPERPROMPT
+'──────────────────────────────────────────────────────────────
+
+A0_FileScopeSelector --> FileManifest : select eligible files
+A1_DCI              --> FileManifest  : build ❖ FILES block
+
+A2_PromptShaper     --> SuperPrompt   : set intent/audience/etc.
+A3_NLIGate          --> SuperPrompt   : mark kept/dropped context
+A4_Condenser        --> SuperPrompt   : compress S_ctx
+A5_SchemaEnforcer   --> SuperPrompt   : validate / mark errors
+PromptBuilder       --> SuperPrompt   : build final prompt text
+
+'──────────────────────────────────────────────────────────────
+' AGENT STACK – FLOWS
+'──────────────────────────────────────────────────────────────
+
+AgentFactory --> AgentConfig      : load & validate JSON
+AgentFactory --> AgentPrompt      : build configured agent
+
+AgentPrompt  --> LLMClient        : send messages
+AgentPrompt  --> JSONEnvelope     : wrap request/response
+AgentPrompt  --> AgentPromptValidationError : raise on invalid
+
+LLMClient --> JSONEnvelope        : use as logical envelope
+
+'──────────────────────────────────────────────────────────────
+' CONFIG – BASIC WIRING (NO CONTROLLER/GUI LINES)
+'──────────────────────────────────────────────────────────────
+
+Settings ..> LLMClient            : model/api config
+Settings ..> Embedder             : embedding model config
+
+@enduml
