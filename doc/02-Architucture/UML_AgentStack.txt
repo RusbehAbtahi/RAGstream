@@ -1,0 +1,133 @@
+@startuml RAGstream_AgentStack
+'──────────────────────────────────────────────────────────────
+'  GLOBAL SETTINGS
+'──────────────────────────────────────────────────────────────
+left to right direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+'  1) AGENT STACK (AgentFactory, AgentPrompt, llm_client)
+'──────────────────────────────────────────────────────────────
+package "Agent Stack" {
+
+    class AgentFactory {
+        + get(agent_name:str) : Any
+        + list_agents() : List[str]
+        - registry : Dict[str,Any]      ' maps agent name → callable/class
+        - default_model : str
+    }
+
+    class AgentPrompt {
+        + compose_messages(
+            agent_name:str,
+            config:Dict,
+            system:str,
+            user:str,
+            s_ctx:List[str]
+        ) : List[Dict]
+        + envelope_for_call(
+            agent_name:str,
+            goal:str,
+            payload:Dict,
+            meta:Dict
+        ) : JSONEnvelope
+        - default_system : str
+        - default_temperature : float
+    }
+
+    class LLMClient {
+        + complete(
+            messages:List[Dict],
+            model:str=None,
+            response_format:Dict=None,
+            temperature:float=0.2
+        ) : JSONEnvelope
+        + estimate_cost(num_tokens:int, model:str=None) : float
+        - model : str
+    }
+
+    class JSONEnvelope {
+        + agent : str
+        + goal : str
+        + timestamp : str
+        + request_id : str
+        + turn_id : int
+        + source : str
+        + version : str
+        + escalate : bool
+        + reason : str
+        + provenance : Dict
+        + payload : Dict
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  2) AGENTS (context only)
+'──────────────────────────────────────────────────────────────
+package "Agents (app/agents)" {
+
+    class A0_FileScopeSelector
+    class A1_DCI
+    class A2_PromptShaper
+    class A3_NLIGate
+    class A4_Condenser
+    class A5_SchemaEnforcer
+}
+
+'──────────────────────────────────────────────────────────────
+'  3) APPLICATION LAYER (context only)
+'──────────────────────────────────────────────────────────────
+package "Application Layer" {
+    class AppController
+}
+
+package "Config & Utils" {
+    class Settings
+    class DebugLogger
+}
+
+'──────────────────────────────────────────────────────────────
+'  4) DEPENDENCIES & FLOW
+'──────────────────────────────────────────────────────────────
+
+' Controller asks factory for agents
+AppController --> AgentFactory : get(agent_name)
+
+' Agents use AgentPrompt to build messages/envelopes
+A2_PromptShaper ..> AgentPrompt : compose_messages()
+A3_NLIGate ..> AgentPrompt : compose_messages()
+A4_Condenser ..> AgentPrompt : compose_messages()
+A5_SchemaEnforcer ..> AgentPrompt : envelope_for_call()
+
+' AgentPrompt uses LLMClient; LLMClient returns JSONEnvelope
+AgentPrompt --> LLMClient : complete()
+LLMClient --> JSONEnvelope : returns
+
+' Config wiring
+Settings .> LLMClient : model/api config
+DebugLogger .> LLMClient : log errors/latency
+DebugLogger .> AgentPrompt : log composed messages
+
+note right of AgentFactory
+  Neutral, stateless registry:
+  - maps agent_name → implementation
+  - no business logic, no UI
+end note
+
+note right of AgentPrompt
+  Stateless prompt composer:
+  - merges SYSTEM/USER + S_ctx
+  - builds JSONEnvelope payload/meta
+  - never calls the LLM directly
+end note
+
+note right of LLMClient
+  Thin wrapper around LLM API:
+  - knows model/messages/response_format
+  - no knowledge of agents or Controller
+end note
+
+@enduml

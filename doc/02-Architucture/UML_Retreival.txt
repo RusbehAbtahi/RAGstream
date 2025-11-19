@@ -1,0 +1,200 @@
+@startuml RAG_Pipeline_Retrieval
+'──────────────────────────────────────────────────────────────
+'  GLOBAL SETTINGS
+'──────────────────────────────────────────────────────────────
+left to right direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+'  EXTERNAL MODULES (INGESTION / APP)
+'──────────────────────────────────────────────────────────────
+package "Ingestion / Memory (external)" {
+    class ChromaVectorStoreBase {
+        + add(ids:List[str], vectors:List[List[float]], metadatas:List[Dict]=None) : None
+        + query(vector:List[float], k:int=10, where:Dict=None) : List[str]
+        + delete_where(where:Dict) : None
+        + snapshot(timestamp:str=None) : Path
+        + collection() : Any
+    }
+
+    class Embedder {
+        + embed(texts:List[str]) : List[List[float]]
+        - model : str
+        - client : OpenAI
+    }
+}
+
+package "Application / Controller (external)" {
+    class AppController {
+        + handle(user_prompt:str, named_files:List[str], exact_lock:bool) : str
+    }
+
+    class StreamlitUI {
+        + render() : None
+    }
+
+    StreamlitUI --> AppController : user actions
+}
+
+'──────────────────────────────────────────────────────────────
+'  RAG PIPELINE & RETRIEVAL (FOCUS OF THIS DIAGRAM)
+'──────────────────────────────────────────────────────────────
+package "RAG Pipeline & Retrieval" {
+
+    '──────────────────────────────────────────────────
+    '  2) RETRIEVAL & RANKING
+    '──────────────────────────────────────────────────
+    package "Retrieval & Ranking" {
+
+        class DocScore {
+            + id : str
+            + score : float
+        }
+
+        class Reranker {
+            + rerank(ids:List[str], query:str) : List[str]
+        }
+
+        class Retriever {
+            + retrieve(query:str, k:int=10) : List[DocScore]
+            - _vs : ChromaVectorStoreBase
+            - _emb : Embedder
+            - _reranker : Reranker
+        }
+
+        Retriever --> ChromaVectorStoreBase
+        Retriever --> Embedder
+        Retriever --> Reranker
+        Retriever .> DocScore
+    }
+
+    '──────────────────────────────────────────────────
+    '  3) AGENTS (A0–A5)
+    '──────────────────────────────────────────────────
+    package "Agents (A0–A5)" {
+
+        class A0_FileScopeSelector {
+            + filter(manifest:List[Dict], toggles:Dict, lock:bool) : Dict
+            - alias_map : Dict[str,str]
+            - reason_trace : List[str]
+        }
+
+        class A1_DCI {
+            + build_files_block(named_files:List[str], lock:bool) : str
+            - pack_threshold_tokens : int
+            - file_manifest : Optional[Any]
+        }
+
+        class A2_PromptShaper {
+            + propose(question:str) : Dict[str,str]                ' {intent, domain, headers}
+            + audit_and_rerun(shape:Dict, s_ctx:List[str]) : bool  ' single bounded re-run gate
+        }
+
+        class A3_NLIGate {
+            + filter(candidates:List[str], question:str) : List[str]
+            - theta : float
+        }
+
+        class A4_Condenser {
+            + condense(kept:List[str]) : List[str]   ' S_ctx lines: Facts/Constraints/Open Issues
+        }
+
+        class A5_SchemaEnforcer {
+            + validate(artifact:str, spec:str) : Dict
+            - max_repairs : int
+            - last_result : Dict
+        }
+    }
+
+    '──────────────────────────────────────────────────
+    '  4) SUPERPROMPT & PROMPT ORCHESTRATION
+    '──────────────────────────────────────────────────
+    package "SuperPrompt & Orchestration" {
+
+        class SuperPrompt {
+            + system : str
+            + audience : str
+            + task : str
+            + mode : str
+            + response_depth : str
+            + tone : str
+            + confidence : str
+            + hard_rules : List[str]
+            + project_memory : List[str]
+            + files_block : str          ' ❖ FILES from A1_DCI
+            + s_ctx : List[str]          ' condensed context from A4_Condenser
+            + to_prompt_text() : str
+        }
+
+        class PromptBuilder {
+            + build(question:str, files_block:str, s_ctx:List[str], shape:Dict=None) : str
+            + build_from_superprompt(sp:SuperPrompt) : str
+            - template : str
+        }
+
+        class LLMClient {
+            + complete(prompt:str) : str
+            + estimate_cost(tokens:int) : float
+            - model : str
+        }
+
+        class JSONEnvelope {
+            + agent : str
+            + goal : str
+            + timestamp : str
+            + request_id : str
+            + turn_id : int
+            + source : str
+            + version : str
+            + escalate : bool
+            + reason : str
+            + provenance : Dict
+            + payload : Dict
+        }
+
+        PromptBuilder --> SuperPrompt : uses
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  PIPELINE ORCHESTRATION (FOCUS ON DATA/FLOW)
+'──────────────────────────────────────────────────────────────
+
+' Controller drives the RAG pipeline sequence
+AppController --> A0_FileScopeSelector : filter()
+AppController --> A1_DCI          : build_files_block()
+AppController --> Retriever       : retrieve()      ' if not exact_lock
+AppController --> Reranker        : rerank()
+AppController --> A3_NLIGate      : filter()
+AppController --> A4_Condenser    : condense() -> S_ctx
+AppController --> A2_PromptShaper : propose()/audit_and_rerun()
+AppController --> A5_SchemaEnforcer : validate()
+
+' SuperPrompt assembly & prompt building
+AppController --> SuperPrompt     : assemble fields
+AppController --> PromptBuilder   : build_from_superprompt()
+AppController --> LLMClient       : complete()
+
+' PromptBuilder context inputs
+PromptBuilder .> A1_DCI        : consumes ❖ FILES
+PromptBuilder .> A4_Condenser  : consumes S_ctx
+
+' Optional: envelope around LLM calls (Agent Stack / logging)
+LLMClient --> JSONEnvelope : wraps request/response
+
+' Layout helpers (cosmetic)
+A0_FileScopeSelector -[hidden]down-> A1_DCI
+A1_DCI -[hidden]down-> Retriever
+Retriever -[hidden]down-> Reranker
+Reranker -[hidden]down-> A3_NLIGate
+A3_NLIGate -[hidden]down-> A4_Condenser
+A4_Condenser -[hidden]down-> A2_PromptShaper
+A2_PromptShaper -[hidden]down-> A5_SchemaEnforcer
+A5_SchemaEnforcer -[hidden]down-> SuperPrompt
+SuperPrompt -[hidden]down-> PromptBuilder
+PromptBuilder -[hidden]down-> LLMClient
+
+@enduml
