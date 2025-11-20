@@ -1,0 +1,203 @@
+{
+  "agent_meta": {
+    "agent_id": "a2_promptshaper",
+    "version": "001",
+    "agent_type": "chooser",
+    "name": "A2 PromptShaper – System Role and Meta Selector",
+    "description": "Chooses appropriate system roles and meta-parameters for downstream agents based on the current SuperPrompt (task, audience, depth, etc.).",
+    "tags": [
+      "prompt_shaping",
+      "meta_config",
+      "system_roles",
+      "superprompt",
+      "ragstream"
+    ],
+    "enabled": true
+  },
+
+  "prompt_profile": {
+    "system_role": "You are a configuration assistant that selects the most appropriate system roles and meta-settings for another AI agent. You never perform the task yourself. Instead, you analyse the task description and context and decide how the downstream agent should behave.",
+    "purpose": "Given the current SuperPrompt (task, audience, purpose, context, etc.), select suitable system roles and meta-settings so that the downstream agent can answer in a way that matches the user’s goals and the RAGstream architecture.",
+    "intent": "Focus on RAG / agent-based workflows, Python tooling, AWS and cloud-native patterns, documentation-quality answers, and careful architectural thinking. Prefer roles that reflect the user’s strengths in Python, AWS, RAG, agents, requirements, and architectural design.",
+    "context": "The user is an experienced engineer and tool builder with strong Python, MATLAB/Simulink, automotive, and data engineering background. They are building RAGstream, a multi-agent RAG and orchestration system with a focus on prompt engineering, architecture, documentation, and AWS-based deployment. A2 PromptShaper receives a structured SuperPrompt (task, audience, response depth, etc.) from a deterministic preprocessing stage and must choose 1–3 system roles plus meta-settings that best support generating high-quality prompts and answers downstream."
+  },
+
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-5.1-mini",
+    "temperature": 0.0,
+    "max_tokens": 256,
+    "response_format": "json"
+  },
+
+  "input_binding": {
+    "superprompt_fields": [
+      "task",
+      "audience",
+      "purpose",
+      "context",
+      "response_depth"
+    ]
+  },
+
+  "fields": [
+    {
+      "id": "system_roles",
+      "label": "System roles for downstream agent",
+      "type": "enum",
+      "cardinality": "many",
+      "min_selected": 1,
+      "max_selected": 3,
+      "options": [
+        {
+          "id": "rag_architect",
+          "label": "RAG system architect",
+          "description": "Designs and reasons about retrieval-augmented generation pipelines, eligibility, and retrieval strategies."
+        },
+        {
+          "id": "llm_orchestration_engineer",
+          "label": "LLM orchestration and agent engineer",
+          "description": "Designs and coordinates multi-agent LLM workflows, tool usage, and controller logic."
+        },
+        {
+          "id": "prompt_engineer",
+          "label": "Prompt engineering specialist",
+          "description": "Crafts precise prompts, super-prompts, and schemas to get reliable behaviour from LLMs."
+        },
+        {
+          "id": "python_software_engineer",
+          "label": "Python software engineer",
+          "description": "Thinks in terms of clean Python design, modularity, and testable components."
+        },
+        {
+          "id": "aws_cloud_engineer",
+          "label": "AWS cloud and serverless engineer",
+          "description": "Focuses on deploying and running the solution on AWS (Lambda, IAM, S3, etc.)."
+        },
+        {
+          "id": "data_engineer",
+          "label": "Data engineer",
+          "description": "Builds and maintains data pipelines, ETL/ELT processes, and structured storage."
+        },
+        {
+          "id": "mlops_engineer",
+          "label": "MLOps / LLMOps engineer",
+          "description": "Thinks about lifecycle, monitoring, evaluation, and safe deployment of LLM/RAG systems."
+        },
+        {
+          "id": "requirements_engineer",
+          "label": "Requirements and systems analyst",
+          "description": "Translates informal goals into clear requirements, invariants, and acceptance criteria."
+        },
+        {
+          "id": "software_architect",
+          "label": "Software architect",
+          "description": "Maintains a coherent architectural view across modules, agents, and services."
+        },
+        {
+          "id": "documentation_specialist",
+          "label": "Technical documentation specialist",
+          "description": "Produces clear, structured documentation and explanations for complex systems."
+        },
+        {
+          "id": "testing_automation_engineer",
+          "label": "Test and tooling automation engineer",
+          "description": "Designs automated tests, validation checks, and developer tooling."
+        },
+        {
+          "id": "knowledge_management_expert",
+          "label": "Knowledge management expert",
+          "description": "Designs knowledge bases, ontologies, and retrieval structures for RAG."
+        },
+        {
+          "id": "legal_tech_consultant",
+          "label": "AI for legal and document workflows consultant",
+          "description": "Focuses on applying LLMs and RAG to contracts, legal documents, and compliance workflows."
+        },
+        {
+          "id": "llm_retrieval_specialist",
+          "label": "Retrieval and ranking specialist",
+          "description": "Optimises retrieval quality, scoring, reranking, and eligibility selection."
+        },
+        {
+          "id": "prompt_safety_reviewer",
+          "label": "Prompt safety and guardrail reviewer",
+          "description": "Reviews prompts and outputs for safety, robustness, and unwanted behaviour."
+        },
+        {
+          "id": "ux_for_ai_tools_designer",
+          "label": "UX designer for AI tools",
+          "description": "Thinks about how users interact with AI tooling and how to structure the UX flows."
+        },
+        {
+          "id": "matlab_simulink_integration_expert",
+          "label": "MATLAB/Simulink integration engineer",
+          "description": "Connects Python/LLM workflows with existing MATLAB and Simulink toolchains."
+        },
+        {
+          "id": "data_quality_analyst",
+          "label": "Data quality and curation analyst",
+          "description": "Evaluates input documents, datasets, and logs for quality and consistency."
+        },
+        {
+          "id": "agents_tooling_engineer",
+          "label": "Agents and tools integrator",
+          "description": "Designs and maintains tool/function-calling interfaces for agents."
+        },
+        {
+          "id": "ai_product_owner",
+          "label": "AI product owner / technical lead",
+          "description": "Balances technical depth with product goals and stakeholder needs."
+        }
+      ],
+      "default": [
+        "rag_architect",
+        "llm_orchestration_engineer",
+        "prompt_engineer"
+      ]
+    },
+    {
+      "id": "confidence",
+      "label": "Configuration confidence",
+      "type": "enum",
+      "cardinality": "one",
+      "options": [
+        { "id": "high", "label": "High" },
+        { "id": "medium", "label": "Medium" },
+        { "id": "low", "label": "Low" }
+      ],
+      "default": "high"
+    },
+    {
+      "id": "response_depth",
+      "label": "Preferred response depth",
+      "type": "enum",
+      "cardinality": "one",
+      "options": [
+        { "id": "short", "label": "Short overview" },
+        { "id": "normal", "label": "Normal detail" },
+        { "id": "exhaustive", "label": "Exhaustive detail" }
+      ],
+      "default": "exhaustive"
+    }
+  ],
+
+  "output_schema": {
+    "format": "json",
+    "type": "enum_choices",
+    "fields": [
+      {
+        "field_id": "system_roles",
+        "result_key": "system_roles"
+      },
+      {
+        "field_id": "confidence",
+        "result_key": "confidence"
+      },
+      {
+        "field_id": "response_depth",
+        "result_key": "response_depth"
+      }
+    ]
+  }
+}
