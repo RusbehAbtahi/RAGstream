@@ -3,23 +3,25 @@
     "agent_id": "a2_promptshaper",
     "version": "001",
     "agent_type": "chooser",
-    "name": "A2 PromptShaper – System Role and Meta Selector",
-    "description": "Chooses appropriate system roles and meta-parameters for downstream agents based on the current SuperPrompt (task, audience, depth, etc.).",
+    "name": "A2 PromptShaper – Meta Selector",
+    "description": "Chooses system, audience, tone, depth and confidence for downstream agents based on the current SuperPrompt.",
     "tags": [
       "prompt_shaping",
       "meta_config",
-      "system_roles",
-      "superprompt",
+      "system",
+      "audience",
+      "tone",
+      "depth",
+      "confidence",
       "ragstream"
     ],
     "enabled": true
   },
 
   "prompt_profile": {
-    "system_role": "You are a configuration assistant that selects the most appropriate system roles and meta-settings for another AI agent. You never perform the task yourself. Instead, you analyse the task description and context and decide how the downstream agent should behave.",
-    "purpose": "Given the current SuperPrompt (task, audience, purpose, context, etc.), select suitable system roles and meta-settings so that the downstream agent can answer in a way that matches the user’s goals and the RAGstream architecture.",
-    "intent": "Focus on RAG / agent-based workflows, Python tooling, AWS and cloud-native patterns, documentation-quality answers, and careful architectural thinking. Prefer roles that reflect the user’s strengths in Python, AWS, RAG, agents, requirements, and architectural design.",
-    "context": "The user is an experienced engineer and tool builder with strong Python, MATLAB/Simulink, automotive, and data engineering background. They are building RAGstream, a multi-agent RAG and orchestration system with a focus on prompt engineering, architecture, documentation, and AWS-based deployment. A2 PromptShaper receives a structured SuperPrompt (task, audience, response depth, etc.) from a deterministic preprocessing stage and must choose 1–3 system roles plus meta-settings that best support generating high-quality prompts and answers downstream."
+    "system_role": "You are a configuration assistant. You never answer the user's question directly. You only decide how another AI agent should behave by choosing its system role, audience, tone, depth, and confidence settings.",
+    "agent_purpose": "Given the current SuperPrompt (task, purpose, context), choose suitable meta-settings so that the downstream agent can answer in a way that matches the user's goals and the RAGstream architecture.",
+    "notes": "Focus on RAG / agent-based workflows, Python tooling, AWS and cloud-native patterns, documentation-quality answers, and careful architectural thinking. Prefer roles that reflect the user's strengths in Python, AWS, RAG, agents, requirements, and architectural design."
   },
 
   "llm_config": {
@@ -33,16 +35,14 @@
   "input_binding": {
     "superprompt_fields": [
       "task",
-      "audience",
       "purpose",
-      "context",
-      "response_depth"
+      "context"
     ]
   },
 
   "fields": [
     {
-      "id": "system_roles",
+      "id": "system",
       "label": "System roles for downstream agent",
       "type": "enum",
       "cardinality": "many",
@@ -52,22 +52,22 @@
         {
           "id": "rag_architect",
           "label": "RAG system architect",
-          "description": "Designs and reasons about retrieval-augmented generation pipelines, eligibility, and retrieval strategies."
+          "description": "Designs and reasons about retrieval-augmented generation pipelines, eligibility and retrieval strategies."
         },
         {
           "id": "llm_orchestration_engineer",
           "label": "LLM orchestration and agent engineer",
-          "description": "Designs and coordinates multi-agent LLM workflows, tool usage, and controller logic."
+          "description": "Designs and coordinates multi-agent LLM workflows, tool usage and controller logic."
         },
         {
           "id": "prompt_engineer",
           "label": "Prompt engineering specialist",
-          "description": "Crafts precise prompts, super-prompts, and schemas to get reliable behaviour from LLMs."
+          "description": "Crafts precise prompts, super-prompts and schemas to get reliable behaviour from LLMs."
         },
         {
           "id": "python_software_engineer",
           "label": "Python software engineer",
-          "description": "Thinks in terms of clean Python design, modularity, and testable components."
+          "description": "Thinks in terms of clean Python design, modularity and testable components."
         },
         {
           "id": "aws_cloud_engineer",
@@ -77,22 +77,22 @@
         {
           "id": "data_engineer",
           "label": "Data engineer",
-          "description": "Builds and maintains data pipelines, ETL/ELT processes, and structured storage."
+          "description": "Builds and maintains data pipelines, ETL/ELT processes and structured storage."
         },
         {
           "id": "mlops_engineer",
           "label": "MLOps / LLMOps engineer",
-          "description": "Thinks about lifecycle, monitoring, evaluation, and safe deployment of LLM/RAG systems."
+          "description": "Thinks about lifecycle, monitoring, evaluation and safe deployment of LLM/RAG systems."
         },
         {
           "id": "requirements_engineer",
           "label": "Requirements and systems analyst",
-          "description": "Translates informal goals into clear requirements, invariants, and acceptance criteria."
+          "description": "Translates informal goals into clear requirements, invariants and acceptance criteria."
         },
         {
           "id": "software_architect",
           "label": "Software architect",
-          "description": "Maintains a coherent architectural view across modules, agents, and services."
+          "description": "Maintains a coherent architectural view across modules, agents and services."
         },
         {
           "id": "documentation_specialist",
@@ -102,27 +102,27 @@
         {
           "id": "testing_automation_engineer",
           "label": "Test and tooling automation engineer",
-          "description": "Designs automated tests, validation checks, and developer tooling."
+          "description": "Designs automated tests, validation checks and developer tooling."
         },
         {
           "id": "knowledge_management_expert",
           "label": "Knowledge management expert",
-          "description": "Designs knowledge bases, ontologies, and retrieval structures for RAG."
+          "description": "Designs knowledge bases, ontologies and retrieval structures for RAG."
         },
         {
           "id": "legal_tech_consultant",
           "label": "AI for legal and document workflows consultant",
-          "description": "Focuses on applying LLMs and RAG to contracts, legal documents, and compliance workflows."
+          "description": "Applies LLMs and RAG to contracts, legal documents and compliance workflows."
         },
         {
           "id": "llm_retrieval_specialist",
           "label": "Retrieval and ranking specialist",
-          "description": "Optimises retrieval quality, scoring, reranking, and eligibility selection."
+          "description": "Optimises retrieval quality, scoring, reranking and eligibility selection."
         },
         {
           "id": "prompt_safety_reviewer",
           "label": "Prompt safety and guardrail reviewer",
-          "description": "Reviews prompts and outputs for safety, robustness, and unwanted behaviour."
+          "description": "Reviews prompts and outputs for safety, robustness and unwanted behaviour."
         },
         {
           "id": "ux_for_ai_tools_designer",
@@ -137,7 +137,7 @@
         {
           "id": "data_quality_analyst",
           "label": "Data quality and curation analyst",
-          "description": "Evaluates input documents, datasets, and logs for quality and consistency."
+          "description": "Evaluates input documents, datasets and logs for quality and consistency."
         },
         {
           "id": "agents_tooling_engineer",
@@ -157,6 +157,49 @@
       ]
     },
     {
+      "id": "audience",
+      "label": "Intended audience",
+      "type": "enum",
+      "cardinality": "one",
+      "options": [
+        { "id": "self_power_user", "label": "Self (power user / architect)" },
+        { "id": "future_employer_engineering", "label": "Future employer – engineering team" },
+        { "id": "future_employer_management", "label": "Future employer – management / decision makers" },
+        { "id": "legal_professional", "label": "Lawyer / legal professional" },
+        { "id": "data_science_peer", "label": "Data scientist / ML engineer" },
+        { "id": "junior_engineer", "label": "Junior engineer to be guided" },
+        { "id": "non_technical_stakeholder", "label": "Non-technical stakeholder" }
+      ],
+      "default": "self_power_user"
+    },
+    {
+      "id": "tone",
+      "label": "Tone of downstream agent",
+      "type": "enum",
+      "cardinality": "one",
+      "options": [
+        { "id": "neutral_analytical", "label": "Neutral and analytical" },
+        { "id": "teaching", "label": "Teaching / didactic" },
+        { "id": "coaching", "label": "Coaching and encouraging" },
+        { "id": "concise", "label": "Very concise" },
+        { "id": "formal", "label": "Formal / documentation style" },
+        { "id": "friendly", "label": "Friendly but precise" }
+      ],
+      "default": "neutral_analytical"
+    },
+    {
+      "id": "depth",
+      "label": "Response depth",
+      "type": "enum",
+      "cardinality": "one",
+      "options": [
+        { "id": "short", "label": "Short overview" },
+        { "id": "normal", "label": "Normal technical depth" },
+        { "id": "exhaustive", "label": "Exhaustive detail" }
+      ],
+      "default": "exhaustive"
+    },
+    {
       "id": "confidence",
       "label": "Configuration confidence",
       "type": "enum",
@@ -167,37 +210,17 @@
         { "id": "low", "label": "Low" }
       ],
       "default": "high"
-    },
-    {
-      "id": "response_depth",
-      "label": "Preferred response depth",
-      "type": "enum",
-      "cardinality": "one",
-      "options": [
-        { "id": "short", "label": "Short overview" },
-        { "id": "normal", "label": "Normal detail" },
-        { "id": "exhaustive", "label": "Exhaustive detail" }
-      ],
-      "default": "exhaustive"
     }
   ],
 
   "output_schema": {
     "format": "json",
-    "type": "enum_choices",
     "fields": [
-      {
-        "field_id": "system_roles",
-        "result_key": "system_roles"
-      },
-      {
-        "field_id": "confidence",
-        "result_key": "confidence"
-      },
-      {
-        "field_id": "response_depth",
-        "result_key": "response_depth"
-      }
+      { "field_id": "system", "result_key": "system" },
+      { "field_id": "audience", "result_key": "audience" },
+      { "field_id": "tone", "result_key": "tone" },
+      { "field_id": "depth", "result_key": "depth" },
+      { "field_id": "confidence", "result_key": "confidence" }
     ]
   }
 }
