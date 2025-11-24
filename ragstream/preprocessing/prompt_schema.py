@@ -64,3 +64,7 @@ class PromptSchema:
 
     def default_for(self, key: str) -> str:
         return self.defaults.get(self.normalize_key(key), "")
+
+    @property
+    def must(self):
+        return self.must_keys

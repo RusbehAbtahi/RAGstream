@@ -1,23 +1,59 @@
+# -*- coding: utf-8 -*-
 """
-SimpleLogger
-============
-Ultra-light façade for the standard logging module.
-Use for ephemeral console messages only (no persistent logs by requirement).
+SimpleLogger — tiny logging facade for RAGstream.
+
+Goal:
+- Avoid crashes when code calls SimpleLogger.info/debug/warning/error.
+- Keep it trivial: one class with classmethods, printing to stdout.
+- Later you can swap this to Python's 'logging' without touching callers.
 """
-import logging
+
+from __future__ import annotations
+import sys
+import datetime
+from typing import ClassVar
+
 
 class SimpleLogger:
-    _logger = logging.getLogger("ragstream")
-    if not _logger.handlers:
-        _logger.setLevel(logging.INFO)
-        _h = logging.StreamHandler()
-        _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s : %(message)s"))
-        _logger.addHandler(_h)
+    """
+    Very small logging helper.
+
+    Usage:
+        SimpleLogger.info("message")
+        SimpleLogger.debug("details")
+    """
+
+    _enabled: ClassVar[bool] = True
+    _prefix: ClassVar[str] = "RAGstream"
 
     @classmethod
-    def log(cls, msg: str) -> None:
-        cls._logger.info(msg)
+    def _log(cls, level: str, msg: str) -> None:
+        if not cls._enabled:
+            return
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"{cls._prefix} | {level.upper():5s} | {now} | {msg}"
+        print(line, file=sys.stdout, flush=True)
+
+    @classmethod
+    def debug(cls, msg: str) -> None:
+        cls._log("DEBUG", msg)
+
+    @classmethod
+    def info(cls, msg: str) -> None:
+        cls._log("INFO", msg)
+
+    @classmethod
+    def warning(cls, msg: str) -> None:
+        cls._log("WARN", msg)
 
     @classmethod
     def error(cls, msg: str) -> None:
-        cls._logger.error(msg)
+        cls._log("ERROR", msg)
+
+    @classmethod
+    def set_enabled(cls, enabled: bool) -> None:
+        cls._enabled = enabled
+
+    @classmethod
+    def set_prefix(cls, prefix: str) -> None:
+        cls._prefix = prefix

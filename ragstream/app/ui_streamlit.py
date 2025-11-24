@@ -86,7 +86,14 @@ def main() -> None:
                 st.session_state["super_prompt_text"] = sp.prompt_ready
 
         with b1c2:
-            st.button("A2 PromptShaper", key="btn_a2", use_container_width=True)
+            clicked_a2 = st.button("A2 PromptShaper", key="btn_a2", use_container_width=True)
+            if clicked_a2:
+                ctrl: AppController = st.session_state.controller
+                sp: SuperPrompt = st.session_state.sp
+                sp = ctrl.run_a2_promptshaper(sp)
+                st.session_state.sp = sp
+                st.session_state["super_prompt_text"] = sp.prompt_ready
+
         with b1c3:
             st.button("Retrieval", key="btn_retrieval", use_container_width=True)
         with b1c4:
