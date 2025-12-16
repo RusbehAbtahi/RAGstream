@@ -50,7 +50,7 @@ class A2PromptShaper:
         sp: SuperPrompt,
         *,
         agent_id: str = "a2_promptshaper",
-        version: str = "001",
+        version: str = "002",
     ) -> SuperPrompt:
         """
         Main entry point for A2.

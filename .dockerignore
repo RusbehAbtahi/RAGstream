@@ -1,0 +1,17 @@
+# VCS / IDE
+.git
+.idea
+
+# Python caches
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Not needed to run Streamlit backend
+training/
+data/A2_SLM_Training/
+
+# Optional: keep runtime image clean (not needed for serving)
+doc/
+tests/
+MD_Gen/
