@@ -36,7 +36,7 @@ def _parse_markdown_sections(user_text: str) -> List[Tuple[str, str]]:
     Last-wins behavior is enforced later by overwrite.
     """
     text = user_text or ""
-    matches = list(re.finditer(r"^(#{1,3})\s+(.+)$", text, flags=re.MULTILINE))
+    matches = list(re.finditer(r"^(#{1,3})\s*(.+)$", text, flags=re.MULTILINE))
     if not matches:
         return []
 
@@ -97,15 +97,17 @@ def preprocess(user_text: str, sp: Any, schema: PromptSchema) -> None:
     # ---------------- Step 3: deterministic mapping via NameMatcher ----------------
     nm = NameMatcher(schema)
 
+    breakpoint()
     # Build a map canonical -> text (last-wins via overwrite)
     mapped: Dict[str, str] = {}
     unknown_headers: List[str] = []
     for raw, body in sections:
-        canonical = nm.resolve(raw)
-        if canonical is None:
+        canonical_key, _method = nm.resolve(raw)  # unpack tuple
+        if canonical_key is None:
             unknown_headers.append(raw)
             continue
-        mapped[canonical] = body  # last definition wins
+        mapped[canonical_key] = body  # last definition wins
+
 
     # ---------------- Step 4: MUST handling + TASK/CONTEXT rule --------------------
     # TASK special rule:

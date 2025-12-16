@@ -40,9 +40,7 @@ filter_file_patterns = [
 only_dirs = [
 
     r"ragstream",
-    r"training/slm_a2/data",
-   r"training/slm_a2/models_local",
-   r"training/slm_a2/scripts",
+
 ]
 
 # Only-mode file patterns: if non-empty, ignore filter_file_patterns but still apply filter_file_patterns first

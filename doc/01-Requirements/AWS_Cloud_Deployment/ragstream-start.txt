@@ -1,0 +1,38 @@
+sudo tee /usr/local/bin/ragstream-start >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION="eu-central-1"
+REGISTRY="108782059508.dkr.ecr.eu-central-1.amazonaws.com"
+IMAGE="108782059508.dkr.ecr.eu-central-1.amazonaws.com/ragstream-web:latest"
+SSM_PARAM="/ragstream/prod/OPENAI_API_KEY"
+CONTAINER_NAME="ragstream"
+PORT="8501"
+
+# 1) Fetch OpenAI key from SSM (decrypted) into a shell variable
+OPENAI_API_KEY="$(aws ssm get-parameter \
+  --name "$SSM_PARAM" \
+  --with-decryption \
+  --query 'Parameter.Value' \
+  --output text \
+  --region "$REGION")"
+
+# 2) Login Docker to ECR (token-based; expires, so we do it each run)
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "$REGISTRY"
+
+# 3) Pull latest image
+docker pull "$IMAGE"
+
+# 4) Replace running container (if any), then start fresh
+if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  docker rm -f "$CONTAINER_NAME"
+fi
+
+docker run -d \
+  --name "$CONTAINER_NAME" \
+  --restart unless-stopped \
+  -p "${PORT}:${PORT}" \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  "$IMAGE"
+EOF
