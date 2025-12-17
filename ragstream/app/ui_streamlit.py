@@ -76,7 +76,7 @@ def main() -> None:
         # Row 1: 4 buttons
         b1c1, b1c2, b1c3, b1c4 = st.columns(4, gap="small")
         with b1c1:
-            clicked = st.button("PreProcessing", key="btn_preproc", use_container_width=True)
+            clicked = st.button("Pre-Processing", key="btn_preproc", use_container_width=True)
             if clicked:
                 ctrl: AppController = st.session_state.controller
                 sp: SuperPrompt = st.session_state.sp
