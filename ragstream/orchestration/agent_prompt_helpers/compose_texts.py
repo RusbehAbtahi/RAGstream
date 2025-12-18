@@ -57,6 +57,7 @@ def build_user_text_for_chooser(
     enums: Dict[str, List[str]],
     cardinality: Dict[str, str],
     option_descriptions: Dict[str, Dict[str, str]],
+    option_labels: Dict[str, Dict[str, str]],
     result_keys: Dict[str, str],
     active_fields: List[str],
 ) -> str:
@@ -65,7 +66,7 @@ def build_user_text_for_chooser(
 
     Shows:
     - Current SuperPrompt state (task, purpose, context, ...).
-    - For each active field: allowed options and expected JSON shape.
+    - For each active field: allowed option ids plus label/description for clarity, and expected JSON shape.
     """
     lines: List[str] = []
 
@@ -100,10 +101,16 @@ def build_user_text_for_chooser(
         else:
             lines.append("  - Type: single option id (string) from the list below.")
 
+        labels = option_labels.get(field_id, {})
         descs = option_descriptions.get(field_id, {})
         for opt_id in allowed:
+            label = labels.get(opt_id)
             desc = descs.get(opt_id)
-            if desc:
+            if label and desc:
+                lines.append(f"    * {opt_id}: {label} — {desc}")
+            elif label:
+                lines.append(f"    * {opt_id}: {label}")
+            elif desc:
                 lines.append(f"    * {opt_id}: {desc}")
             else:
                 lines.append(f"    * {opt_id}")

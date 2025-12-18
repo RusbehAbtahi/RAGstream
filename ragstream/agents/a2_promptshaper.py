@@ -141,19 +141,37 @@ class A2PromptShaper:
             )
 
         # 6) Update SuperPrompt body with the chosen values.
-        #    'system' may be a list → we join with ', ' for display; others should be strings.
+        #    The LLM output is constrained to option ids. For a readable final prompt,
+        #    translate ids -> labels (label only) using agent.option_labels.
+        #
+        #    We still keep the raw ids in sp.extras['a2_selected_ids'] for stability/debugging.
+        selected_ids: Dict[str, Any] = {}
+        labels_map: Dict[str, Dict[str, str]] = getattr(agent, "option_labels", {}) or {}
+
+        def _to_label(field_id: str, opt_id: str) -> str:
+            opt_id = (opt_id or "").strip()
+            if not opt_id:
+                return ""
+            return (labels_map.get(field_id, {}).get(opt_id) or opt_id).strip()
+
         for key in active_fields:
             value = result_dict.get(key)
             if value is None:
                 continue
 
+            selected_ids[key] = value
+
             if isinstance(value, list):
-                text = ", ".join(str(v).strip() for v in value if str(v).strip())
+                label_items = [_to_label(key, str(v)) for v in value]
+                label_items = [x for x in label_items if x]
+                text = ", ".join(label_items)
             else:
-                text = str(value).strip()
+                text = _to_label(key, str(value))
 
             if text:
                 sp.body[key] = text
+
+        sp.extras["a2_selected_ids"] = selected_ids
 
         # 7) Rebuild super-prompt markdown (right box) from the updated body.
         sp.prompt_ready = _compose_prompt_ready(

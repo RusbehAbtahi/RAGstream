@@ -41,22 +41,60 @@ class A4_Condenser:
 
 ### ~\ragstream\app\controller.py
 ```python
-# ragstream/app/controller.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
+
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.preprocessing.prompt_schema import PromptSchema
-from ragstream.preprocessing.preprocessing import preprocess  # correct import
+from ragstream.preprocessing.preprocessing import preprocess
+
+from ragstream.orchestration.agent_factory import AgentFactory
+from ragstream.orchestration.llm_client import LLMClient
+from ragstream.agents.a2_promptshaper import A2PromptShaper
+
 
 class AppController:
     def __init__(self, schema_path: str = "ragstream/config/prompt_schema.json") -> None:
-        self.schema = PromptSchema(schema_path)  # load once
+        """
+        Central app controller.
+
+        - Loads PromptSchema once (for PreProcessing) from the same path
+          you used in your original working version.
+        - Creates a shared AgentFactory + LLMClient.
+        - Creates the A2PromptShaper agent.
+        """
+        # PreProcessing schema (OLD, working behaviour)
+        self.schema = PromptSchema(schema_path)
+
+        # Shared AgentFactory (for A2 and, later, other agents)
+        self.agent_factory = AgentFactory()
+
+        # Shared LLMClient
+        self.llm_client = LLMClient()
+
+        # A2 agent
+        self.a2_promptshaper = A2PromptShaper(
+            agent_factory=self.agent_factory,
+            llm_client=self.llm_client,
+        )
 
     def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
+        """
+        Keep EXACTLY the old behaviour:
+        - Ignore empty/whitespace-only input.
+        - Otherwise run deterministic preprocessing, update sp in place.
+        """
         text = (user_text or "").strip()
         if not text:
             return sp
-        preprocess(text, sp, self.schema)  # updates sp in-place (sets prompt_ready, stage, history)
+        preprocess(text, sp, self.schema)
         return sp
+
+    def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:
+        """
+        Run A2 on the current SuperPrompt.
+        """
+        return self.a2_promptshaper.run(sp)
 ```
 
 ### ~\ragstream\app\controller_legacy.py
@@ -119,6 +157,141 @@ class AppController:
 ```
 
 ### ~\ragstream\app\ui_streamlit.py
+```python
+# -*- coding: utf-8 -*-
+"""
+Run on a free port, e.g.:
+  /home/rusbeh_ab/venvs/ragstream/bin/python -m streamlit run /home/rusbeh_ab/project/RAGstream/ragstream/app/ui_streamlit_2.py --server.port 8503
+"""
+
+from __future__ import annotations
+import streamlit as st
+from ragstream.app.controller import AppController
+from ragstream.orchestration.super_prompt import SuperPrompt
+
+def main() -> None:
+    st.set_page_config(page_title="RAGstream", layout="wide")
+
+    st.markdown(
+        """
+        <style>
+            /* Hide Streamlit header/toolbar to reduce top gap */
+            header {visibility: hidden;}
+            div[data-testid="stHeader"] {display: none;}
+            div[data-testid="stToolbar"] {display: none;}
+
+            /* Tighten page paddings to push content up/left */
+            .block-container {
+                padding-top: 0.2rem;
+                padding-bottom: 0rem;
+                padding-left: 0.6rem;
+                padding-right: 0.6rem;
+            }
+
+            /* Big, bold custom field titles */
+            .field-title {
+                font-size: 1.8rem;
+                font-weight: 800;
+                line-height: 1.2;
+                margin-bottom: 0.35rem;
+            }
+
+            /* Make the row gaps compact */
+            div[data-testid="stHorizontalBlock"]{
+                gap: 0.4rem !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("RAGstream")
+    # one controller + one SuperPrompt per user session
+    if "controller" not in st.session_state:
+        st.session_state.controller = AppController()
+    if "sp" not in st.session_state:
+        st.session_state.sp = SuperPrompt()
+    if "super_prompt_text" not in st.session_state:
+        st.session_state["super_prompt_text"] = ""
+
+    # Layout: gutters left/right, two main columns, small spacer between
+    gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
+
+    with gutter_l:
+        st.empty()
+
+    # LEFT: Prompt + two rows of pipeline buttons
+    with col_left:
+        st.markdown('<div class="field-title">Prompt</div>', unsafe_allow_html=True)
+        st.text_area(
+            label="Prompt (hidden)",
+            key="prompt_text",
+            height=240,
+            label_visibility="collapsed",
+        )
+
+        # Small vertical spacer
+        st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
+
+        # Row 1: 4 buttons
+        b1c1, b1c2, b1c3, b1c4 = st.columns(4, gap="small")
+        with b1c1:
+            clicked = st.button("Pre-Processing", key="btn_preproc", use_container_width=True)
+            if clicked:
+                ctrl: AppController = st.session_state.controller
+                sp: SuperPrompt = st.session_state.sp
+                user_text = st.session_state.get("prompt_text", "")
+                sp = ctrl.preprocess(user_text, sp)
+                st.session_state.sp = sp
+                st.session_state["super_prompt_text"] = sp.prompt_ready
+
+        with b1c2:
+            clicked_a2 = st.button("A2-PromptShaper", key="btn_a2", use_container_width=True)
+            if clicked_a2:
+                ctrl: AppController = st.session_state.controller
+                sp: SuperPrompt = st.session_state.sp
+                sp = ctrl.run_a2_promptshaper(sp)
+                st.session_state.sp = sp
+                st.session_state["super_prompt_text"] = sp.prompt_ready
+
+        with b1c3:
+            st.button("Retrieval", key="btn_retrieval", use_container_width=True)
+        with b1c4:
+            st.button("ReRanker", key="btn_reranker", use_container_width=True)
+
+        # Row 2: 4 buttons
+        b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")
+        with b2c1:
+            st.button("A3 NLI Gate", key="btn_a3", use_container_width=True)
+        with b2c2:
+            st.button("A4 Condenser", key="btn_a4", use_container_width=True)
+        with b2c3:
+            st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
+        with b2c4:
+            st.button("Prompt Builder", key="btn_builder", use_container_width=True)
+
+    # SPACER between columns
+    with spacer:
+        st.empty()
+
+    # RIGHT: Super-Prompt box
+    with col_right:
+        st.markdown('<div class="field-title">Super-Prompt</div>', unsafe_allow_html=True)
+        st.text_area(
+            label="Super-Prompt (hidden)",
+            key="super_prompt_text",
+            height=240,
+            label_visibility="collapsed",
+        )
+
+    with gutter_r:
+        st.empty()
+
+if __name__ == "__main__":
+    main()
+```
+
+### ~\ragstream\app\ui_streamlit_demo.py
 ```python
 # -*- coding: utf-8 -*-
 """
@@ -392,213 +565,6 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-```
-
-### ~\ragstream\app\ui_streamlit_2.py
-```python
-# -*- coding: utf-8 -*-
-"""
-Run on a free port, e.g.:
-  /home/rusbeh_ab/venvs/ragstream/bin/python -m streamlit run /home/rusbeh_ab/project/RAGstream/ragstream/app/ui_streamlit_2.py --server.port 8503
-"""
-
-from __future__ import annotations
-import streamlit as st
-from ragstream.app.controller import AppController
-from ragstream.orchestration.super_prompt import SuperPrompt
-
-def main() -> None:
-    st.set_page_config(page_title="RAGstream", layout="wide")
-
-    st.markdown(
-        """
-        <style>
-            /* Hide Streamlit header/toolbar to reduce top gap */
-            header {visibility: hidden;}
-            div[data-testid="stHeader"] {display: none;}
-            div[data-testid="stToolbar"] {display: none;}
-
-            /* Tighten page paddings to push content up/left */
-            .block-container {
-                padding-top: 0.2rem;
-                padding-bottom: 0rem;
-                padding-left: 0.6rem;
-                padding-right: 0.6rem;
-            }
-
-            /* Big, bold custom field titles */
-            .field-title {
-                font-size: 1.8rem;
-                font-weight: 800;
-                line-height: 1.2;
-                margin-bottom: 0.35rem;
-            }
-
-            /* Make the row gaps compact */
-            div[data-testid="stHorizontalBlock"]{
-                gap: 0.4rem !important;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.title("RAGstream")
-    # one controller + one SuperPrompt per user session
-    if "controller" not in st.session_state:
-        st.session_state.controller = AppController()
-    if "sp" not in st.session_state:
-        st.session_state.sp = SuperPrompt()
-    if "super_prompt_text" not in st.session_state:
-        st.session_state["super_prompt_text"] = ""
-
-    # Layout: gutters left/right, two main columns, small spacer between
-    gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
-
-    with gutter_l:
-        st.empty()
-
-    # LEFT: Prompt + two rows of pipeline buttons
-    with col_left:
-        st.markdown('<div class="field-title">Prompt</div>', unsafe_allow_html=True)
-        st.text_area(
-            label="Prompt (hidden)",
-            key="prompt_text",
-            height=240,
-            label_visibility="collapsed",
-        )
-
-        # Small vertical spacer
-        st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
-
-        # Row 1: 4 buttons
-        b1c1, b1c2, b1c3, b1c4 = st.columns(4, gap="small")
-        with b1c1:
-            clicked = st.button("PreProcessing", key="btn_preproc", use_container_width=True)
-            if clicked:
-                ctrl: AppController = st.session_state.controller
-                sp: SuperPrompt = st.session_state.sp
-                user_text = st.session_state.get("prompt_text", "")
-                sp = ctrl.preprocess(user_text, sp)
-                st.session_state.sp = sp
-                st.session_state["super_prompt_text"] = sp.prompt_ready
-
-        with b1c2:
-            st.button("A2 PromptShaper", key="btn_a2", use_container_width=True)
-        with b1c3:
-            st.button("Retrieval", key="btn_retrieval", use_container_width=True)
-        with b1c4:
-            st.button("ReRanker", key="btn_reranker", use_container_width=True)
-
-        # Row 2: 4 buttons
-        b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")
-        with b2c1:
-            st.button("A3 NLI Gate", key="btn_a3", use_container_width=True)
-        with b2c2:
-            st.button("A4 Condenser", key="btn_a4", use_container_width=True)
-        with b2c3:
-            st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
-        with b2c4:
-            st.button("Prompt Builder", key="btn_builder", use_container_width=True)
-
-    # SPACER between columns
-    with spacer:
-        st.empty()
-
-    # RIGHT: Super-Prompt box
-    with col_right:
-        st.markdown('<div class="field-title">Super-Prompt</div>', unsafe_allow_html=True)
-        st.text_area(
-            label="Super-Prompt (hidden)",
-            key="super_prompt_text",
-            height=240,
-            label_visibility="collapsed",
-        )
-
-    with gutter_r:
-        st.empty()
-
-if __name__ == "__main__":
-    main()
-```
-
-### ~\ragstream\app\agents\a1_dci.py
-```python
-"""
-Agents (A1..A4)
-===============
-Controller-side agents:
-- A1 Deterministic Code Injector → builds ❖ FILES (FULL/PACK) and enforces Exact File Lock.
-- A2 Prompt Shaper → suggests intent/domain + headers (advisory).
-- A3 NLI Gate → keep/drop based on entailment with θ strictness.
-- A4 Context Condenser → outputs S_ctx (Facts / Constraints / Open Issues) with citations.
-"""
-from typing import List, Dict, Tuple, Optional
-
-class A1_DCI:
-    def build_files_block(self, named_files: List[str], lock: bool) -> str:
-        return "❖ FILES\n"
-
-```
-
-### ~\ragstream\app\agents\a2_prompt_shaper.py
-```python
-"""
-Agents (A1..A4)
-===============
-Controller-side agents:
-- A1 Deterministic Code Injector → builds ❖ FILES (FULL/PACK) and enforces Exact File Lock.
-- A2 Prompt Shaper → suggests intent/domain + headers (advisory).
-- A3 NLI Gate → keep/drop based on entailment with θ strictness.
-- A4 Context Condenser → outputs S_ctx (Facts / Constraints / Open Issues) with citations.
-"""
-from typing import List, Dict, Tuple, Optional
-
-
-class A2_PromptShaper:
-    def propose(self, question: str) -> Dict[str, str]:
-        return {"intent": "explain", "domain": "software"}
-
-
-```
-
-### ~\ragstream\app\agents\a3_nli_gate.py
-```python
-"""
-Agents (A1..A4)
-===============
-Controller-side agents:
-- A1 Deterministic Code Injector → builds ❖ FILES (FULL/PACK) and enforces Exact File Lock.
-- A2 Prompt Shaper → suggests intent/domain + headers (advisory).
-- A3 NLI Gate → keep/drop based on entailment with θ strictness.
-- A4 Context Condenser → outputs S_ctx (Facts / Constraints / Open Issues) with citations.
-"""
-from typing import List, Dict, Tuple, Optional
-
-
-class A3_NLIGate:
-    def __init__(self, theta: float = 0.6) -> None:
-        self.theta = theta
-    def filter(self, candidates: List[str], question: str) -> List[str]:
-        return candidates
-```
-
-### ~\ragstream\app\agents\a4_condenser.py
-```python
-"""
-Agents (A1..A4)
-===============
-Controller-side agents:
-- A1 Deterministic Code Injector → builds ❖ FILES (FULL/PACK) and enforces Exact File Lock.
-- A2 Prompt Shaper → suggests intent/domain + headers (advisory).
-- A3 NLI Gate → keep/drop based on entailment with θ strictness.
-- A4 Context Condenser → outputs S_ctx (Facts / Constraints / Open Issues) with citations.
-"""
-from typing import List, Dict, Tuple, Optional
-
-class A4_Condenser:
-    def condense(self, kept: List[str]) -> List[str]:
-        return ["Facts:", "Constraints:", "Open Issues:"]
 ```
 
 
@@ -1673,18 +1639,561 @@ class VectorStoreChroma(ChromaVectorStoreBase):
 
 ## /home/rusbeh_ab/project/RAGstream/ragstream/orchestration
 
+### ~\ragstream\orchestration\agent_factory.py
+```python
+# -*- coding: utf-8 -*-
+"""
+AgentFactory
+============
+
+
+- This is the single place where AgentPrompt objects are created from JSON configs.
+- It hides all file-system details (where JSON lives, how paths are built).
+- It also caches created agents, so JSON is read only once per (agent_id, version).
+
+Usage model (high level):
+- Controller creates ONE AgentFactory instance at startup.
+- Each Agent (A2, A3, ...) asks this factory for its AgentPrompt:
+    factory.get_agent("a2_promptshaper", "001")
+- The returned AgentPrompt is then used to compose/parse LLM calls.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+from ragstream.utils.logging import SimpleLogger
+from ragstream.orchestration.agent_prompt import AgentPrompt
+
+
+class AgentFactory:
+    """
+    Central factory for building and caching AgentPrompt instances.
+
+    Design goals:
+    - Neutral: knows nothing about A2/A3/etc. beyond their (agent_id, version).
+    - File-based: loads JSON configs from data/agents/<agent_id>/<version>.json.
+    - Cached: Agents are constructed once and reused for the lifetime of the factory.
+    """
+
+    def __init__(self, agents_root: Optional[Path] = None) -> None:
+        """
+        Initialize the factory.
+
+        Parameters
+        ----------
+        agents_root:
+            Optional base directory where all agent JSON configs live.
+            If None, we derive it from the package layout assuming the repo root
+            looks like:
+
+                RAGstream/
+                    data/
+                        agents/
+                            a2_promptshaper/001.json
+                    ragstream/
+                        orchestration/
+                            agent_factory.py
+                        ...
+
+            In that case:
+                repo_root = Path(__file__).resolve().parents[2]
+                agents_root = repo_root / "data" / "agents"
+        """
+        if agents_root is None:
+            # Go from ragstream/orchestration/agent_factory.py
+            #   -> ragstream/
+            #   -> RAGstream/ (repo root)
+            repo_root = Path(__file__).resolve().parents[2]
+            agents_root = repo_root / "data" / "agents"
+
+        self.agents_root: Path = agents_root
+        self._cache: Dict[Tuple[str, str], AgentPrompt] = {}
+
+        SimpleLogger.info(f"AgentFactory initialized with agents_root={self.agents_root}")
+
+    # ------------------------------------------------------------------
+    # Internal path builder
+    # ------------------------------------------------------------------
+
+    def _build_config_path(self, agent_id: str, version: str) -> Path:
+        """
+        Internal helper: compute the JSON config path for a given agent_id/version.
+
+        Example:
+            agent_id = "a2_promptshaper"
+            version  = "001"
+        Path becomes:
+            <agents_root>/a2_promptshaper/001.json
+        """
+        return self.agents_root / agent_id / f"{version}.json"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def load_config(self, agent_id: str, version: str) -> Dict[str, Any]:
+        """
+        Load the raw JSON config for a given agent_id and version.
+
+        Responsibilities:
+        - Build the file path.
+        - Read JSON from disk.
+        - Raise a clear error if the file does not exist or is invalid.
+
+        This method does NOT cache anything; it just returns the config dict.
+        """
+        cfg_path = self._build_config_path(agent_id, version)
+
+        if not cfg_path.is_file():
+            msg = f"AgentFactory: config not found for {agent_id=} {version=} at {cfg_path}"
+            SimpleLogger.error(msg)
+            raise FileNotFoundError(msg)
+
+        try:
+            with cfg_path.open("r", encoding="utf-8") as f:
+                config: Dict[str, Any] = json.load(f)
+        except Exception as exc:
+            msg = f"AgentFactory: failed to load JSON config from {cfg_path}: {exc}"
+            SimpleLogger.error(msg)
+            raise
+
+        return config
+
+    def get_agent(self, agent_id: str, version: str = "001") -> AgentPrompt:
+        """
+        Return an AgentPrompt instance for the given (agent_id, version).
+
+        Responsibilities:
+        - Check the in-memory cache first.
+        - If not present:
+            - Load the JSON config.
+            - Build AgentPrompt via AgentPrompt.from_config(config).
+            - Store it in the cache.
+        - Always return the same AgentPrompt instance for the same key.
+
+        This ensures:
+        - We only hit the file system once per agent/version.
+        - All callers share the same AgentPrompt configuration object.
+        """
+        key = (agent_id, version)
+        if key in self._cache:
+            return self._cache[key]
+
+        config = self.load_config(agent_id, version)
+        agent = AgentPrompt.from_config(config)
+        self._cache[key] = agent
+
+        SimpleLogger.info(
+            f"AgentFactory: created AgentPrompt for agent_id={agent_id}, version={version}"
+        )
+        return agent
+
+    def clear_cache(self) -> None:
+        """
+        Clear the internal cache of AgentPrompt instances.
+
+        Why this exists:
+        - Mostly for testing or advanced scenarios (e.g. live-reloading configs).
+        - In normal operation you probably never call this.
+
+        Behavior:
+        - Simply empties the cache dict; no further side effects.
+        """
+        self._cache.clear()
+        SimpleLogger.info("AgentFactory: cache cleared")
+```
+
+### ~\ragstream\orchestration\agent_prompt.py
+```python
+# -*- coding: utf-8 -*-
+"""
+AgentPrompt
+===========
+Main neutral prompt engine used by all LLM-using agents.
+
+This file only:
+- Defines AgentPrompt (the main class).
+- Defines AgentPromptValidationError (small helper exception).
+- Delegates JSON parsing, field config extraction, normalization and text
+  composition to helper modules in agent_prompt_helpers.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+from ragstream.utils.logging import SimpleLogger
+from ragstream.orchestration.agent_prompt_helpers.config_loader import (
+    extract_field_config,
+)
+from ragstream.orchestration.agent_prompt_helpers.schema_map import (
+    build_result_key_map,
+)
+from ragstream.orchestration.agent_prompt_helpers.json_parser import (
+    extract_json_object,
+)
+from ragstream.orchestration.agent_prompt_helpers.field_normalizer import (
+    normalize_one,
+    normalize_many,
+)
+from ragstream.orchestration.agent_prompt_helpers.compose_texts import (
+    build_system_text,
+    build_user_text_for_chooser,
+)
+
+
+class AgentPromptValidationError(Exception):
+    """Raised when the LLM output cannot be parsed or validated."""
+
+
+class AgentPrompt:
+    """
+    Neutral prompt engine.
+
+    Configuration is passed in once (from JSON via AgentFactory) and is read-only.
+    No per-call state is stored inside the instance; all inputs for a run are passed
+    to compose()/parse() as parameters.
+    """
+
+    def __init__(
+        self,
+        agent_name: str,
+        version: str,
+        mode: str,
+        system_text: str,
+        purpose_text: str,
+        output_schema: Dict[str, Any],
+        enums: Dict[str, List[str]],
+        defaults: Dict[str, Any],
+        cardinality: Dict[str, str],
+        option_descriptions: Dict[str, Dict[str, str]],
+        model_name: str,
+        temperature: float,
+        max_output_tokens: int,
+    ) -> None:
+        self.agent_name: str = agent_name
+        self.version: str = version
+        self.mode: str = mode  # "chooser" | "writer" | "extractor" | "scorer"
+        self.system_text: str = system_text
+        self.purpose_text: str = purpose_text
+        self.output_schema: Dict[str, Any] = output_schema
+
+        # Per-field configuration
+        self.enums: Dict[str, List[str]] = enums
+        self.defaults: Dict[str, Any] = defaults
+        self.cardinality: Dict[str, str] = cardinality
+        self.option_descriptions: Dict[str, Dict[str, str]] = option_descriptions
+
+        # Model configuration
+        self.model_name: str = model_name
+        self.temperature: float = temperature
+        self.max_output_tokens: int = max_output_tokens
+
+        # Derived mapping: field_id -> result_key in JSON
+        self._result_keys: Dict[str, str] = build_result_key_map(output_schema)
+
+        if self.mode not in ("chooser", "writer", "extractor", "scorer"):
+            SimpleLogger.error(f"AgentPrompt[{self.agent_name}] unknown mode: {self.mode}")
+
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "AgentPrompt":
+        """
+        Build AgentPrompt from a JSON config dict as stored in data/agents/...
+
+        Expects an A2-style schema with:
+          - agent_meta
+          - prompt_profile
+          - llm_config
+          - fields
+          - output_schema
+        """
+        agent_meta = config.get("agent_meta", {})
+        prompt_profile = config.get("prompt_profile", {})
+        llm_cfg = config.get("llm_config", {})
+        fields_cfg = config.get("fields", []) or []
+        output_schema = config.get("output_schema", {}) or {}
+
+        agent_name = agent_meta.get("agent_id") or agent_meta.get("agent_name") or "unknown_agent"
+        version = str(agent_meta.get("version", "000"))
+        mode = agent_meta.get("agent_type", "chooser")
+
+        system_text = prompt_profile.get("system_role", "")
+        purpose_text = prompt_profile.get("agent_purpose", "")
+
+        model_name = llm_cfg.get("model_name", "gpt-5.1-mini")
+        temperature = float(llm_cfg.get("temperature", 0.0))
+        max_tokens = int(llm_cfg.get("max_tokens", 256))
+
+        enums, defaults, cardinality, opt_desc = extract_field_config(fields_cfg)
+
+        return cls(
+            agent_name=agent_name,
+            version=version,
+            mode=mode,
+            system_text=system_text,
+            purpose_text=purpose_text,
+            output_schema=output_schema,
+            enums=enums,
+            defaults=defaults,
+            cardinality=cardinality,
+            option_descriptions=opt_desc,
+            model_name=model_name,
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
+
+    @property
+    def model(self) -> str:
+        """Model name used by llm_client."""
+        return self.model_name
+
+    @property
+    def max_tokens(self) -> int:
+        """Maximum output tokens for llm_client."""
+        return self.max_output_tokens
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    def compose(
+        self,
+        input_payload: Dict[str, Any],
+        active_fields: Optional[List[str]] = None,
+    ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+        """
+        Build SYSTEM + USER messages and the response_format for the LLM.
+
+        input_payload:
+            Dict with keys like "task", "purpose", "context" (from SuperPrompt).
+
+        active_fields:
+            Optional list of field_ids that are "live" for this call, decided by A2.
+            If None, all known enum fields are considered active.
+        """
+        if self.mode != "chooser":
+            raise AgentPromptValidationError(
+                f"AgentPrompt[{self.agent_name}] compose() currently only supports mode='chooser'"
+            )
+
+        active_set: Set[str]
+        if active_fields is None:
+            active_set = set(self.enums.keys())
+        else:
+            active_set = set(f for f in active_fields if f in self.enums)
+
+        system_text = build_system_text(
+            system_text=self.system_text,
+            purpose_text=self.purpose_text,
+            agent_name=self.agent_name,
+            version=self.version,
+        )
+
+        user_text = build_user_text_for_chooser(
+            input_payload=input_payload,
+            enums=self.enums,
+            cardinality=self.cardinality,
+            option_descriptions=self.option_descriptions,
+            result_keys=self._result_keys,
+            active_fields=sorted(active_set),
+        )
+
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ]
+        response_format = {"type": "json_object"}
+
+        return messages, response_format
+
+    def parse(
+        self,
+        raw_output: Any,
+        active_fields: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Parse and validate the LLM raw output into a clean Python dict.
+
+        raw_output:
+            Raw LLM response. Usually a string; treated as JSON or JSON-like.
+
+        active_fields:
+            Optional list of field_ids that were active for this call.
+            If None, all enum fields are considered active.
+
+        Returns
+        -------
+        result:
+            Dict with normalized values per field_id, e.g.:
+            {
+                "system": ["rag_architect", "prompt_engineer"],
+                "audience": "self_power_user",
+                "tone": "neutral_analytical",
+                "depth": "exhaustive",
+                "confidence": "high",
+            }
+        """
+        if self.mode != "chooser":
+            raise AgentPromptValidationError(
+                f"AgentPrompt[{self.agent_name}] parse() currently only supports mode='chooser'"
+            )
+
+        if active_fields is None:
+            active_set: Set[str] = set(self.enums.keys())
+        else:
+            active_set = set(f for f in active_fields if f in self.enums)
+
+        json_obj = extract_json_object(raw_output)
+
+        result: Dict[str, Any] = {}
+        for field_id, allowed in self.enums.items():
+            if field_id not in active_set:
+                # Inactive: caller (A2) keeps the existing value (e.g. user-set).
+                continue
+
+            result_key = self._result_keys.get(field_id, field_id)
+            card = self.cardinality.get(field_id, "one")
+            default_value = self.defaults.get(field_id)
+
+            raw_value = json_obj.get(result_key, None)
+
+            if card == "many":
+                normalized = normalize_many(
+                    field_id=field_id,
+                    raw_value=raw_value,
+                    allowed=allowed,
+                    default_value=default_value,
+                )
+            else:
+                normalized = normalize_one(
+                    field_id=field_id,
+                    raw_value=raw_value,
+                    allowed=allowed,
+                    default_value=default_value,
+                )
+
+            result[field_id] = normalized
+
+        return result
+```
+
 ### ~\ragstream\orchestration\llm_client.py
 ```python
+# ragstream/orchestration/llm_client.py
+# -*- coding: utf-8 -*-
 """
-LLMClient
-=========
-Adapter for model calls + cost estimate.
+LLMClient — thin wrapper around an LLM provider.
+
+Current implementation:
+- Uses OpenAI Python client v1 (OpenAI() + client.chat.completions.create).
+- Reads OPENAI_API_KEY from environment (or optional api_key in __init__).
+- Supports optional JSON-mode: if response_format={"type": "json_object"},
+  it will attempt json.loads on the returned content and give you a dict.
 """
+
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Union
+import os
+import json
+
+from ragstream.utils.logging import SimpleLogger
+
+try:
+    # New v1-style client
+    from openai import OpenAI  # type: ignore[import]
+except ImportError:  # pragma: no cover - import guard
+    OpenAI = None  # type: ignore[assignment]
+
+JsonDict = Dict[str, Any]
+
+
 class LLMClient:
-    def complete(self, prompt: str) -> str:
-        return "ANSWER"
-    def estimate_cost(self, tokens: int) -> float:
-        return 0.0
+    """
+    Neutral LLM gateway.
+
+    You give it:
+      - messages: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+      - model_name, temperature, max_output_tokens
+      - optional response_format (e.g. {"type": "json_object"})
+
+    It returns:
+      - string (raw content) OR
+      - dict (if JSON-mode used and parsing succeeded)
+    """
+
+    def __init__(self, api_key: Optional[str] = None) -> None:
+        key = api_key or os.getenv("OPENAI_API_KEY") or ""
+        self._client: Optional[OpenAI] = None  # type: ignore[type-arg]
+
+        if OpenAI is None:
+            SimpleLogger.info(
+                "LLMClient: 'openai' v1 client not installed. Any LLM call will fail until you "
+                "install it (e.g. 'pip install openai')."
+            )
+            return
+
+        if not key:
+            SimpleLogger.info(
+                "LLMClient: OPENAI_API_KEY not set. Any LLM call will fail until you set it."
+            )
+            return
+
+        try:
+            # v1 client: hold a single instance
+            self._client = OpenAI(api_key=key)
+            SimpleLogger.info("LLMClient: OpenAI client initialised (v1 API).")
+        except Exception as exc:
+            SimpleLogger.error(f"LLMClient: failed to initialise OpenAI client: {exc!r}")
+            self._client = None
+
+    def chat(
+            self,
+            *,
+            messages,
+            model_name: str,
+            temperature: float,
+            max_output_tokens: int,
+            response_format: dict | None = None,
+    ):
+        """
+        Thin wrapper over OpenAI chat.completions.
+
+        - Uses max_completion_tokens (new API) instead of max_tokens.
+        - For gpt-5* reasoning models, we do NOT send temperature (it is unsupported).
+        """
+        if self._client is None:
+            raise RuntimeError("LLMClient: OpenAI client is not initialised")
+
+        # Base kwargs for the API call
+        kwargs: dict = {
+            "model": model_name,
+            "messages": messages,
+            "max_completion_tokens": max_output_tokens,
+        }
+
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+
+        # temperature is illegal for gpt-5* reasoning models, allowed for others
+        if temperature is not None and not model_name.startswith("gpt-5"):
+            kwargs["temperature"] = temperature
+
+        resp = self._client.chat.completions.create(**kwargs)
+        # AgentPrompt.parse() expects the raw content (string or JSON-string)
+        content = resp.choices[0].message.content
+        return content if isinstance(content, str) else str(content or "")
+
 ```
 
 ### ~\ragstream\orchestration\prompt_builder.py
@@ -1790,6 +2299,418 @@ class SuperPrompt:
         self.prompt_ready: str = ""   # fully composed prompt ready to display/send
     def __repr__(self) -> str:
         return f"SuperPrompt(stage={self.stage!r})"
+```
+
+### ~\ragstream\orchestration\agent_prompt_helpers\compose_texts.py
+```python
+# -*- coding: utf-8 -*-
+"""
+compose_texts
+=============
+
+Why this helper exists:
+- Composing SYSTEM and USER messages is text-heavy and easy to clutter the
+  main AgentPrompt class.
+- We want the core class to read like a high-level story, and all text
+  formatting to live here.
+
+What it does:
+- Provides `build_system_text(...)` for the SYSTEM message.
+- Provides `build_user_text_for_chooser(...)` for the USER message when
+  agent_type == "chooser".
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+
+def build_system_text(
+    system_text: str,
+    purpose_text: str,
+    agent_name: str,
+    version: str,
+) -> str:
+    """
+    Build the SYSTEM message content for the LLM.
+    """
+    lines: List[str] = []
+
+    if system_text:
+        lines.append(system_text.strip())
+
+    if purpose_text:
+        lines.append("")
+        lines.append(f"Agent purpose: {purpose_text.strip()}")
+
+    lines.append("")
+    lines.append(f"Agent id: {agent_name} v{version}")
+    lines.append(
+        "You never answer the user's question directly. "
+        "You ONLY choose configuration values as instructed."
+    )
+    lines.append(
+        "You MUST respond with a single JSON object and nothing else "
+        "(no prose, no comments)."
+    )
+
+    return "\n".join(lines)
+
+
+def build_user_text_for_chooser(
+    input_payload: Dict[str, Any],
+    enums: Dict[str, List[str]],
+    cardinality: Dict[str, str],
+    option_descriptions: Dict[str, Dict[str, str]],
+    result_keys: Dict[str, str],
+    active_fields: List[str],
+) -> str:
+    """
+    Build the USER message content for a chooser-type agent.
+
+    Shows:
+    - Current SuperPrompt state (task, purpose, context, ...).
+    - For each active field: allowed options and expected JSON shape.
+    """
+    lines: List[str] = []
+
+    # Show SuperPrompt state
+    lines.append("Current SuperPrompt state:")
+    for key, value in input_payload.items():
+        lines.append(f"- {key}: {value!r}")
+    lines.append("")
+
+    # Explain the decision task
+    lines.append(
+        "Based on this, choose values for the following configuration fields. "
+        "For each field, you MUST choose only from the allowed option ids."
+    )
+    lines.append("")
+
+    # List fields and options
+    for field_id in active_fields:
+        allowed = enums.get(field_id, [])
+        if not allowed:
+            continue
+
+        card = cardinality.get(field_id, "one")
+        result_key = result_keys.get(field_id, field_id)
+
+        lines.append(f"Field '{field_id}' (JSON key: '{result_key}'):")
+
+        if card == "many":
+            lines.append(
+                "  - Type: array of one or more option ids (strings) from the list below."
+            )
+        else:
+            lines.append("  - Type: single option id (string) from the list below.")
+
+        descs = option_descriptions.get(field_id, {})
+        for opt_id in allowed:
+            desc = descs.get(opt_id)
+            if desc:
+                lines.append(f"    * {opt_id}: {desc}")
+            else:
+                lines.append(f"    * {opt_id}")
+
+        lines.append("")
+
+    # Describe expected JSON keys and shapes
+    lines.append("Return ONLY a JSON object with keys:")
+    for field_id in active_fields:
+        result_key = result_keys.get(field_id, field_id)
+        card = cardinality.get(field_id, "one")
+        if card == "many":
+            lines.append(f"- '{result_key}': array of option ids (strings).")
+        else:
+            lines.append(f"- '{result_key}': single option id (string).")
+
+    lines.append("")
+    lines.append("Do NOT add explanations, comments or extra keys. JSON only.")
+
+    return "\n".join(lines)
+```
+
+### ~\ragstream\orchestration\agent_prompt_helpers\config_loader.py
+```python
+# -*- coding: utf-8 -*-
+"""
+config_loader
+=============
+
+Why this helper exists:
+- Agent JSON configs contain a 'fields' list with enums, defaults and cardinality.
+- Converting this list into clean Python dictionaries is generic logic and should
+  not clutter AgentPrompt.
+
+What it does:
+- Provides a single function `extract_field_config(fields_cfg)` that returns:
+  - enums[field_id] = list of allowed option ids.
+  - defaults[field_id] = default value from config (may be str or list).
+  - cardinality[field_id] = "one" or "many".
+  - option_descriptions[field_id][opt_id] = human-readable description (optional).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+
+
+def extract_field_config(
+    fields_cfg: List[Dict[str, Any]]
+) -> Tuple[Dict[str, List[str]], Dict[str, Any], Dict[str, str], Dict[str, Dict[str, str]]]:
+    """
+    Convert the JSON 'fields' list into enums/defaults/cardinality/option_descriptions.
+
+    - enums[field_id] = ["opt1", "opt2", ...]
+    - defaults[field_id] = default value from config (may be str or list)
+    - cardinality[field_id] = "one" | "many"
+    - option_descriptions[field_id][opt_id] = description (if present)
+    """
+    enums: Dict[str, List[str]] = {}
+    defaults: Dict[str, Any] = {}
+    cardinality: Dict[str, str] = {}
+    option_descriptions: Dict[str, Dict[str, str]] = {}
+
+    for field in fields_cfg:
+        field_id = field.get("id")
+        if not field_id:
+            continue
+
+        field_type = field.get("type", "enum")
+        if field_type != "enum":
+            # For v1, AgentPrompt only supports enum-based Chooser behaviour.
+            # Writer / Extractor / Scorer can be handled later.
+            continue
+
+        options = field.get("options", []) or []
+        allowed_ids: List[str] = []
+        descs: Dict[str, str] = {}
+
+        for opt in options:
+            opt_id = opt.get("id")
+            if not opt_id:
+                continue
+            allowed_ids.append(opt_id)
+            if "description" in opt:
+                descs[opt_id] = opt["description"]
+
+        if allowed_ids:
+            enums[field_id] = allowed_ids
+            if descs:
+                option_descriptions[field_id] = descs
+
+        defaults[field_id] = field.get("default")
+        cardinality[field_id] = field.get("cardinality", "one")
+
+    return enums, defaults, cardinality, option_descriptions
+```
+
+### ~\ragstream\orchestration\agent_prompt_helpers\field_normalizer.py
+```python
+# -*- coding: utf-8 -*-
+"""
+field_normalizer
+================
+
+Why this helper exists:
+- Every Chooser agent must clean and validate what the LLM returns.
+- This logic (enforcing enums, cardinality and defaults) is generic and should
+  not sit inside the main AgentPrompt file.
+
+What it does:
+- Provides `normalize_one()` for single-choice enum fields.
+- Provides `normalize_many()` for multi-choice enum fields.
+- Both functions take the allowed options and default value and always return
+  a safe, normalized result.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from ragstream.utils.logging import SimpleLogger
+
+
+def normalize_one(
+    field_id: str,
+    raw_value: Any,
+    allowed: List[str],
+    default_value: Any,
+) -> Optional[str]:
+    """
+    Normalize a single-choice enum field to one allowed id.
+
+    Rules:
+    - If raw_value is a string in allowed → use it.
+    - If raw_value is a list → pick the first element that is in allowed.
+    - Else → fall back to default_value if valid; otherwise first allowed or None.
+    """
+    chosen: Optional[str] = None
+
+    if isinstance(raw_value, str) and raw_value in allowed:
+        chosen = raw_value
+    elif isinstance(raw_value, list):
+        for item in raw_value:
+            if isinstance(item, str) and item in allowed:
+                chosen = item
+                break
+
+    if chosen is None:
+        if isinstance(default_value, str) and default_value in allowed:
+            chosen = default_value
+        elif allowed:
+            chosen = allowed[0]
+
+    if chosen is None:
+        SimpleLogger.error(f"field_normalizer.normalize_one: no valid value for field '{field_id}'")
+
+    return chosen
+
+
+def normalize_many(
+    field_id: str,
+    raw_value: Any,
+    allowed: List[str],
+    default_value: Any,
+) -> List[str]:
+    """
+    Normalize a multi-choice enum field to a list of allowed ids.
+
+    Rules:
+    - If raw_value is a list → keep only items that are allowed and strings.
+    - If raw_value is a single string → convert to [value] if allowed.
+    - If after filtering we have nothing → use default_value if list/str and valid.
+    - If still nothing and allowed is non-empty → use [allowed[0]] as last resort.
+    """
+    selected: List[str] = []
+
+    if isinstance(raw_value, list):
+        for item in raw_value:
+            if isinstance(item, str) and item in allowed and item not in selected:
+                selected.append(item)
+    elif isinstance(raw_value, str) and raw_value in allowed:
+        selected.append(raw_value)
+
+    if not selected:
+        if isinstance(default_value, list):
+            for item in default_value:
+                if isinstance(item, str) and item in allowed and item not in selected:
+                    selected.append(item)
+        elif isinstance(default_value, str) and default_value in allowed:
+            selected.append(default_value)
+
+    if not selected and allowed:
+        selected.append(allowed[0])
+
+    if not selected:
+        SimpleLogger.error(
+            f"field_normalizer.normalize_many: no valid values for field '{field_id}'"
+        )
+
+    return selected
+```
+
+### ~\ragstream\orchestration\agent_prompt_helpers\json_parser.py
+```python
+# -*- coding: utf-8 -*-
+"""
+json_parser
+===========
+
+Why this helper exists:
+- LLMs often return messy strings: JSON plus explanations or extra text.
+- AgentPrompt should not be cluttered with low-level parsing details.
+
+What it does:
+- Provides a single function `extract_json_object(raw_output)` that tries
+  to extract and load a JSON object.
+- On failure it returns {} instead of raising, so caller can fall back to defaults.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict
+
+from ragstream.utils.logging import SimpleLogger
+
+
+def extract_json_object(raw_output: Any) -> Dict[str, Any]:
+    """
+    Best-effort extraction of a JSON object from the raw LLM output.
+
+    Strategy:
+    - If already a dict: return as-is.
+    - If a string: try json.loads directly.
+    - If that fails: try to locate the first '{' and last '}' and parse that slice.
+    - On failure: return {} (caller will fall back to defaults).
+    """
+    if isinstance(raw_output, dict):
+        return raw_output
+
+    if not isinstance(raw_output, str):
+        SimpleLogger.error("json_parser.extract_json_object: raw_output is neither dict nor str")
+        return {}
+
+    text = raw_output.strip()
+
+    # First attempt: direct JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Second attempt: find JSON substring
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except Exception:
+            SimpleLogger.error(
+                "json_parser.extract_json_object: failed to parse JSON substring; returning {}"
+            )
+
+    return {}
+```
+
+### ~\ragstream\orchestration\agent_prompt_helpers\schema_map.py
+```python
+# -*- coding: utf-8 -*-
+"""
+schema_map
+==========
+
+Why this helper exists:
+- The agent JSON has an 'output_schema' which maps internal field ids
+  to JSON keys used in the LLM response.
+- Building this field_id → result_key mapping is a small, generic task.
+
+What it does:
+- Provides `build_result_key_map(output_schema)` which returns:
+    result_keys[field_id] = result_key
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict
+
+
+def build_result_key_map(output_schema: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Build field_id -> result_key map from the 'output_schema' section
+    of the JSON config.
+    """
+    result: Dict[str, str] = {}
+    fields = output_schema.get("fields", []) or []
+    for field in fields:
+        field_id = field.get("field_id")
+        if not field_id:
+            continue
+        result_key = field.get("result_key", field_id)
+        result[field_id] = result_key
+    return result
 ```
 
 
@@ -2072,29 +2993,65 @@ class ConversationMemory:
 
 ### ~\ragstream\utils\logging.py
 ```python
+# -*- coding: utf-8 -*-
 """
-SimpleLogger
-============
-Ultra-light façade for the standard logging module.
-Use for ephemeral console messages only (no persistent logs by requirement).
+SimpleLogger — tiny logging facade for RAGstream.
+
+Goal:
+- Avoid crashes when code calls SimpleLogger.info/debug/warning/error.
+- Keep it trivial: one class with classmethods, printing to stdout.
+- Later you can swap this to Python's 'logging' without touching callers.
 """
-import logging
+
+from __future__ import annotations
+import sys
+import datetime
+from typing import ClassVar
+
 
 class SimpleLogger:
-    _logger = logging.getLogger("ragstream")
-    if not _logger.handlers:
-        _logger.setLevel(logging.INFO)
-        _h = logging.StreamHandler()
-        _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s : %(message)s"))
-        _logger.addHandler(_h)
+    """
+    Very small logging helper.
+
+    Usage:
+        SimpleLogger.info("message")
+        SimpleLogger.debug("details")
+    """
+
+    _enabled: ClassVar[bool] = True
+    _prefix: ClassVar[str] = "RAGstream"
 
     @classmethod
-    def log(cls, msg: str) -> None:
-        cls._logger.info(msg)
+    def _log(cls, level: str, msg: str) -> None:
+        if not cls._enabled:
+            return
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"{cls._prefix} | {level.upper():5s} | {now} | {msg}"
+        print(line, file=sys.stdout, flush=True)
+
+    @classmethod
+    def debug(cls, msg: str) -> None:
+        cls._log("DEBUG", msg)
+
+    @classmethod
+    def info(cls, msg: str) -> None:
+        cls._log("INFO", msg)
+
+    @classmethod
+    def warning(cls, msg: str) -> None:
+        cls._log("WARN", msg)
 
     @classmethod
     def error(cls, msg: str) -> None:
-        cls._logger.error(msg)
+        cls._log("ERROR", msg)
+
+    @classmethod
+    def set_enabled(cls, enabled: bool) -> None:
+        cls._enabled = enabled
+
+    @classmethod
+    def set_prefix(cls, prefix: str) -> None:
+        cls._prefix = prefix
 ```
 
 ### ~\ragstream\utils\paths.py

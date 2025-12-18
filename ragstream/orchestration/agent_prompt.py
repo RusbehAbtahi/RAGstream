@@ -60,6 +60,7 @@ class AgentPrompt:
         defaults: Dict[str, Any],
         cardinality: Dict[str, str],
         option_descriptions: Dict[str, Dict[str, str]],
+        option_labels: Dict[str, Dict[str, str]],
         model_name: str,
         temperature: float,
         max_output_tokens: int,
@@ -76,6 +77,7 @@ class AgentPrompt:
         self.defaults: Dict[str, Any] = defaults
         self.cardinality: Dict[str, str] = cardinality
         self.option_descriptions: Dict[str, Dict[str, str]] = option_descriptions
+        self.option_labels: Dict[str, Dict[str, str]] = option_labels
 
         # Model configuration
         self.model_name: str = model_name
@@ -121,7 +123,7 @@ class AgentPrompt:
         temperature = float(llm_cfg.get("temperature", 0.0))
         max_tokens = int(llm_cfg.get("max_tokens", 256))
 
-        enums, defaults, cardinality, opt_desc = extract_field_config(fields_cfg)
+        enums, defaults, cardinality, opt_desc, opt_labels = extract_field_config(fields_cfg)
 
         return cls(
             agent_name=agent_name,
@@ -134,6 +136,7 @@ class AgentPrompt:
             defaults=defaults,
             cardinality=cardinality,
             option_descriptions=opt_desc,
+            option_labels=opt_labels,
             model_name=model_name,
             temperature=temperature,
             max_output_tokens=max_tokens,
@@ -195,6 +198,7 @@ class AgentPrompt:
             enums=self.enums,
             cardinality=self.cardinality,
             option_descriptions=self.option_descriptions,
+            option_labels=self.option_labels,
             result_keys=self._result_keys,
             active_fields=sorted(active_set),
         )
