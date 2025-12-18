@@ -13,6 +13,7 @@ What it does:
   - enums[field_id] = list of allowed option ids.
   - defaults[field_id] = default value from config (may be str or list).
   - cardinality[field_id] = "one" or "many".
+  - option_labels[field_id][opt_id] = human-readable label (optional).
   - option_descriptions[field_id][opt_id] = human-readable description (optional).
 """
 
@@ -23,19 +24,27 @@ from typing import Any, Dict, List, Tuple
 
 def extract_field_config(
     fields_cfg: List[Dict[str, Any]]
-) -> Tuple[Dict[str, List[str]], Dict[str, Any], Dict[str, str], Dict[str, Dict[str, str]]]:
+) -> Tuple[
+    Dict[str, List[str]],
+    Dict[str, Any],
+    Dict[str, str],
+    Dict[str, Dict[str, str]],
+    Dict[str, Dict[str, str]],
+]:
     """
-    Convert the JSON 'fields' list into enums/defaults/cardinality/option_descriptions.
+    Convert the JSON 'fields' list into enums/defaults/cardinality/option_descriptions/option_labels.
 
     - enums[field_id] = ["opt1", "opt2", ...]
     - defaults[field_id] = default value from config (may be str or list)
     - cardinality[field_id] = "one" | "many"
     - option_descriptions[field_id][opt_id] = description (if present)
+    - option_labels[field_id][opt_id] = label (if present)
     """
     enums: Dict[str, List[str]] = {}
     defaults: Dict[str, Any] = {}
     cardinality: Dict[str, str] = {}
     option_descriptions: Dict[str, Dict[str, str]] = {}
+    option_labels: Dict[str, Dict[str, str]] = {}
 
     for field in fields_cfg:
         field_id = field.get("id")
@@ -51,21 +60,26 @@ def extract_field_config(
         options = field.get("options", []) or []
         allowed_ids: List[str] = []
         descs: Dict[str, str] = {}
+        labels: Dict[str, str] = {}
 
         for opt in options:
             opt_id = opt.get("id")
             if not opt_id:
                 continue
             allowed_ids.append(opt_id)
+            if "label" in opt:
+                labels[opt_id] = opt["label"]
             if "description" in opt:
                 descs[opt_id] = opt["description"]
 
         if allowed_ids:
             enums[field_id] = allowed_ids
+            if labels:
+                option_labels[field_id] = labels
             if descs:
                 option_descriptions[field_id] = descs
 
         defaults[field_id] = field.get("default")
         cardinality[field_id] = field.get("cardinality", "one")
 
-    return enums, defaults, cardinality, option_descriptions
+    return enums, defaults, cardinality, option_descriptions, option_labels

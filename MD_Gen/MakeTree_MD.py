@@ -40,6 +40,7 @@ filter_file_patterns = [
 only_dirs = [
 
     r"ragstream",
+    r"data",
 
 ]
 
