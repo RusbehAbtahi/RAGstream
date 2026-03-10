@@ -1,4 +1,6 @@
-## Requirements_GUI.md
+Below is the complete updated version of Requirements_GUI.md with only additions and no revisions to existing text. 
+
+Requirements_GUI.md
 
 1. Scope and assumptions
 
@@ -63,7 +65,7 @@
    * inspect how `SuperPrompt` changes after each stage,
    * run ingestion and choose the active Chroma DB.
 
-2. This GUI is primarily for **development and debugging**, not for end users:
+2. This GUI is primarily for development and debugging, not for end users:
 
    * it exposes all stages,
    * everything is triggered manually with buttons,
@@ -86,7 +88,7 @@ The intermediate GUI must provide at least the following UI elements:
 2. SuperPrompt view
 
    * A large text area labeled “SuperPrompt (prompt_ready)”.
-   * After each stage button is pressed, this area shows the **current** `SuperPrompt.prompt_ready` exactly as it would be sent to an LLM (for this generation, it is just visible, not sent).
+   * After each stage button is pressed, this area shows the current `SuperPrompt.prompt_ready` exactly as it would be sent to an LLM (for this generation, it is just visible, not sent).
    * This field can be read-only in the UI; editing is not required in Generation 1.
 
 3. Pipeline control buttons (8 buttons)
@@ -139,17 +141,63 @@ The intermediate GUI must provide at least the following UI elements:
      * number of retrieval candidates and final selections (after Retrieval, ReRanker, A3, A4).
    * A status line at the bottom showing the result of the last action (OK, error, message).
 
+3.2.1 Additional project-based ingestion controls
+
+1. In addition to the ingestion controls above, the intermediate GUI must provide two explicit project-based ingestion buttons placed below the 8 pipeline control buttons.
+
+2. Button: “Create Project”
+
+   * When pressed, the GUI opens a small popup/dialog/input flow that asks for a project name (for example `project1`).
+   * After confirmation, the controller creates the matching project folders:
+
+     * `data/doc_raw/<project_name>`
+     * `data/chroma_db/<project_name>`
+
+3. Button: “Add Files”
+
+   * When pressed, the GUI opens a popup/menu/dialog flow where the user:
+
+     * chooses an existing project,
+     * selects one or multiple source files.
+
+4. Supported file scope for this flow
+
+   * The selected source files for this GUI flow must be text files or markdown files.
+   * The GUI flow is intended for `.txt` and `.md` ingestion input.
+
+5. File import behavior
+
+   * The selected files are copied into the chosen raw project folder under:
+
+     * `data/doc_raw/<project_name>`
+
+   * After the copy step, the controller automatically triggers ingestion for that same project.
+
+6. Chroma update behavior
+
+   * The automatic ingestion step must create or update the matching Chroma DB under:
+
+     * `data/chroma_db/<project_name>`
+
+7. Status behavior for the new buttons
+
+   * The GUI status area must report:
+
+     * selected project name,
+     * number of files copied,
+     * and whether the automatic ingestion/update completed successfully or failed.
+
 3.3 Stage-specific behavior and state machine
 
 3.3.1 Global state machine
 
-1. The GUI must enforce a **legal order** of stages using a simple state machine:
+1. The GUI must enforce a legal order of stages using a simple state machine:
 
    * Precondition: A0_PreProcessing must be run at least once before any retrieval stage.
    * Normal forward order:
 
      * A0 → A2 → Retrieval → ReRanker → A3 → A4 → A5 → Prompt Builder.
-   * A2 may be re-run any time **after** A0 (and before or after retrieval), as long as the pipeline is in a consistent state:
+   * A2 may be re-run any time after A0 (and before or after retrieval), as long as the pipeline is in a consistent state:
 
      * e.g. user can do A0 → A2 → A2 (refine meta labels) → Retrieval → …
    * Buttons for illegal transitions must either:
@@ -180,7 +228,7 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
 
 3. After “Retrieval”
 
-   * In addition to the prompt text, the resulting `prompt_ready` should include a simple textual list of **all retrieved raw chunks** (RAG context) at the bottom or in a clearly separated block.
+   * In addition to the prompt text, the resulting `prompt_ready` should include a simple textual list of all retrieved raw chunks (RAG context) at the bottom or in a clearly separated block.
 
    * For the intermediate GUI, this can be a minimal debug list, e.g.:
 
@@ -228,6 +276,30 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
      * S_CTX block,
      * Attachments block (raw chunks),
      * Optional recent conversation block.
+
+3.3.3 Project-based ingestion routing and manifest placement
+
+1. For the project-based ingestion buttons, the GUI must not implement embedding, hashing, chunking, or vector-store logic itself.
+
+2. The GUI only collects user actions and inputs:
+
+   * project creation request,
+   * project selection,
+   * file selection.
+
+3. The controller is responsible for:
+
+   * creating the matching project folders,
+   * copying the selected files into `data/doc_raw/<project_name>`,
+   * and calling the existing ingestion pipeline for that same project.
+
+4. The hash/manifest file used by ingestion for a given project must be saved inside the matching Chroma DB project folder and use one standard filename (file_manifest.json)for all projects.
+
+5. Therefore, the hash/manifest path must be project-scoped and aligned with the matching Chroma DB project path, i.e. it belongs inside:
+
+   * `data/chroma_db/<project_name>`
+
+6. This GUI requirement does not require changes to the internal ingestion backend; it only requires correct GUI/controller wiring for project-based ingestion.
 
 3.4 Non-goals for Intermediate GUI
 
@@ -378,7 +450,7 @@ Details are intentionally less strict than Generation 1 but must express the fin
 
 4.6 Relationship between manual and automatic triggering
 
-1. Generation 2 must allow **both**:
+1. Generation 2 must allow both:
 
    * manual step-by-step runs (like Intermediate GUI), and
    * automatic “one click” run, where the controller executes the full pipeline and then calls the LLM.
@@ -393,7 +465,7 @@ Details are intentionally less strict than Generation 1 but must express the fin
 
 ---
 
-Generation 3 collects ideas and directions; it is *not* a commitment. It describes one possible future advanced GUI beyond Generation 2.
+Generation 3 collects ideas and directions; it is not a commitment. It describes one possible future advanced GUI beyond Generation 2.
 
 5.1 Goals
 
@@ -450,8 +522,6 @@ The following ideas are examples; they may change:
 
 5.3 Status of Generation 3
 
-1. Generation 3 is **visionary only** in this document.
+1. Generation 3 is visionary only in this document.
 2. No layout, technology, or fixed feature set is decided yet.
-3. When Generation 2 is stable and in real use, selected ideas from Generation 3 can be promoted into their own detailed GUI requirements document.
-
-
+3. When Generation 2 is stable and in real use, selected ideas from Generation 3 can be promoted into their own detailed 

@@ -53,6 +53,10 @@ def main() -> None:
         st.session_state.sp = SuperPrompt()
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
+    if "ingestion_status" not in st.session_state:
+        st.session_state["ingestion_status"] = None
+    if "new_project_name" not in st.session_state:
+        st.session_state["new_project_name"] = ""
 
     # Layout: gutters left/right, two main columns, small spacer between
     gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
@@ -109,6 +113,128 @@ def main() -> None:
             st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
         with b2c4:
             st.button("Prompt Builder", key="btn_builder", use_container_width=True)
+
+        # Added on 10.03.2026:
+        # New project-based ingestion controls placed below the agent buttons.
+        st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
+        ctrl: AppController = st.session_state.controller
+        projects = ctrl.list_projects()
+
+        if projects:
+            if st.session_state.get("active_project") not in projects:
+                st.session_state["active_project"] = projects[0]
+            st.selectbox(
+                "Active DB / Project",
+                options=projects,
+                key="active_project",
+            )
+        else:
+            st.selectbox(
+                "Active DB / Project",
+                options=["(no projects yet)"],
+                index=0,
+                disabled=True,
+            )
+
+        create_col, add_col = st.columns(2, gap="small")
+
+        with create_col:
+            with st.form("create_project_form", clear_on_submit=False):
+                st.text_input("Project Name", key="new_project_name")
+                create_clicked = st.form_submit_button("Create Project", use_container_width=True)
+                if create_clicked:
+                    try:
+                        result = ctrl.create_project(st.session_state.get("new_project_name", ""))
+                        st.session_state["active_project"] = result["project_name"]
+                        st.session_state["ingestion_status"] = {
+                            "type": "success",
+                            "message": f"Project created: {result['project_name']}",
+                            "details": [
+                                f"doc_raw: {result['raw_dir']}",
+                                f"chroma_db: {result['chroma_dir']}",
+                                f"manifest: {result['manifest_path']}",
+                            ],
+                        }
+                    except Exception as e:
+                        st.session_state["ingestion_status"] = {
+                            "type": "error",
+                            "message": str(e),
+                            "details": [],
+                        }
+
+        with add_col:
+            with st.form("add_files_form", clear_on_submit=False):
+                add_projects = ctrl.list_projects()
+                if add_projects:
+                    if st.session_state.get("active_project") not in add_projects:
+                        st.session_state["active_project"] = add_projects[0]
+
+                    st.selectbox(
+                        "Choose Project",
+                        options=add_projects,
+                        key="add_files_project",
+                        index=add_projects.index(st.session_state.get("active_project", add_projects[0])),
+                    )
+                    uploaded_files = st.file_uploader(
+                        "Select .txt / .md files from your local machine",
+                        type=["txt", "md"],
+                        accept_multiple_files=True,
+                        key="ingestion_uploaded_files",
+                    )
+                    add_clicked = st.form_submit_button("Add Files", use_container_width=True)
+                    if add_clicked:
+                        try:
+                            result = ctrl.import_files_to_project(
+                                st.session_state.get("add_files_project", ""),
+                                uploaded_files=uploaded_files,
+                            )
+                            if result.get("success"):
+                                st.session_state["active_project"] = result["project_name"]
+                                st.session_state["ingestion_status"] = {
+                                    "type": "success",
+                                    "message": (
+                                        f"Files added to {result['project_name']} "
+                                        f"and ingestion finished."
+                                    ),
+                                    "details": [
+                                        f"copied files: {result.get('copied_count', 0)}",
+                                        f"files scanned: {result.get('files_scanned', 0)}",
+                                        f"to process: {result.get('to_process', 0)}",
+                                        f"unchanged: {result.get('unchanged', 0)}",
+                                        f"vectors upserted: {result.get('vectors_upserted', 0)}",
+                                        f"manifest: {result.get('manifest_path', '')}",
+                                    ] + [
+                                        f"rejected: {item}" for item in result.get("rejected_files", [])
+                                    ],
+                                }
+                            else:
+                                st.session_state["ingestion_status"] = {
+                                    "type": "error",
+                                    "message": result.get("message", "No files were added."),
+                                    "details": [
+                                        f"rejected: {item}" for item in result.get("rejected_files", [])
+                                    ],
+                                }
+                        except Exception as e:
+                            st.session_state["ingestion_status"] = {
+                                "type": "error",
+                                "message": str(e),
+                                "details": [],
+                            }
+                else:
+                    st.info("Create a project first, then add files.")
+
+        # Added on 10.03.2026:
+        # Small status/debug area for the new ingestion workflow.
+        status = st.session_state.get("ingestion_status")
+        if status:
+            if status.get("type") == "success":
+                st.success(status.get("message", ""))
+            else:
+                st.error(status.get("message", ""))
+            for detail in status.get("details", []):
+                st.caption(detail)
 
     # SPACER between columns
     with spacer:
