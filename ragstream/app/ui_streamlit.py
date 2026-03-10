@@ -57,6 +57,11 @@ def main() -> None:
         st.session_state["ingestion_status"] = None
     if "new_project_name" not in st.session_state:
         st.session_state["new_project_name"] = ""
+    if "pending_active_project" not in st.session_state:
+        # Added on 10.03.2026:
+        # Temporary project switch key. We use this instead of modifying
+        # the widget-owned key "active_project" after that widget exists.
+        st.session_state["pending_active_project"] = None
 
     # Layout: gutters left/right, two main columns, small spacer between
     gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
@@ -121,6 +126,15 @@ def main() -> None:
         ctrl: AppController = st.session_state.controller
         projects = ctrl.list_projects()
 
+        # Added on 10.03.2026:
+        # Apply requested project switch before the "active_project" widget
+        # is created in this run. This avoids the Streamlit session-state error.
+        pending_project = st.session_state.get("pending_active_project")
+        if pending_project is not None:
+            if projects and pending_project in projects:
+                st.session_state["active_project"] = pending_project
+            st.session_state["pending_active_project"] = None
+
         if projects:
             if st.session_state.get("active_project") not in projects:
                 st.session_state["active_project"] = projects[0]
@@ -137,6 +151,29 @@ def main() -> None:
                 disabled=True,
             )
 
+        # Added on 10.03.2026:
+        # Show the files that are actually ingested/embedded for the currently
+        # active project by reading the standardized manifest through the controller.
+        active_project = st.session_state.get("active_project")
+        if projects and active_project in projects:
+            embedded_info = ctrl.get_embedded_files(active_project)
+
+            st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="field-title" style="font-size:1.05rem;">Embedded Files</div>', unsafe_allow_html=True)
+
+            if embedded_info.get("success"):
+                embedded_files = embedded_info.get("files", [])
+                embedded_text = "\n".join(embedded_files) if embedded_files else "(no embedded files yet)"
+                st.text_area(
+                    label="Embedded Files (hidden)",
+                    value=embedded_text,
+                    height=120,
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+            else:
+                st.error(embedded_info.get("message", "Could not read embedded file list."))
+
         create_col, add_col = st.columns(2, gap="small")
 
         with create_col:
@@ -146,7 +183,6 @@ def main() -> None:
                 if create_clicked:
                     try:
                         result = ctrl.create_project(st.session_state.get("new_project_name", ""))
-                        st.session_state["active_project"] = result["project_name"]
                         st.session_state["ingestion_status"] = {
                             "type": "success",
                             "message": f"Project created: {result['project_name']}",
@@ -156,6 +192,12 @@ def main() -> None:
                                 f"manifest: {result['manifest_path']}",
                             ],
                         }
+                        # Added on 10.03.2026:
+                        # Do not write directly to "active_project" here, because
+                        # that widget already exists in this run. Switch via a
+                        # temporary key and rerun safely.
+                        st.session_state["pending_active_project"] = result["project_name"]
+                        st.rerun()
                     except Exception as e:
                         st.session_state["ingestion_status"] = {
                             "type": "error",
@@ -167,14 +209,20 @@ def main() -> None:
             with st.form("add_files_form", clear_on_submit=False):
                 add_projects = ctrl.list_projects()
                 if add_projects:
-                    if st.session_state.get("active_project") not in add_projects:
-                        st.session_state["active_project"] = add_projects[0]
+                    # Added on 10.03.2026:
+                    # Do not modify "active_project" here. Just derive a safe
+                    # default selection for the form-local project chooser.
+                    current_active_project = st.session_state.get("active_project")
+                    if current_active_project in add_projects:
+                        default_add_project = current_active_project
+                    else:
+                        default_add_project = add_projects[0]
 
                     st.selectbox(
                         "Choose Project",
                         options=add_projects,
                         key="add_files_project",
-                        index=add_projects.index(st.session_state.get("active_project", add_projects[0])),
+                        index=add_projects.index(default_add_project),
                     )
                     uploaded_files = st.file_uploader(
                         "Select .txt / .md files from your local machine",
@@ -190,7 +238,6 @@ def main() -> None:
                                 uploaded_files=uploaded_files,
                             )
                             if result.get("success"):
-                                st.session_state["active_project"] = result["project_name"]
                                 st.session_state["ingestion_status"] = {
                                     "type": "success",
                                     "message": (
@@ -208,6 +255,11 @@ def main() -> None:
                                         f"rejected: {item}" for item in result.get("rejected_files", [])
                                     ],
                                 }
+                                # Added on 10.03.2026:
+                                # Same safe pattern as above: switch the active
+                                # project through a temporary key, then rerun.
+                                st.session_state["pending_active_project"] = result["project_name"]
+                                st.rerun()
                             else:
                                 st.session_state["ingestion_status"] = {
                                     "type": "error",

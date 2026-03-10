@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
+
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -181,6 +183,68 @@ class AppController:
             }
         )
         return ingest_result
+
+    # Added on 10.03.2026:
+    # Read the standardized project manifest and return the file names that were
+    # actually ingested/embedded for the selected project.
+    def get_embedded_files(self, project_name: str) -> dict[str, Any]:
+        project_name = self._normalize_project_name(project_name)
+        manifest_path = self.chroma_root / project_name / "file_manifest.json"
+
+        if not manifest_path.exists():
+            return {
+                "success": True,
+                "project_name": project_name,
+                "manifest_path": str(manifest_path),
+                "files": [],
+            }
+
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+
+            records: list[dict[str, Any]] = []
+
+            if isinstance(manifest_data, dict):
+                manifest_records = manifest_data.get("files")
+
+                if isinstance(manifest_records, list):
+                    records = [r for r in manifest_records if isinstance(r, dict)]
+                elif isinstance(manifest_records, dict):
+                    records = [r for r in manifest_records.values() if isinstance(r, dict)]
+                else:
+                    # Added on 10.03.2026:
+                    # Fallback in case the manifest itself is already a mapping
+                    # from file path to metadata record.
+                    if all(isinstance(v, dict) for v in manifest_data.values()):
+                        records = [r for r in manifest_data.values() if isinstance(r, dict)]
+
+            elif isinstance(manifest_data, list):
+                records = [r for r in manifest_data if isinstance(r, dict)]
+
+            file_names: list[str] = []
+            for record in records:
+                record_path = str(record.get("path", "")).strip()
+                if record_path:
+                    file_names.append(Path(record_path).name)
+
+            unique_sorted_files = sorted(set(file_names), key=str.lower)
+
+            return {
+                "success": True,
+                "project_name": project_name,
+                "manifest_path": str(manifest_path),
+                "files": unique_sorted_files,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "project_name": project_name,
+                "manifest_path": str(manifest_path),
+                "files": [],
+                "message": str(e),
+            }
 
     # Added on 10.03.2026:
     # Small validation/helper methods for project-scoped folder + manifest routing.
