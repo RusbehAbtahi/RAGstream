@@ -15,3 +15,7 @@ data/A2_SLM_Training/
 doc/
 tests/
 MD_Gen/
+
+# raw files and chroma data base 
+data/doc_raw/
+data/chroma_db/
