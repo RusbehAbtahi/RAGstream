@@ -97,7 +97,7 @@ def preprocess(user_text: str, sp: Any, schema: PromptSchema) -> None:
     # ---------------- Step 3: deterministic mapping via NameMatcher ----------------
     nm = NameMatcher(schema)
 
-    breakpoint()
+   # breakpoint()
     # Build a map canonical -> text (last-wins via overwrite)
     mapped: Dict[str, str] = {}
     unknown_headers: List[str] = []

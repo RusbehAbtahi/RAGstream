@@ -23,6 +23,10 @@ from ragstream.ingestion.embedder import Embedder
 from ragstream.ingestion.ingestion_manager import IngestionManager
 from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
 
+# Added on 15.03.2026:
+# Deterministic Retrieval stage.
+from ragstream.retrieval.retriever import Retriever
+
 
 class AppController:
     def __init__(self, schema_path: str = "ragstream/config/prompt_schema.json") -> None:
@@ -33,6 +37,7 @@ class AppController:
           you used in your original working version.
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
+        - Creates the Retrieval stage object.
         """
         # PreProcessing schema (OLD, working behaviour)
         self.schema = PromptSchema(schema_path)
@@ -59,6 +64,14 @@ class AppController:
         self.doc_root.mkdir(parents=True, exist_ok=True)
         self.chroma_root.mkdir(parents=True, exist_ok=True)
 
+        # Added on 15.03.2026:
+        # Retrieval is initialized once and re-used. It reads the active project
+        # Chroma DB and reconstructs real chunk text from doc_raw.
+        self.retriever = Retriever(
+            doc_root=str(self.doc_root),
+            chroma_root=str(self.chroma_root),
+        )
+
     def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
         """
         Keep EXACTLY the old behaviour:
@@ -76,6 +89,36 @@ class AppController:
         Run A2 on the current SuperPrompt.
         """
         return self.a2_promptshaper.run(sp)
+
+    # Added on 15.03.2026:
+    # Retrieval is a separate deterministic stage and must remain independent
+    # from ReRanker / A3. The controller only passes the current SuperPrompt,
+    # the active GUI project, and the GUI top-k value.
+    def run_retrieval(self, sp: SuperPrompt, project_name: str, top_k: int) -> SuperPrompt:
+        """
+        Run Retrieval on the current SuperPrompt for the selected active project.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt.
+            project_name:
+                Active project selected in the GUI.
+            top_k:
+                Number of chunks to keep after retrieval ranking.
+
+        Returns:
+            Updated SuperPrompt after Retrieval has populated:
+            - base_context_chunks
+            - views_by_stage["retrieval"]
+            - final_selection_ids
+            - stage / history_of_stages
+        """
+        project_name = self._normalize_project_name(project_name)
+        return self.retriever.run(
+            sp=sp,
+            project_name=project_name,
+            top_k=int(top_k),
+        )
 
     # Added on 10.03.2026:
     # Project-based ingestion helpers for the new Streamlit buttons.

@@ -8,6 +8,7 @@ from __future__ import annotations
 import streamlit as st
 from ragstream.app.controller import AppController
 from ragstream.orchestration.super_prompt import SuperPrompt
+import copy
 
 def main() -> None:
     st.set_page_config(page_title="RAGstream", layout="wide")
@@ -51,6 +52,12 @@ def main() -> None:
         st.session_state.controller = AppController()
     if "sp" not in st.session_state:
         st.session_state.sp = SuperPrompt()
+    if "sp_pre" not in st.session_state:
+        st.session_state.sp_pre = SuperPrompt()
+    if "sp_a2" not in st.session_state:
+        st.session_state.sp_a2 = SuperPrompt()
+    if "sp_rtv" not in st.session_state:
+        st.session_state.sp_rtv = SuperPrompt()
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
     if "ingestion_status" not in st.session_state:
@@ -62,6 +69,8 @@ def main() -> None:
         # Temporary project switch key. We use this instead of modifying
         # the widget-owned key "active_project" after that widget exists.
         st.session_state["pending_active_project"] = None
+    if "retrieval_top_k" not in st.session_state:
+        st.session_state["retrieval_top_k"] = 100
 
     # Layout: gutters left/right, two main columns, small spacer between
     gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
@@ -92,6 +101,7 @@ def main() -> None:
                 user_text = st.session_state.get("prompt_text", "")
                 sp = ctrl.preprocess(user_text, sp)
                 st.session_state.sp = sp
+                st.session_state.sp_pre = copy.deepcopy(sp)
                 st.session_state["super_prompt_text"] = sp.prompt_ready
 
         with b1c2:
@@ -101,10 +111,37 @@ def main() -> None:
                 sp: SuperPrompt = st.session_state.sp
                 sp = ctrl.run_a2_promptshaper(sp)
                 st.session_state.sp = sp
+                st.session_state.sp_a2 = copy.deepcopy(sp)
                 st.session_state["super_prompt_text"] = sp.prompt_ready
 
         with b1c3:
-            st.button("Retrieval", key="btn_retrieval", use_container_width=True)
+            clicked_retrieval = st.button("Retrieval", key="btn_retrieval", use_container_width=True)
+            if clicked_retrieval:
+                #try:
+                    ctrl: AppController = st.session_state.controller
+                    sp: SuperPrompt = st.session_state.sp
+
+                    project_name = st.session_state.get("active_project")
+                    if not project_name:
+                        available_projects = ctrl.list_projects()
+                        if available_projects:
+                            project_name = available_projects[0]
+                            st.session_state["active_project"] = project_name
+
+                    if not project_name or project_name == "(no projects yet)":
+                        st.error("No active project is available for Retrieval.")
+                    else:
+                        top_k = int(st.session_state.get("retrieval_top_k", 100))
+                        sp = ctrl.run_retrieval(sp, project_name, top_k)
+                        sp.compose_prompt_ready()
+
+                        st.session_state.sp = sp
+                        st.session_state.sp_rtv = copy.deepcopy(sp)
+                        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+                #except Exception as e:
+                   # st.error(str(e))
+
         with b1c4:
             st.button("ReRanker", key="btn_reranker", use_container_width=True)
 
@@ -118,6 +155,14 @@ def main() -> None:
             st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
         with b2c4:
             st.button("Prompt Builder", key="btn_builder", use_container_width=True)
+
+        st.number_input(
+            "Retrieval Top-K (number of chunks)",
+            min_value=1,
+            max_value=1000,
+            step=1,
+            key="retrieval_top_k",
+        )
 
         # Added on 10.03.2026:
         # New project-based ingestion controls placed below the agent buttons.
