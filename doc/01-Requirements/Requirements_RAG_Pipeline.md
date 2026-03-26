@@ -64,23 +64,29 @@ Button sequence (manual mode), which is also the execution order in auto mode:
 All stages use the same `SuperPrompt` invariants:
 
 1. `base_context_chunks` is the **authoritative set** of retrieved `Chunk` objects for the session (merged from conversation history + long-term memory, de-duplicated by `id`). No stage creates a second corpus; later stages only manipulate views on these chunks.
-2. `views_by_stage[stage]` is an **ordered list of `chunk_id`s** written by each stage that deals with retrieval results (Retrieval, ReRanker, A3, A4). This captures ranking/filter choices without duplicating text.
+2. `views_by_stage[stage]` is an **ordered list of per-chunk stage snapshots** written by each stage that deals with retrieval results. In the current implementation the snapshot item is `(chunk_id, stage_score, stage_status)`. This keeps ranking/filter information next to the `chunk_id` without mutating the `Chunk` itself.
 3. `final_selection_ids` always contains the current chosen `chunk_id`s for building `S_CTX_MD` and `Attachments_MD`. After A4 it reflects the token-budgeted subset that feeds the final LLM.
-4. `Chunk` objects are **immutable** after creation. Any scores, keep/drop flags, etc. live only in stage-local maps and views.
-5. `System_MD`, `Prompt_MD`, `S_CTX_MD`, `Attachments_MD` are **rendered at send time**, derived from `body`, `recentConversation`, and the id lists. They may be empty until Prompt_Builder runs.
+4. `Chunk` objects are **immutable** after creation. Scores and keep/drop status live in `views_by_stage` (and optionally in other stage-local metadata), not inside `Chunk`.
+5. `System_MD`, `Prompt_MD`, `S_CTX_MD`, `Attachments_MD` remain the final rendered blocks for send-time use. `prompt_ready` may also be regenerated earlier for GUI preview purposes, either by stage-local helpers (A0/A2 current implementation) or by `SuperPrompt.compose_prompt_ready()` in later stages.
 
 ---
 
 ## 4. Fixed numeric defaults (N-constants)
 
-The pipeline uses named constants instead of magic numbers. All are configurable (JSON/YAML), but these are the **default values**:
+The pipeline uses named limits instead of uncontrolled magic numbers. The current retrieval implementation uses these practical defaults:
 
-* `N0_QUERY_PIECES = 5`
+* `QUERY_CHUNK_SIZE = 500`
 
-  * Number of query sub-spans extracted from the user prompt for embedding-based retrieval.
+  * Query decomposition window size for Retrieval. The same chunking idea as ingestion is reused.
+* `QUERY_OVERLAP = 100`
+
+  * Overlap between retrieval query pieces.
+* `DEFAULT_TOP_K = 100`
+
+  * Default GUI/runtime value for the number of retrieval candidates to keep.
 * `N1_RETR_MAX_CANDIDATES = 200`
 
-  * Max number of high-scoring chunks kept after initial vector retrieval (per session).
+  * Conceptual upper cap for retrieval experiments and future config alignment.
 * `N2_RERANK_TOP_K = 50`
 
   * Number of candidates from `views_by_stage["retrieval"]` passed into the cross-encoder reranker. (Matches the earlier “~50 candidates per query” decision.)
@@ -93,9 +99,9 @@ The pipeline uses named constants instead of magic numbers. All are configurable
 
 Requirements:
 
-1. The constants above must live in a **single config** (e.g. `config/pipeline_limits.json`) and never be hard-coded.
-2. Stages must treat these as **soft caps**: they can internally cut below the limit but never exceed it.
-3. Changing these constants must not require code changes; only config + tests.
+1. Retrieval limits must stay explicit and centralized; future cleanup may move all of them into a single config.
+2. Stages treat these as **soft caps**: they can internally cut below the limit but never exceed the active runtime cap.
+3. Query decomposition for Retrieval currently follows deterministic chunking (`chunk_size`, `overlap`) instead of the older `N0_QUERY_PIECES` wording.
 
 ---
 
@@ -125,11 +131,12 @@ Outputs / mutations
 
    * Apply TASK/CONTEXT special rule and fill defaults for other MUST keys.
 3. Write into `sp.body` only for known keys; unknowns go to `sp.extras["unknown_attributes"]`.
-4. Build `sp.prompt_ready` with `_compose_prompt_ready(...)` and update stage:
+4. Build `sp.prompt_ready` with the current preprocessing compose helper and update stage:
 
    * `sp.stage = "preprocessed"`
    * `sp.history_of_stages.append("preprocessed")`
 5. No changes to retrieval fields: `base_context_chunks`, `views_by_stage`, `final_selection_ids` remain untouched.
+6. Migration note: the long-term target is to route this preview rendering through `SuperPrompt.compose_prompt_ready()`, but A0 currently still uses its stage-local helper.
 
 Optional LLM fallback
 
@@ -174,6 +181,7 @@ Behaviour
    * `sp.stage = "a2"`
    * `sp.history_of_stages.append("a2")`
 4. A2 **pass-2** (optional runtime refinement) uses the same model and agent config, but includes the earlier A2 output as part of the input payload. The requirement here is only to keep it **compatible**; details of pass-2 policies can be added later.
+5. Current GUI snapshot rendering may still be produced by the existing A2 compose helper. Migration to `SuperPrompt.compose_prompt_ready()` is allowed later without changing the stage contract.
 
 No retrieval fields are touched here.
 
@@ -181,7 +189,7 @@ No retrieval fields are touched here.
 
 Purpose
 
-* Build the first ranked candidate list of chunks from both conversation history and long-term documents.
+* Build the first ranked candidate list of chunks from the active project document store.
 
 Nature
 
@@ -191,30 +199,29 @@ Nature
 Inputs
 
 * `sp: SuperPrompt` with `stage="a2"`.
-* Embedding index(es) for:
-
-  * recent conversation chunks,
-  * long-term Markdown/file chunks.
+* Active project Chroma store (`data/chroma_db/<project>`), with raw source files in `data/doc_raw/<project>`.
 * Config:
 
-  * `N0_QUERY_PIECES`, `N1_RETR_MAX_CANDIDATES`, embedding model name, τ for LogAvgExp.
+  * runtime `top_k`, query `chunk_size`, query `overlap`, embedding model name, τ for LogAvgExp.
 
 Behaviour
 
 1. Query decomposition:
 
    * Build a **normalized query string** from `sp.body["task"]`, `sp.body["context"]`, `sp.body["purpose"]`.
-   * Split into `N0_QUERY_PIECES` pieces (e.g. 5) following the agreed chunking rules.
-2. For each piece, perform vector search over the combined index; for each candidate chunk compute cosine scores.
-3. Aggregate per-chunk scores across pieces with **LogAvgExp (τ = 9)** and length normalization.
-4. Merge results from conversation and long-term memory, de-duplicate by `chunk_id`, and keep the top `N1_RETR_MAX_CANDIDATES`.
-5. Populate `sp.base_context_chunks` with the **unique `Chunk` objects** for these ids (creating them if needed).
-6. Write:
+   * Split that query string with deterministic chunking (`chunk_size = 500`, `overlap = 100`).
+2. Embed all query pieces and compare them against all stored vectors from the active project Chroma collection.
+3. Aggregate per-chunk scores across pieces with **LogAvgExp (τ = 9)**.
+4. Sort descending by retrieval score and keep the active runtime top-k.
+5. Reconstruct the real chunk text from `data/doc_raw/<project>` using the stored metadata (`path`, `chunk_idx`) and the same chunker. If a stale DB row points to a missing raw file, skip that row instead of failing the stage.
+6. Populate `sp.base_context_chunks` with the hydrated `Chunk` objects.
+7. Write:
 
-   * `sp.views_by_stage["retrieval"] = [chunk_id_1, chunk_id_2, ...]` (in score order).
+   * `sp.views_by_stage["retrieval"] = [(chunk_id, retrieval_score, SELECTED), ...]` in score order.
+   * `sp.final_selection_ids = [chunk_id_1, chunk_id_2, ...]` in the same order for the current GUI / intermediate stage view.
    * `sp.stage = "retrieval"` and append to history.
 
-The retrieval step does **not** set `final_selection_ids` yet; that is the job of A3/A4.
+The retrieval step remains independent from ReRanker and A3.
 
 ### 5.4 ReRanker
 
@@ -230,18 +237,19 @@ Nature
 Inputs
 
 * `sp: SuperPrompt` with `stage="retrieval"`.
-* Candidate ids: `sp.views_by_stage["retrieval"][:N2_RERANK_TOP_K]`.
+* Candidate stage snapshots: `sp.views_by_stage["retrieval"][:N2_RERANK_TOP_K]`.
 * Model: `cross-encoder/ms-marco-MiniLM-L-6-v2`.
 
 Behaviour
 
 1. Render a **single query string** `Prompt_MD` from `sp.body` (task/purpose/context/format) for reranking; do **not** include `System_MD` or attachments.
-2. For each candidate id (up to `N2_RERANK_TOP_K`), look up its `Chunk` text (`snippet`) and run the cross-encoder on `(Prompt_MD, snippet)`.
+2. For each candidate snapshot (up to `N2_RERANK_TOP_K`), read its `chunk_id`, look up the corresponding `Chunk` text (`snippet`), and run the cross-encoder on `(Prompt_MD, snippet)`.
 3. Sort by cross-encoder score descending and write:
 
-   * `sp.views_by_stage["reranked"] = [chunk_id_1, chunk_id_2, ...]` in the new order.
+   * `sp.views_by_stage["reranked"] = [(chunk_id, rerank_score, SELECTED), ...]` in the new order.
 4. Update:
 
+   * `sp.final_selection_ids` to the reranked ids for the current intermediate view.
    * `sp.stage = "reranked"`; append history.
 
 Still no mutations to `final_selection_ids`.
@@ -260,7 +268,7 @@ Nature
 Inputs
 
 * `sp: SuperPrompt` with `stage="reranked"`.
-* Candidate ids: `sp.views_by_stage["reranked"]`.
+* Candidate stage snapshots: `sp.views_by_stage["reranked"]`.
 * A3 agent config JSON (via AgentFactory), including:
 
   * max candidates to consider,
@@ -280,8 +288,8 @@ Behaviour
 3. Call LLM via llm_client; parse the JSON response; keep only candidates with `decision == "keep"`.
 4. Write:
 
-   * `sp.views_by_stage["a3"] = [kept_id_1, kept_id_2, ...]`.
-   * `sp.final_selection_ids = sp.views_by_stage["a3"][:]` (initial final selection).
+   * `sp.views_by_stage["a3"] = [(chunk_id, a3_score, a3_status), ...]`, where selected items use `a3_score = 1.0`, rejected items use `0.0`, and `a3_status` captures `SELECTED / DISCARDED / DUPLICATED`.
+   * `sp.final_selection_ids` becomes the ordered list of kept ids (initial final selection).
 5. Update stage:
 
    * `sp.stage = "a3"`; append history.
@@ -325,7 +333,7 @@ Behaviour
 
    * `sp.S_CTX_MD = <condensed markdown>`.
    * `sp.final_selection_ids = [subset_of_ids]`.
-   * `sp.views_by_stage["a4"] = sp.final_selection_ids[:]`.
+   * `sp.views_by_stage["a4"] = [(chunk_id, 1.0, SELECTED), ...]` for the final retained subset.
 5. Update:
 
    * `sp.stage = "a4"`; append history.
@@ -403,7 +411,8 @@ Behaviour
    3. `S_CTX_MD`
    4. `Attachments_MD`
    5. (optional) `Recent Conversation` block
-7. `sp.stage` stays `"a5"`; Prompt_Builder **does not** change the lifecycle stage, it only prepares the final view/send-time representation.
+7. Current implementation note: `SuperPrompt.compose_prompt_ready()` may also be used earlier for intermediate GUI previews. Prompt_Builder remains the authoritative final assembly step for send-time use.
+8. `sp.stage` stays `"a5"`; Prompt_Builder **does not** change the lifecycle stage, it only prepares the final view/send-time representation.
 
 ---
 
@@ -415,7 +424,7 @@ Behaviour
 
      * passes the current `SuperPrompt` to the corresponding stage function/agent,
      * receives the mutated `SuperPrompt`,
-     * updates the GUI `Super-Prompt` box (`sp.prompt_ready`) after stages that change it (A0, A2, A4, A5, Prompt_Builder).
+     * updates the GUI `Super-Prompt` box (`sp.prompt_ready`) after stages that change it (A0, A2, Retrieval, and later stages that render a preview).
 2. Auto mode:
 
    * Controller runs all stages in sequence:

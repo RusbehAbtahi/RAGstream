@@ -75,7 +75,8 @@
 │   │   ├── chunk.py
 │   │   ├── doc_score.py
 │   │   ├── reranker.py
-│   │   └── retriever.py
+│   │   ├── retriever.py
+│   │   └── retriever_old.py
 │   └── utils
 │       ├── __init__.py
 │       ├── __pycache__
@@ -92,10 +93,13 @@
     │       ├── 001.json
     │       └── 002.json
     ├── chroma_db
-    │   └── project1
-    │       ├── 2d71b43d-3226-411e-8ff2-2cede3dcb9a0
+    │   ├── project1
+    │   └── project2
+    │       ├── 526ca8ff-c00e-4657-b10c-94f6a376684e
+    │       └── file_manifest.json
     ├── doc_raw
+    │   └── project2
+    ├── np_store
     │   └── project1
-    └── np_store
-        └── project1
+    └── project1
 ```

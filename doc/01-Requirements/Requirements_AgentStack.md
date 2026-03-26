@@ -38,7 +38,7 @@ The A2 data flow using the Agent Stack:
 
 1. Controller
 
-   * Calls `A2.run(superprompt, version="v1")`.
+   * Calls `A2.run(superprompt, agent_id="a2_promptshaper", version="002")`.
    * Does not know anything about agent configs, AgentFactory, AgentPrompt, or llm_client.
 
 2. A2 (agent code)
@@ -63,8 +63,8 @@ The A2 data flow using the Agent Stack:
 
      ```python
      agent_prompt = AgentFactory.create(
-         agent_name="A2",
-         version="v1",
+         agent_id="a2_promptshaper",
+         version="002",
          input_payload=input_payload,
      )
      ```
@@ -126,17 +126,18 @@ The A2 data flow using the Agent Stack:
 
 3.2. File layout (within RAGstream project)
 
-* Agent config files SHOULD live under a dedicated folder, for example:
+* Agent config files currently live under the runtime/project data folder:
 
-  * `config/agents/{agent_name}/{version}.json`
+  * `data/agents/{agent_id}/{version}.json`
 
   Examples:
 
-  * `config/agents/A2/v1.json`
-  * `config/agents/PreProcessing/v1.json`
-  * `config/agents/A3/v1.json`
+  * `data/agents/a2_promptshaper/002.json`
+  * `data/agents/a3_nligate/001.json`
+  * `data/agents/a4_condenser/001.json`
 
-* The exact path construction is the responsibility of AgentFactory; agents (A2, etc.) must not hard-code file paths.
+* The exact path construction is the responsibility of AgentFactory; calling agents (A2, etc.) must not hard-code file paths.
+* The current AgentFactory derives this base path from the repository root and treats it as the single source of truth for runtime agent configs.
 
 3.3. AgentConfig JSON schema (conceptual)
 
@@ -144,8 +145,8 @@ Each agent config JSON MUST follow this conceptual structure:
 
 ```json
 {
-  "agent_name": "A2",
-  "version": "v1",
+  "agent_id": "a2_promptshaper",
+  "version": "002",
 
   "mode": "Chooser",         // Chooser | Writer | Extractor
 
@@ -264,7 +265,7 @@ Behavior:
 
 1. Resolve the config path:
 
-   * Deduce `config/agents/{agent_name}/{version}.json` (or similar convention).
+   * Deduce `data/agents/{agent_id}/{version}.json` according to the runtime path convention.
    * If the file does not exist, raise a clear error (e.g. `UnknownAgentConfigError`).
 
 2. Load and parse JSON:

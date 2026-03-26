@@ -188,16 +188,17 @@ Behavior:
   * any retrieval config (max_candidates, scoring parameters).
 * Retrieval returns:
 
-  * base_context_chunks: list of Chunk objects.
-  * initial_view_ids: list of chunk IDs for stage "retrieval".
+  * base_context_chunks: list of hydrated `Chunk` objects.
+  * retrieval_view: ordered stage snapshots for stage `"retrieval"`, currently `(chunk_id, retrieval_score, stage_status)`.
+  * final_selection_ids initialized to the same retrieval order for the current intermediate GUI view.
 * Controller updates sp:
 
-  * base_context_chunks set or extended.
-  * views_by_stage["retrieval"] = initial_view_ids.
-  * final_selection_ids initialized to initial_view_ids (before A3 and A4 adjust them).
+  * base_context_chunks set from Retrieval output.
+  * views_by_stage["retrieval"] = retrieval_view.
+  * final_selection_ids initialized to the retrieval ids (before ReRanker / A3 / A4 adjust them).
   * stage set to "retrieval".
   * history_of_stages appended with "retrieval".
-  * prompt_ready updated to include a simple view of raw chunks if required by GUI (for intermediate version this can be a simple appended section in the SuperPrompt text area).
+  * prompt_ready may be regenerated via `sp.compose_prompt_ready()` so the GUI shows a simple Related Context preview.
 
 5.4 ReRanker
 
@@ -211,17 +212,17 @@ Behavior:
 * Call reranker module with:
 
   * Prompt_MD (normalized ask) from SuperPrompt.
-  * Chunk texts corresponding to views_by_stage["retrieval"].
+  * Chunk texts corresponding to `views_by_stage["retrieval"]`.
 * Reranker returns:
 
-  * reranked_ids: list of chunk IDs in new order. 
+  * `reranked_view`: ordered stage snapshots in the new order.
 * Controller updates sp:
 
-  * views_by_stage["reranked"] = reranked_ids.
-  * final_selection_ids updated to reranked_ids (subject to later filtering by A3 and token budgeting by A4).
+  * `views_by_stage["reranked"] = reranked_view`.
+  * `final_selection_ids` updated to the reranked ids (subject to later filtering by A3 and token budgeting by A4).
   * stage set to "reranked".
   * history_of_stages appended with "reranked".
-  * prompt_ready updated to include a simple view of reranked raw chunks in the GUI snapshot.
+  * `prompt_ready` may be regenerated for the GUI snapshot.
 
 5.5 A3 NLI Gate
 

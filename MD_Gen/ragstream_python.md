@@ -44,6 +44,12 @@ class A4_Condenser:
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
+
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Iterable
+
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.preprocessing.prompt_schema import PromptSchema
 from ragstream.preprocessing.preprocessing import preprocess
@@ -51,6 +57,18 @@ from ragstream.preprocessing.preprocessing import preprocess
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
 from ragstream.agents.a2_promptshaper import A2PromptShaper
+
+# Added on 10.03.2026:
+# Project-based document ingestion is wired here only at controller level.
+# The existing ingestion backend remains unchanged.
+from ragstream.ingestion.chunker import Chunker
+from ragstream.ingestion.embedder import Embedder
+from ragstream.ingestion.ingestion_manager import IngestionManager
+from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
+
+# Added on 15.03.2026:
+# Deterministic Retrieval stage.
+from ragstream.retrieval.retriever import Retriever
 
 
 class AppController:
@@ -62,6 +80,7 @@ class AppController:
           you used in your original working version.
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
+        - Creates the Retrieval stage object.
         """
         # PreProcessing schema (OLD, working behaviour)
         self.schema = PromptSchema(schema_path)
@@ -76,6 +95,24 @@ class AppController:
         self.a2_promptshaper = A2PromptShaper(
             agent_factory=self.agent_factory,
             llm_client=self.llm_client,
+        )
+
+        # Added on 10.03.2026:
+        # Keep project/document roots centralized in the controller so the GUI
+        # stays thin and the ingestion backend continues to receive explicit paths.
+        self.project_root = Path(__file__).resolve().parents[2]
+        self.data_root = self.project_root / "data"
+        self.doc_root = self.data_root / "doc_raw"
+        self.chroma_root = self.data_root / "chroma_db"
+        self.doc_root.mkdir(parents=True, exist_ok=True)
+        self.chroma_root.mkdir(parents=True, exist_ok=True)
+
+        # Added on 15.03.2026:
+        # Retrieval is initialized once and re-used. It reads the active project
+        # Chroma DB and reconstructs real chunk text from doc_raw.
+        self.retriever = Retriever(
+            doc_root=str(self.doc_root),
+            chroma_root=str(self.chroma_root),
         )
 
     def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
@@ -95,6 +132,218 @@ class AppController:
         Run A2 on the current SuperPrompt.
         """
         return self.a2_promptshaper.run(sp)
+
+    # Added on 15.03.2026:
+    # Retrieval is a separate deterministic stage and must remain independent
+    # from ReRanker / A3. The controller only passes the current SuperPrompt,
+    # the active GUI project, and the GUI top-k value.
+    def run_retrieval(self, sp: SuperPrompt, project_name: str, top_k: int) -> SuperPrompt:
+        """
+        Run Retrieval on the current SuperPrompt for the selected active project.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt.
+            project_name:
+                Active project selected in the GUI.
+            top_k:
+                Number of chunks to keep after retrieval ranking.
+
+        Returns:
+            Updated SuperPrompt after Retrieval has populated:
+            - base_context_chunks
+            - views_by_stage["retrieval"]
+            - final_selection_ids
+            - stage / history_of_stages
+        """
+        project_name = self._normalize_project_name(project_name)
+        return self.retriever.run(
+            sp=sp,
+            project_name=project_name,
+            top_k=int(top_k),
+        )
+
+    # Added on 10.03.2026:
+    # Project-based ingestion helpers for the new Streamlit buttons.
+    def list_projects(self) -> list[str]:
+        doc_projects = {p.name for p in self.doc_root.iterdir() if p.is_dir()}
+        chroma_projects = {p.name for p in self.chroma_root.iterdir() if p.is_dir()}
+        return sorted(doc_projects | chroma_projects)
+
+    def create_project(self, project_name: str) -> dict[str, Any]:
+        project_name = self._normalize_project_name(project_name)
+        raw_dir = self.doc_root / project_name
+        chroma_dir = self.chroma_root / project_name
+
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        chroma_dir.mkdir(parents=True, exist_ok=True)
+
+        return {
+            "success": True,
+            "project_name": project_name,
+            "raw_dir": str(raw_dir),
+            "chroma_dir": str(chroma_dir),
+            "manifest_path": str(chroma_dir / "file_manifest.json"),
+        }
+
+    def ingest_project(self, project_name: str) -> dict[str, Any]:
+        project_name = self._normalize_project_name(project_name)
+        paths = self.create_project(project_name)
+
+        # Added on 10.03.2026:
+        # The manifest file is standardized per requirement and stored inside
+        # the matching Chroma DB project folder.
+        manifest_path = Path(paths["manifest_path"])
+
+        manager = IngestionManager(doc_root=str(self.doc_root))
+        store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
+        chunker = Chunker()
+        embedder = Embedder(model="text-embedding-3-large")
+
+        stats = manager.run(
+            subfolder=project_name,
+            store=store,
+            chunker=chunker,
+            embedder=embedder,
+            manifest_path=str(manifest_path),
+        )
+
+        result = asdict(stats)
+        result.update(
+            {
+                "success": True,
+                "project_name": project_name,
+                "raw_dir": str(self.doc_root / project_name),
+                "chroma_dir": str(self.chroma_root / project_name),
+                "manifest_path": str(manifest_path),
+            }
+        )
+        return result
+
+    def import_files_to_project(
+        self,
+        project_name: str,
+        *,
+        uploaded_files: Iterable[Any] | None = None,
+    ) -> dict[str, Any]:
+        project_name = self._normalize_project_name(project_name)
+        self.create_project(project_name)
+
+        target_dir = self.doc_root / project_name
+        allowed_suffixes = {".txt", ".md"}
+
+        copied_files: list[str] = []
+        rejected_files: list[str] = []
+
+        # Added on 10.03.2026:
+        # Support browser uploads from Streamlit without changing ingestion internals.
+        for uploaded in uploaded_files or []:
+            filename = Path(getattr(uploaded, "name", "")).name
+            if not filename:
+                continue
+            if Path(filename).suffix.lower() not in allowed_suffixes:
+                rejected_files.append(f"{filename}  [only .txt/.md allowed]")
+                continue
+
+            dst = target_dir / filename
+            with dst.open("wb") as f:
+                f.write(uploaded.getbuffer())
+            copied_files.append(dst.name)
+
+        if not copied_files:
+            return {
+                "success": False,
+                "project_name": project_name,
+                "copied_files": [],
+                "copied_count": 0,
+                "rejected_files": rejected_files,
+                "message": "No valid .txt or .md files were added.",
+            }
+
+        ingest_result = self.ingest_project(project_name)
+        ingest_result.update(
+            {
+                "copied_files": copied_files,
+                "copied_count": len(copied_files),
+                "rejected_files": rejected_files,
+            }
+        )
+        return ingest_result
+
+    # Added on 10.03.2026:
+    # Read the standardized project manifest and return the file names that were
+    # actually ingested/embedded for the selected project.
+    def get_embedded_files(self, project_name: str) -> dict[str, Any]:
+        project_name = self._normalize_project_name(project_name)
+        manifest_path = self.chroma_root / project_name / "file_manifest.json"
+
+        if not manifest_path.exists():
+            return {
+                "success": True,
+                "project_name": project_name,
+                "manifest_path": str(manifest_path),
+                "files": [],
+            }
+
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+
+            records: list[dict[str, Any]] = []
+
+            if isinstance(manifest_data, dict):
+                manifest_records = manifest_data.get("files")
+
+                if isinstance(manifest_records, list):
+                    records = [r for r in manifest_records if isinstance(r, dict)]
+                elif isinstance(manifest_records, dict):
+                    records = [r for r in manifest_records.values() if isinstance(r, dict)]
+                else:
+                    # Added on 10.03.2026:
+                    # Fallback in case the manifest itself is already a mapping
+                    # from file path to metadata record.
+                    if all(isinstance(v, dict) for v in manifest_data.values()):
+                        records = [r for r in manifest_data.values() if isinstance(r, dict)]
+
+            elif isinstance(manifest_data, list):
+                records = [r for r in manifest_data if isinstance(r, dict)]
+
+            file_names: list[str] = []
+            for record in records:
+                record_path = str(record.get("path", "")).strip()
+                if record_path:
+                    file_names.append(Path(record_path).name)
+
+            unique_sorted_files = sorted(set(file_names), key=str.lower)
+
+            return {
+                "success": True,
+                "project_name": project_name,
+                "manifest_path": str(manifest_path),
+                "files": unique_sorted_files,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "project_name": project_name,
+                "manifest_path": str(manifest_path),
+                "files": [],
+                "message": str(e),
+            }
+
+    # Added on 10.03.2026:
+    # Small validation/helper methods for project-scoped folder + manifest routing.
+    @staticmethod
+    def _normalize_project_name(project_name: str) -> str:
+        name = (project_name or "").strip()
+        if not name:
+            raise ValueError("Project name must not be empty.")
+        if "/" in name or "\\" in name:
+            raise ValueError("Project name must not contain path separators.")
+        if name in {".", ".."} or ".." in name:
+            raise ValueError("Project name must not contain relative path markers.")
+        return name
 ```
 
 ### ~\ragstream\app\controller_legacy.py
@@ -168,6 +417,7 @@ from __future__ import annotations
 import streamlit as st
 from ragstream.app.controller import AppController
 from ragstream.orchestration.super_prompt import SuperPrompt
+import copy
 
 def main() -> None:
     st.set_page_config(page_title="RAGstream", layout="wide")
@@ -211,8 +461,25 @@ def main() -> None:
         st.session_state.controller = AppController()
     if "sp" not in st.session_state:
         st.session_state.sp = SuperPrompt()
+    if "sp_pre" not in st.session_state:
+        st.session_state.sp_pre = SuperPrompt()
+    if "sp_a2" not in st.session_state:
+        st.session_state.sp_a2 = SuperPrompt()
+    if "sp_rtv" not in st.session_state:
+        st.session_state.sp_rtv = SuperPrompt()
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
+    if "ingestion_status" not in st.session_state:
+        st.session_state["ingestion_status"] = None
+    if "new_project_name" not in st.session_state:
+        st.session_state["new_project_name"] = ""
+    if "pending_active_project" not in st.session_state:
+        # Added on 10.03.2026:
+        # Temporary project switch key. We use this instead of modifying
+        # the widget-owned key "active_project" after that widget exists.
+        st.session_state["pending_active_project"] = None
+    if "retrieval_top_k" not in st.session_state:
+        st.session_state["retrieval_top_k"] = 100
 
     # Layout: gutters left/right, two main columns, small spacer between
     gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
@@ -243,6 +510,7 @@ def main() -> None:
                 user_text = st.session_state.get("prompt_text", "")
                 sp = ctrl.preprocess(user_text, sp)
                 st.session_state.sp = sp
+                st.session_state.sp_pre = copy.deepcopy(sp)
                 st.session_state["super_prompt_text"] = sp.prompt_ready
 
         with b1c2:
@@ -252,10 +520,37 @@ def main() -> None:
                 sp: SuperPrompt = st.session_state.sp
                 sp = ctrl.run_a2_promptshaper(sp)
                 st.session_state.sp = sp
+                st.session_state.sp_a2 = copy.deepcopy(sp)
                 st.session_state["super_prompt_text"] = sp.prompt_ready
 
         with b1c3:
-            st.button("Retrieval", key="btn_retrieval", use_container_width=True)
+            clicked_retrieval = st.button("Retrieval", key="btn_retrieval", use_container_width=True)
+            if clicked_retrieval:
+                #try:
+                    ctrl: AppController = st.session_state.controller
+                    sp: SuperPrompt = st.session_state.sp
+
+                    project_name = st.session_state.get("active_project")
+                    if not project_name:
+                        available_projects = ctrl.list_projects()
+                        if available_projects:
+                            project_name = available_projects[0]
+                            st.session_state["active_project"] = project_name
+
+                    if not project_name or project_name == "(no projects yet)":
+                        st.error("No active project is available for Retrieval.")
+                    else:
+                        top_k = int(st.session_state.get("retrieval_top_k", 100))
+                        sp = ctrl.run_retrieval(sp, project_name, top_k)
+                        sp.compose_prompt_ready()
+
+                        st.session_state.sp = sp
+                        st.session_state.sp_rtv = copy.deepcopy(sp)
+                        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+                #except Exception as e:
+                   # st.error(str(e))
+
         with b1c4:
             st.button("ReRanker", key="btn_reranker", use_container_width=True)
 
@@ -269,6 +564,183 @@ def main() -> None:
             st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
         with b2c4:
             st.button("Prompt Builder", key="btn_builder", use_container_width=True)
+
+        st.number_input(
+            "Retrieval Top-K (number of chunks)",
+            min_value=1,
+            max_value=1000,
+            step=1,
+            key="retrieval_top_k",
+        )
+
+        # Added on 10.03.2026:
+        # New project-based ingestion controls placed below the agent buttons.
+        st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
+        ctrl: AppController = st.session_state.controller
+        projects = ctrl.list_projects()
+
+        # Added on 10.03.2026:
+        # Apply requested project switch before the "active_project" widget
+        # is created in this run. This avoids the Streamlit session-state error.
+        pending_project = st.session_state.get("pending_active_project")
+        if pending_project is not None:
+            if projects and pending_project in projects:
+                st.session_state["active_project"] = pending_project
+            st.session_state["pending_active_project"] = None
+
+        if projects:
+            if st.session_state.get("active_project") not in projects:
+                st.session_state["active_project"] = projects[0]
+            st.selectbox(
+                "Active DB / Project",
+                options=projects,
+                key="active_project",
+            )
+        else:
+            st.selectbox(
+                "Active DB / Project",
+                options=["(no projects yet)"],
+                index=0,
+                disabled=True,
+            )
+
+        # Added on 10.03.2026:
+        # Show the files that are actually ingested/embedded for the currently
+        # active project by reading the standardized manifest through the controller.
+        active_project = st.session_state.get("active_project")
+        if projects and active_project in projects:
+            embedded_info = ctrl.get_embedded_files(active_project)
+
+            st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="field-title" style="font-size:1.05rem;">Embedded Files</div>', unsafe_allow_html=True)
+
+            if embedded_info.get("success"):
+                embedded_files = embedded_info.get("files", [])
+                embedded_text = "\n".join(embedded_files) if embedded_files else "(no embedded files yet)"
+                st.text_area(
+                    label="Embedded Files (hidden)",
+                    value=embedded_text,
+                    height=120,
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+            else:
+                st.error(embedded_info.get("message", "Could not read embedded file list."))
+
+        create_col, add_col = st.columns(2, gap="small")
+
+        with create_col:
+            with st.form("create_project_form", clear_on_submit=False):
+                st.text_input("Project Name", key="new_project_name")
+                create_clicked = st.form_submit_button("Create Project", use_container_width=True)
+                if create_clicked:
+                    try:
+                        result = ctrl.create_project(st.session_state.get("new_project_name", ""))
+                        st.session_state["ingestion_status"] = {
+                            "type": "success",
+                            "message": f"Project created: {result['project_name']}",
+                            "details": [
+                                f"doc_raw: {result['raw_dir']}",
+                                f"chroma_db: {result['chroma_dir']}",
+                                f"manifest: {result['manifest_path']}",
+                            ],
+                        }
+                        # Added on 10.03.2026:
+                        # Do not write directly to "active_project" here, because
+                        # that widget already exists in this run. Switch via a
+                        # temporary key and rerun safely.
+                        st.session_state["pending_active_project"] = result["project_name"]
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state["ingestion_status"] = {
+                            "type": "error",
+                            "message": str(e),
+                            "details": [],
+                        }
+
+        with add_col:
+            with st.form("add_files_form", clear_on_submit=False):
+                add_projects = ctrl.list_projects()
+                if add_projects:
+                    # Added on 10.03.2026:
+                    # Do not modify "active_project" here. Just derive a safe
+                    # default selection for the form-local project chooser.
+                    current_active_project = st.session_state.get("active_project")
+                    if current_active_project in add_projects:
+                        default_add_project = current_active_project
+                    else:
+                        default_add_project = add_projects[0]
+
+                    st.selectbox(
+                        "Choose Project",
+                        options=add_projects,
+                        key="add_files_project",
+                        index=add_projects.index(default_add_project),
+                    )
+                    uploaded_files = st.file_uploader(
+                        "Select .txt / .md files from your local machine",
+                        type=["txt", "md"],
+                        accept_multiple_files=True,
+                        key="ingestion_uploaded_files",
+                    )
+                    add_clicked = st.form_submit_button("Add Files", use_container_width=True)
+                    if add_clicked:
+                        try:
+                            result = ctrl.import_files_to_project(
+                                st.session_state.get("add_files_project", ""),
+                                uploaded_files=uploaded_files,
+                            )
+                            if result.get("success"):
+                                st.session_state["ingestion_status"] = {
+                                    "type": "success",
+                                    "message": (
+                                        f"Files added to {result['project_name']} "
+                                        f"and ingestion finished."
+                                    ),
+                                    "details": [
+                                        f"copied files: {result.get('copied_count', 0)}",
+                                        f"files scanned: {result.get('files_scanned', 0)}",
+                                        f"to process: {result.get('to_process', 0)}",
+                                        f"unchanged: {result.get('unchanged', 0)}",
+                                        f"vectors upserted: {result.get('vectors_upserted', 0)}",
+                                        f"manifest: {result.get('manifest_path', '')}",
+                                    ] + [
+                                        f"rejected: {item}" for item in result.get("rejected_files", [])
+                                    ],
+                                }
+                                # Added on 10.03.2026:
+                                # Same safe pattern as above: switch the active
+                                # project through a temporary key, then rerun.
+                                st.session_state["pending_active_project"] = result["project_name"]
+                                st.rerun()
+                            else:
+                                st.session_state["ingestion_status"] = {
+                                    "type": "error",
+                                    "message": result.get("message", "No files were added."),
+                                    "details": [
+                                        f"rejected: {item}" for item in result.get("rejected_files", [])
+                                    ],
+                                }
+                        except Exception as e:
+                            st.session_state["ingestion_status"] = {
+                                "type": "error",
+                                "message": str(e),
+                                "details": [],
+                            }
+                else:
+                    st.info("Create a project first, then add files.")
+
+        # Added on 10.03.2026:
+        # Small status/debug area for the new ingestion workflow.
+        status = st.session_state.get("ingestion_status")
+        if status:
+            if status.get("type") == "success":
+                st.success(status.get("message", ""))
+            else:
+                st.error(status.get("message", ""))
+            for detail in status.get("details", []):
+                st.caption(detail)
 
     # SPACER between columns
     with spacer:
@@ -1870,6 +2342,7 @@ class AgentPrompt:
         defaults: Dict[str, Any],
         cardinality: Dict[str, str],
         option_descriptions: Dict[str, Dict[str, str]],
+        option_labels: Dict[str, Dict[str, str]],
         model_name: str,
         temperature: float,
         max_output_tokens: int,
@@ -1886,6 +2359,7 @@ class AgentPrompt:
         self.defaults: Dict[str, Any] = defaults
         self.cardinality: Dict[str, str] = cardinality
         self.option_descriptions: Dict[str, Dict[str, str]] = option_descriptions
+        self.option_labels: Dict[str, Dict[str, str]] = option_labels
 
         # Model configuration
         self.model_name: str = model_name
@@ -1931,7 +2405,7 @@ class AgentPrompt:
         temperature = float(llm_cfg.get("temperature", 0.0))
         max_tokens = int(llm_cfg.get("max_tokens", 256))
 
-        enums, defaults, cardinality, opt_desc = extract_field_config(fields_cfg)
+        enums, defaults, cardinality, opt_desc, opt_labels = extract_field_config(fields_cfg)
 
         return cls(
             agent_name=agent_name,
@@ -1944,6 +2418,7 @@ class AgentPrompt:
             defaults=defaults,
             cardinality=cardinality,
             option_descriptions=opt_desc,
+            option_labels=opt_labels,
             model_name=model_name,
             temperature=temperature,
             max_output_tokens=max_tokens,
@@ -2005,6 +2480,7 @@ class AgentPrompt:
             enums=self.enums,
             cardinality=self.cardinality,
             option_descriptions=self.option_descriptions,
+            option_labels=self.option_labels,
             result_keys=self._result_keys,
             active_fields=sorted(active_set),
         )
@@ -2226,9 +2702,17 @@ Notes (agreed pipeline choices; for reference only):
 
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Literal
+from enum import Enum
 
 # Lifecycle stages for this SuperPrompt (fixed vocabulary)
 Stage = Literal["raw", "preprocessed", "a2", "retrieval", "reranked", "a3", "a4", "a5"]
+
+
+class A3ChunkStatus(str, Enum):
+    SELECTED = "selected"
+    DISCARDED = "discarded"
+    DUPLICATED = "duplicated"
+
 
 class SuperPrompt:
     __slots__ = (
@@ -2243,7 +2727,7 @@ class SuperPrompt:
 
         # retrieval artifacts
         "base_context_chunks",   # list[Chunk]: authoritative set of retrieved Chunk objects (combined from history + long-term memory)
-        "views_by_stage",        # dict[str, list[str]]: for each stage, the ordered list of chunk_ids (ranking/filter snapshot)
+        "views_by_stage",        # dict[str, list[tuple[str, float, A3ChunkStatus]]]: per stage, ordered (chunk_id, stage_score, stage_status)
         "final_selection_ids",   # list[str]: current chosen chunk_ids (from latest view after filters + token budget)
 
         # recent conversation (separate block)
@@ -2285,7 +2769,27 @@ class SuperPrompt:
 
         # retrieval artifacts
         self.base_context_chunks: List["Chunk"] = []  # authoritative working set of Chunk objects (no duplicates)
-        self.views_by_stage: Dict[str, List[str]] = {}  # stage name -> ordered chunk_ids (ranking/filter snapshot)
+
+        # stage name -> ordered list of per-chunk stage snapshots:
+        # (chunk_id, stage_score, stage_status)
+        #
+        # Intended stage-local meaning:
+        # - Retrieval:
+        #     stage_score  = cosine similarity score
+        #     stage_status = A3ChunkStatus.SELECTED
+        #
+        # - ReRanker:
+        #     stage_score  = reranker score
+        #     stage_status = A3ChunkStatus.SELECTED for kept chunks,
+        #                    optionally A3ChunkStatus.DISCARDED for cut-off chunks
+        #
+        # - A3:
+        #     stage_score  = 1.0 for pass / keep, 0.0 for reject
+        #     stage_status = A3ChunkStatus.SELECTED / DISCARDED / DUPLICATED
+        #
+        # The list is always ordered according to the active stage view.
+        self.views_by_stage: Dict[str, List[tuple[str, float, A3ChunkStatus]]] = {}
+
         self.final_selection_ids: List[str] = []        # the ids chosen for render after all filters/budgets
 
         # recent conversation block (kept separate from retrieved context)
@@ -2296,7 +2800,204 @@ class SuperPrompt:
         self.Prompt_MD: str = ""       # rendered from body (task/purpose/context/format)
         self.S_CTX_MD: str = ""        # rendered summary from final_selection_ids
         self.Attachments_MD: str = ""  # rendered excerpts from final_selection_ids with provenance
-        self.prompt_ready: str = ""   # fully composed prompt ready to display/send
+        self.prompt_ready: str = ""    # fully composed prompt ready to display/send
+
+    def compose_prompt_ready(self) -> str:
+        """
+        Central render method for the current SuperPrompt.
+
+        Purpose:
+        - Build a single display/send-ready markdown text from the current object state.
+        - Work already for PreProcessing and A2, where no chunks exist yet.
+        - Also work for Retrieval and later stages, where chunk-based context may exist.
+        - Replace the stage-local external compose functions in the future, so prompt
+          rendering lives in one central place.
+
+        Current behaviour:
+        - Rebuild self.System_MD from self.body
+        - Rebuild self.Prompt_MD from self.body
+        - Keep self.S_CTX_MD and self.Attachments_MD if some later stage has already set them
+        - If no later-stage attachments exist, render a simple "Related Context" section
+          from the currently selected chunks
+        - Write the final combined markdown into self.prompt_ready
+
+        Returns:
+            The final composed markdown string.
+        """
+        self.System_MD = self._render_system_md()
+        self.Prompt_MD = self._render_prompt_md()
+
+        parts: List[str] = []
+
+        if self.System_MD:
+            parts.append(self.System_MD)
+
+        if self.Prompt_MD:
+            parts.append(self.Prompt_MD)
+
+        if self.S_CTX_MD:
+            parts.append(self.S_CTX_MD)
+
+        if self.Attachments_MD:
+            parts.append(self.Attachments_MD)
+        else:
+            related_context_md = self._render_related_context_md()
+            if related_context_md:
+                parts.append(related_context_md)
+
+        self.prompt_ready = "\n\n".join(parts).strip()
+        return self.prompt_ready
+
+    def _render_system_md(self) -> str:
+        """
+        Render the high-authority system/config part from self.body.
+
+        This method is intentionally deterministic and simple.
+        It does not depend on retrieval artifacts.
+        """
+        lines: List[str] = []
+
+        system_value = (self.body.get("system") or "").strip()
+        role_value = (self.body.get("role") or "").strip()
+        audience_value = (self.body.get("audience") or "").strip()
+        tone_value = (self.body.get("tone") or "").strip()
+        depth_value = (self.body.get("depth") or "").strip()
+
+        if system_value:
+            lines.append("## System")
+            lines.append(system_value)
+
+        config_lines: List[str] = []
+
+        if role_value:
+            config_lines.append(f"- Role: {role_value}")
+        if audience_value:
+            config_lines.append(f"- Audience: {audience_value}")
+        if tone_value:
+            config_lines.append(f"- Tone: {tone_value}")
+        if depth_value:
+            config_lines.append(f"- Depth: {depth_value}")
+
+        if config_lines:
+            if lines:
+                lines.append("")
+            lines.append("## Configuration")
+            lines.extend(config_lines)
+
+        return "\n".join(lines).strip()
+
+    def _render_prompt_md(self) -> str:
+        """
+        Render the user-facing prompt part from self.body.
+
+        This method is designed to cover:
+        - raw / preprocessed / a2 stages without any chunk context
+        - later stages as well, because the canonical prompt body remains the same
+        """
+        lines: List[str] = []
+
+        task_value = (self.body.get("task") or "").strip()
+        purpose_value = (self.body.get("purpose") or "").strip()
+        context_value = (self.body.get("context") or "").strip()
+        format_value = (self.body.get("format") or "").strip()
+        text_value = (self.body.get("text") or "").strip()
+
+        if task_value:
+            lines.append("## Task")
+            lines.append(task_value)
+            lines.append("")
+
+        if purpose_value:
+            lines.append("## Purpose")
+            lines.append(purpose_value)
+            lines.append("")
+
+        if context_value:
+            lines.append("## Context")
+            lines.append(context_value)
+            lines.append("")
+
+        if format_value:
+            lines.append("## Format")
+            lines.append(format_value)
+            lines.append("")
+
+        if text_value:
+            lines.append("## Text")
+            lines.append(text_value)
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def _render_related_context_md(self) -> str:
+        """
+        Render a simple chunk-based context preview from the current selected chunks.
+
+        Design intention:
+        - The GUI should show only the selected chunk texts.
+        - Technical metadata such as ID, source, score, status, and span remain
+          inside SuperPrompt as internal structured data and are not rendered here.
+        - If no chunks exist yet, this method returns an empty string and the caller
+          simply skips the section.
+        """
+        ordered_chunks = self._get_ordered_context_chunks()
+        if not ordered_chunks:
+            return ""
+
+        lines: List[str] = []
+        lines.append("## Related Context")
+        lines.append("")
+
+        chunk_counter = 1
+        for chunk_obj in ordered_chunks:
+            lines.append(f"### Chunk {chunk_counter}")
+            lines.append("")
+            lines.append(chunk_obj.snippet.strip())
+            lines.append("")
+            chunk_counter += 1
+
+        return "\n".join(lines).strip()
+
+    def _get_ordered_context_chunks(self) -> List["Chunk"]:
+        """
+        Return the currently relevant chunks in the intended display order.
+
+        Order policy:
+        1. If final_selection_ids exists, use that order.
+        2. Otherwise, if the current stage has a view in views_by_stage, use that order.
+        3. Otherwise, fall back to the raw order of base_context_chunks.
+
+        This keeps the render logic general enough for Retrieval, ReRanker, A3,
+        and future later stages.
+        """
+        if not self.base_context_chunks:
+            return []
+
+        chunk_by_id: Dict[str, "Chunk"] = {}
+        for chunk_obj in self.base_context_chunks:
+            chunk_by_id[chunk_obj.id] = chunk_obj
+
+        ordered_chunks: List["Chunk"] = []
+
+        if self.final_selection_ids:
+            for chunk_id in self.final_selection_ids:
+                if chunk_id in chunk_by_id:
+                    ordered_chunks.append(chunk_by_id[chunk_id])
+            return ordered_chunks
+
+        if self.stage in self.views_by_stage:
+            stage_rows = self.views_by_stage[self.stage]
+            for row in stage_rows:
+                chunk_id = row[0]
+                if chunk_id in chunk_by_id:
+                    ordered_chunks.append(chunk_by_id[chunk_id])
+            return ordered_chunks
+
+        for chunk_obj in self.base_context_chunks:
+            ordered_chunks.append(chunk_obj)
+
+        return ordered_chunks
+
     def __repr__(self) -> str:
         return f"SuperPrompt(stage={self.stage!r})"
 ```
@@ -2362,6 +3063,7 @@ def build_user_text_for_chooser(
     enums: Dict[str, List[str]],
     cardinality: Dict[str, str],
     option_descriptions: Dict[str, Dict[str, str]],
+    option_labels: Dict[str, Dict[str, str]],
     result_keys: Dict[str, str],
     active_fields: List[str],
 ) -> str:
@@ -2370,7 +3072,7 @@ def build_user_text_for_chooser(
 
     Shows:
     - Current SuperPrompt state (task, purpose, context, ...).
-    - For each active field: allowed options and expected JSON shape.
+    - For each active field: allowed option ids plus label/description for clarity, and expected JSON shape.
     """
     lines: List[str] = []
 
@@ -2405,10 +3107,16 @@ def build_user_text_for_chooser(
         else:
             lines.append("  - Type: single option id (string) from the list below.")
 
+        labels = option_labels.get(field_id, {})
         descs = option_descriptions.get(field_id, {})
         for opt_id in allowed:
+            label = labels.get(opt_id)
             desc = descs.get(opt_id)
-            if desc:
+            if label and desc:
+                lines.append(f"    * {opt_id}: {label} — {desc}")
+            elif label:
+                lines.append(f"    * {opt_id}: {label}")
+            elif desc:
                 lines.append(f"    * {opt_id}: {desc}")
             else:
                 lines.append(f"    * {opt_id}")
@@ -2448,6 +3156,7 @@ What it does:
   - enums[field_id] = list of allowed option ids.
   - defaults[field_id] = default value from config (may be str or list).
   - cardinality[field_id] = "one" or "many".
+  - option_labels[field_id][opt_id] = human-readable label (optional).
   - option_descriptions[field_id][opt_id] = human-readable description (optional).
 """
 
@@ -2458,19 +3167,27 @@ from typing import Any, Dict, List, Tuple
 
 def extract_field_config(
     fields_cfg: List[Dict[str, Any]]
-) -> Tuple[Dict[str, List[str]], Dict[str, Any], Dict[str, str], Dict[str, Dict[str, str]]]:
+) -> Tuple[
+    Dict[str, List[str]],
+    Dict[str, Any],
+    Dict[str, str],
+    Dict[str, Dict[str, str]],
+    Dict[str, Dict[str, str]],
+]:
     """
-    Convert the JSON 'fields' list into enums/defaults/cardinality/option_descriptions.
+    Convert the JSON 'fields' list into enums/defaults/cardinality/option_descriptions/option_labels.
 
     - enums[field_id] = ["opt1", "opt2", ...]
     - defaults[field_id] = default value from config (may be str or list)
     - cardinality[field_id] = "one" | "many"
     - option_descriptions[field_id][opt_id] = description (if present)
+    - option_labels[field_id][opt_id] = label (if present)
     """
     enums: Dict[str, List[str]] = {}
     defaults: Dict[str, Any] = {}
     cardinality: Dict[str, str] = {}
     option_descriptions: Dict[str, Dict[str, str]] = {}
+    option_labels: Dict[str, Dict[str, str]] = {}
 
     for field in fields_cfg:
         field_id = field.get("id")
@@ -2486,24 +3203,29 @@ def extract_field_config(
         options = field.get("options", []) or []
         allowed_ids: List[str] = []
         descs: Dict[str, str] = {}
+        labels: Dict[str, str] = {}
 
         for opt in options:
             opt_id = opt.get("id")
             if not opt_id:
                 continue
             allowed_ids.append(opt_id)
+            if "label" in opt:
+                labels[opt_id] = opt["label"]
             if "description" in opt:
                 descs[opt_id] = opt["description"]
 
         if allowed_ids:
             enums[field_id] = allowed_ids
+            if labels:
+                option_labels[field_id] = labels
             if descs:
                 option_descriptions[field_id] = descs
 
         defaults[field_id] = field.get("default")
         cardinality[field_id] = field.get("cardinality", "one")
 
-    return enums, defaults, cardinality, option_descriptions
+    return enums, defaults, cardinality, option_descriptions, option_labels
 ```
 
 ### ~\ragstream\orchestration\agent_prompt_helpers\field_normalizer.py
@@ -2802,6 +3524,475 @@ class Reranker:
 ```
 
 ### ~\ragstream\retrieval\retriever.py
+```python
+# -*- coding: utf-8 -*-
+"""
+retriever.py
+
+Purpose:
+    Deterministic Retrieval stage for RAGstream.
+
+Scope of this file:
+    - Read retrieval query text from the current SuperPrompt
+      (TASK / PURPOSE / CONTEXT).
+    - Split that retrieval query into overlapping query pieces.
+    - Open the active project's Chroma document store.
+    - Compare every stored chunk embedding against all query-piece embeddings.
+    - Aggregate per-chunk similarities with LogAvgExp (tau = 9).
+    - Keep the top-k chunks.
+    - Hydrate real Chunk objects from doc_raw using the same chunking logic
+      as ingestion.
+    - Write the Retrieval stage result back into the same SuperPrompt.
+
+Non-goals:
+    - No reranking here.
+    - No A3 filtering here.
+    - No GUI rendering here.
+    - No final prompt composition here.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+
+from ragstream.ingestion.chunker import Chunker
+from ragstream.ingestion.embedder import Embedder
+from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
+from ragstream.orchestration.super_prompt import A3ChunkStatus, SuperPrompt
+from ragstream.retrieval.chunk import Chunk
+from ragstream.retrieval.doc_score import DocScore  # compatibility re-export
+
+# Keep old import compatibility:
+# from ragstream.retrieval.retriever import DocScore
+DocScore = DocScore
+
+
+# ---------------------------------------------------------------------
+# Module-level retrieval defaults
+# ---------------------------------------------------------------------
+
+# Fallback number of chunks to keep if the caller gives no valid top-k.
+DEFAULT_TOP_K = 100
+
+# Retrieval query splitting reuses the same deterministic windowing idea
+# as ingestion. These values MUST stay aligned with the active ingestion
+# chunking contract unless you intentionally change both sides together.
+DEFAULT_QUERY_CHUNK_SIZE = 500
+DEFAULT_QUERY_OVERLAP = 100
+
+# Agreed retrieval aggregation constant:
+# score(chunk) = tau * log(mean(exp(sim_i / tau)))
+DEFAULT_LOGAVGEXP_TAU = 9.0
+
+
+class Retriever:
+    """
+    Deterministic Retrieval stage for document chunks.
+
+    Design:
+    - Keep this class stateless with respect to pipeline history.
+      The evolving pipeline state lives in SuperPrompt.
+    - This class only reads the current SuperPrompt, computes retrieval,
+      and writes the retrieval result back into the same SuperPrompt.
+    - The controller decides when to call this class.
+    """
+
+    def __init__(
+        self,
+        *,
+        doc_root: str,
+        chroma_root: str,
+        embedder: Embedder | None = None,
+        chunker: Chunker | None = None,
+    ) -> None:
+        """
+        Initialize Retrieval with explicit project roots and shared helpers.
+
+        Args:
+            doc_root:
+                Absolute path to the doc_raw root folder.
+                Example: .../data/doc_raw
+            chroma_root:
+                Absolute path to the chroma_db root folder.
+                Example: .../data/chroma_db
+            embedder:
+                Optional shared Embedder instance. If omitted, a default one is created.
+            chunker:
+                Optional shared Chunker instance. If omitted, a default one is created.
+        """
+        self.doc_root = Path(doc_root).resolve()
+        self.chroma_root = Path(chroma_root).resolve()
+
+        self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-large")
+        self.chunker = chunker if chunker is not None else Chunker()
+
+        # Keep the chunk class explicit so hydration remains readable and testable.
+        self.chunk_cls = Chunk
+
+    # -----------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------
+
+    def run(self, sp: SuperPrompt, project_name: str, top_k: int) -> SuperPrompt:
+        """
+        Execute the Retrieval stage and update the same SuperPrompt in place.
+
+        Inputs:
+            sp:
+                The current evolving SuperPrompt, typically after PreProcessing / A2.
+            project_name:
+                The active project selected in the GUI.
+            top_k:
+                Number of chunks to keep after retrieval ranking.
+
+        Returns:
+            The same SuperPrompt instance, mutated in place.
+
+        Effects on SuperPrompt:
+            - Writes hydrated Chunk objects into sp.base_context_chunks
+            - Writes the retrieval stage snapshot into sp.views_by_stage["retrieval"]
+            - Writes ordered chunk IDs into sp.final_selection_ids
+            - Appends "retrieval" to sp.history_of_stages
+            - Sets sp.stage = "retrieval"
+        """
+        if sp is None:
+            raise ValueError("Retriever.run: 'sp' must not be None")
+
+        project_name = (project_name or "").strip()
+        if not project_name:
+            raise ValueError("Retriever.run: project_name must not be empty")
+
+        if not self.doc_root.exists():
+            raise FileNotFoundError(f"Retriever.run: doc_root does not exist: {self.doc_root}")
+
+        project_db_dir = self.chroma_root / project_name
+        if not project_db_dir.exists():
+            raise FileNotFoundError(
+                f"Retriever.run: active project Chroma DB does not exist: {project_db_dir}"
+            )
+
+        query_text = self._build_query_text(sp)
+        if not query_text:
+            raise ValueError(
+                "Retriever.run: retrieval query is empty. "
+                "At least one of TASK / PURPOSE / CONTEXT must be present."
+            )
+
+        query_pieces = self._split_query_into_pieces(
+            query_text=query_text,
+            chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
+            overlap=DEFAULT_QUERY_OVERLAP,
+        )
+
+        ranked_rows = self._retrieve_and_rank(
+            project_name=project_name,
+            query_pieces=query_pieces,
+            top_k=top_k,
+        )
+
+        valid_ranked_rows, hydrated_chunks = self._hydrate_ranked_chunks(ranked_rows)
+        self._write_stage_to_superprompt(sp, valid_ranked_rows, hydrated_chunks)
+
+        return sp
+
+    # -----------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------
+
+    def _build_query_text(self, sp: SuperPrompt) -> str:
+        """
+        Build the retrieval query text from the structured SuperPrompt body.
+
+        Current design choice:
+        - Use only TASK / PURPOSE / CONTEXT.
+        - Keep the order explicit and stable.
+        - Skip empty fields.
+        """
+        blocks: List[str] = []
+
+        task = (sp.body.get("task") or "").strip()
+        purpose = (sp.body.get("purpose") or "").strip()
+        context = (sp.body.get("context") or "").strip()
+
+        if task:
+            blocks.append("## TASK")
+            blocks.append(task)
+            blocks.append("")
+
+        if purpose:
+            blocks.append("## PURPOSE")
+            blocks.append(purpose)
+            blocks.append("")
+
+        if context:
+            blocks.append("## CONTEXT")
+            blocks.append(context)
+            blocks.append("")
+
+        return "\n".join(blocks).strip()
+
+    def _split_query_into_pieces(
+        self,
+        *,
+        query_text: str,
+        chunk_size: int,
+        overlap: int,
+    ) -> List[str]:
+        """
+        Split the retrieval query into overlapping query pieces.
+
+        We intentionally reuse the same deterministic chunking idea as ingestion
+        so the prompt side and document side follow the same windowing culture.
+        """
+        query_text = (query_text or "").strip()
+        if not query_text:
+            return []
+
+        pieces = self.chunker.split(
+            file_path="__prompt__",
+            text=query_text,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+
+        return [chunk_text for _fp, chunk_text in pieces if (chunk_text or "").strip()]
+
+    def _retrieve_and_rank(
+        self,
+        *,
+        project_name: str,
+        query_pieces: List[str],
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read all stored chunk embeddings from the active project Chroma DB,
+        score them against all query pieces, aggregate with LogAvgExp, and keep top-k.
+
+        Return format:
+            List of dictionaries, one per selected chunk:
+            {
+                "id": <chunk_id>,
+                "score": <retrieval_score>,
+                "status": A3ChunkStatus.SELECTED,
+                "meta": <stored metadata dict>
+            }
+
+        Notes:
+        - This stage is deterministic.
+        - No reranking happens here.
+        - We read ALL stored chunk embeddings because the agreed Retrieval stage
+          should compute its own final ranking across the complete project store.
+        """
+        if not query_pieces:
+            return []
+
+        k = int(top_k) if int(top_k) > 0 else DEFAULT_TOP_K
+
+        store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
+
+        raw = store.collection.get(include=["embeddings", "metadatas"])
+        ids: List[str] = raw.get("ids", []) if raw else []
+        metadatas: List[Dict[str, Any] | None] = raw.get("metadatas", []) if raw else []
+        embeddings = raw.get("embeddings", []) if raw else []
+
+        # embeddings may come back as a NumPy array, so never test it with
+        # "if not embeddings". Use explicit length checks instead.
+        if len(ids) == 0 or len(embeddings) == 0:
+            return []
+
+        if len(ids) != len(embeddings):
+            raise RuntimeError(
+                "Retriever._retrieve_and_rank: Chroma returned mismatched ids/embeddings lengths"
+            )
+
+        if len(metadatas) > 0 and len(metadatas) != len(ids):
+            raise RuntimeError(
+                "Retriever._retrieve_and_rank: Chroma returned mismatched ids/metadatas lengths"
+            )
+
+        query_vectors = self.embedder.embed(query_pieces)
+
+        # query_vectors may also be array-like, so use explicit length checks.
+        if len(query_vectors) == 0:
+            return []
+
+        A = np.asarray(embeddings, dtype=np.float32)    # stored chunks: [N, D]
+        Q = np.asarray(query_vectors, dtype=np.float32) # query pieces:  [M, D]
+
+        if A.ndim != 2 or Q.ndim != 2:
+            raise RuntimeError(
+                "Retriever._retrieve_and_rank: unexpected embedding dimensions returned by Chroma/OpenAI"
+            )
+
+        if A.shape[1] != Q.shape[1]:
+            raise RuntimeError(
+                "Retriever._retrieve_and_rank: stored vectors and query vectors have different dimensions"
+            )
+
+        # Normalize rows to compute cosine similarity as a matrix product.
+        # Similarities shape: [N_chunks, M_query_pieces]
+        A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+        Q_norm = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-12)
+        sims = A_norm @ Q_norm.T
+
+        # LogAvgExp aggregation over the query-piece axis.
+        # score(chunk) = tau * log(mean(exp(sim_i / tau)))
+        tau = float(DEFAULT_LOGAVGEXP_TAU)
+        aggregated_scores = tau * np.log(np.mean(np.exp(sims / tau), axis=1))
+
+        rows: List[Dict[str, Any]] = []
+        for idx, chunk_id in enumerate(ids):
+            meta = metadatas[idx] if (len(metadatas) > 0 and metadatas[idx] is not None) else {}
+            rows.append(
+                {
+                    "id": chunk_id,
+                    "score": float(aggregated_scores[idx]),
+                    "status": A3ChunkStatus.SELECTED,
+                    "meta": meta,
+                }
+            )
+
+        # Deterministic sort:
+        # 1) higher score first
+        # 2) stable fallback by chunk_id
+        rows.sort(key=lambda row: (-row["score"], row["id"]))
+
+        return rows[: min(k, len(rows))]
+
+    def _hydrate_ranked_chunks(
+        self,
+        ranked_rows: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[Chunk]]:
+        """
+        Reconstruct real Chunk objects for the selected ranked rows.
+
+        Why reconstruction is needed:
+        - Chroma stores embeddings + metadata only.
+        - The actual chunk text must therefore be rebuilt from doc_raw
+          using the same chunker and the stored chunk_idx.
+
+        Important robustness rule:
+        - If one retrieved row points to a stale or broken source file,
+          we skip that row instead of crashing the whole Retrieval stage.
+
+        Returns:
+            (valid_ranked_rows, hydrated_chunks)
+
+            valid_ranked_rows:
+                Only the rows that could be reconstructed successfully.
+            hydrated_chunks:
+                Chunk objects aligned 1:1 with valid_ranked_rows.
+        """
+        valid_ranked_rows: List[Dict[str, Any]] = []
+        hydrated: List[Chunk] = []
+
+        # Local caches avoid re-reading and re-splitting the same source file
+        # when several retrieved chunks come from that file.
+        text_cache: Dict[str, str] = {}
+        split_cache: Dict[str, List[tuple[str, str]]] = {}
+
+        step = DEFAULT_QUERY_CHUNK_SIZE - DEFAULT_QUERY_OVERLAP
+
+        for row in ranked_rows:
+            chunk_id = row["id"]
+            meta = row.get("meta", {}) or {}
+
+            rel_path = str(meta.get("path") or "").strip()
+            if not rel_path:
+                continue
+
+            raw_path = self.doc_root / rel_path
+            if not raw_path.exists():
+                continue
+
+            chunk_idx_raw = meta.get("chunk_idx")
+            if chunk_idx_raw is None:
+                continue
+
+            chunk_idx = int(chunk_idx_raw)
+
+            cache_key = raw_path.as_posix()
+            if cache_key not in text_cache:
+                text_cache[cache_key] = raw_path.read_text(encoding="utf-8", errors="ignore")
+
+            if cache_key not in split_cache:
+                split_cache[cache_key] = self.chunker.split(
+                    file_path=str(raw_path),
+                    text=text_cache[cache_key],
+                    chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
+                    overlap=DEFAULT_QUERY_OVERLAP,
+                )
+
+            all_chunks_for_file = split_cache[cache_key]
+            if chunk_idx < 0 or chunk_idx >= len(all_chunks_for_file):
+                continue
+
+            _fp, snippet = all_chunks_for_file[chunk_idx]
+
+            source_text = text_cache[cache_key]
+            start = chunk_idx * step
+            end = min(start + DEFAULT_QUERY_CHUNK_SIZE, len(source_text))
+
+            chunk_obj = self.chunk_cls(
+                id=chunk_id,
+                source=rel_path,
+                snippet=snippet,
+                span=(start, end),
+                meta=dict(meta),
+            )
+
+            valid_ranked_rows.append(row)
+            hydrated.append(chunk_obj)
+
+        return valid_ranked_rows, hydrated
+
+    def _write_stage_to_superprompt(
+        self,
+        sp: SuperPrompt,
+        ranked_rows: List[Dict[str, Any]],
+        hydrated_chunks: List[Chunk],
+    ) -> None:
+        """
+        Persist the Retrieval result into the evolving SuperPrompt.
+
+        Write-back contract for this stage:
+        - base_context_chunks:
+            the hydrated Chunk objects in retrieval order
+        - views_by_stage["retrieval"]:
+            ordered triples (chunk_id, retrieval_score, SELECTED)
+        - final_selection_ids:
+            ordered chunk IDs from the current retrieval result
+        - stage/history:
+            bookkeeping for the pipeline lifecycle
+        """
+        if len(ranked_rows) != len(hydrated_chunks):
+            raise RuntimeError(
+                "Retriever._write_stage_to_superprompt: ranked_rows and hydrated_chunks length mismatch"
+            )
+
+        sp.base_context_chunks = list(hydrated_chunks)
+
+        retrieval_view: List[tuple[str, float, A3ChunkStatus]] = []
+        final_ids: List[str] = []
+
+        for row in ranked_rows:
+            chunk_id = str(row["id"])
+            score = float(row["score"])
+            status = row["status"]
+
+            retrieval_view.append((chunk_id, score, status))
+            final_ids.append(chunk_id)
+
+        sp.views_by_stage["retrieval"] = retrieval_view
+        sp.final_selection_ids = final_ids
+        sp.stage = "retrieval"
+        sp.history_of_stages.append("retrieval")
+```
+
+### ~\ragstream\retrieval\retriever_old.py
 ```python
 # -*- coding: utf-8 -*-
 """

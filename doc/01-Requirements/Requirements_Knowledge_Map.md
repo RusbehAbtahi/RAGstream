@@ -79,9 +79,9 @@ It does not redefine behavior; it only names the main nodes and shows how they c
 
 * MOD_Attention             = retrieval/attention.py
 
-* MOD_AgentFactory          = orchestration/agent_factory.py   (planned)
+* MOD_AgentFactory          = orchestration/agent_factory.py
 
-* MOD_AgentPrompt           = orchestration/agent_prompt.py    (planned)
+* MOD_AgentPrompt           = orchestration/agent_prompt.py
 
 * MOD_LLMClient             = orchestration/llm_client.py
 
@@ -316,11 +316,13 @@ NODE_A -> relation -> NODE_B
 
 * CON_Retrieval (implicit)  -> reads          -> CON_DocVectorStore
 
-* CON_Retrieval (implicit)  -> produces       -> CON_Chunk (IDs for SuperPrompt)
+* CON_Retrieval (implicit)  -> produces       -> CON_Chunk (hydrated working set + ordered stage snapshot in SuperPrompt)
+
+* CON_Retrieval (implicit)  -> updates        -> CON_SuperPrompt
 
 * CON_ReRanker (implicit)   -> reads          -> CON_Chunk
 
-* CON_ReRanker (implicit)   -> updates        -> selection in CON_SuperPrompt
+* CON_ReRanker (implicit)   -> updates        -> stage snapshot and current selection in CON_SuperPrompt
 
 * CON_IngestionPipelineDoc  -> uses           -> CON_Project
 

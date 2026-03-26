@@ -43,7 +43,6 @@ package "Ingestion & Memory" {
 '──────────────────────────────────────────────────────────────
 package "RAG Pipeline & Retrieval" {
 
-    class DocScore
     class Reranker
     class Retriever
 
@@ -129,8 +128,6 @@ HistoryIngestionWorker --> HistoryStoreChroma : write snapshots
 
 Retriever --> ChromaVectorStoreBase : vector search
 Retriever --> Embedder              : encode query
-Retriever --> Reranker              : pass candidates
-Retriever .> DocScore               : returns scored docs
 
 '──────────────────────────────────────────────────────────────
 ' RAG PIPELINE (A0…A5) & SUPERPROMPT

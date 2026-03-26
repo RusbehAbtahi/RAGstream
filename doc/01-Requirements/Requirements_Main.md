@@ -53,7 +53,7 @@ At the highest level, RAGstream consists of:
   * A0_PreProcessing (deterministic, optional LLM help later).
   * A2 PromptShaper (LLM-based Chooser agent).
   * Retrieval (deterministic vector search).
-  * ReRanker (deterministic model like E-BERT).
+  * ReRanker (deterministic BERT-style cross-encoder stage).
   * A3 NLI Gate (LLM-based filtering agent).
   * A4 Condenser (LLM-based summarization / context compressor).
   * A5 Format Enforcer (LLM-based format / style agent).
@@ -88,11 +88,13 @@ At minimum, SuperPrompt must represent:
   * audience,
   * task / purpose / context,
   * tone,
-  * response_depth,
+  * depth,
   * confidence (desired or inferred).
 * RAG context:
 
-  * A list (or lists) of retrieved chunks, plus IDs for the current selection.
+  * `base_context_chunks`: the current authoritative working set of selected `Chunk` objects.
+  * `views_by_stage`: ordered stage snapshots for retrieval/reranking/filtering views.
+  * `final_selection_ids`: the currently active selected chunk IDs for downstream stages and rendering.
   * A condensed context block (S_CTX) produced by A4 (facts / constraints / open issues).
   * Optional attachments (raw excerpts that the final LLM may see).
 * Stage and history:
@@ -101,7 +103,8 @@ At minimum, SuperPrompt must represent:
   * A history of stages that have been run in order.
 * GUI snapshot:
 
-  * A single text representation (“prompt_ready”) that the GUI shows as “current SuperPrompt”.
+  * A single text representation (`prompt_ready`) that the GUI shows as the current SuperPrompt preview.
+  * During the current implementation phase this preview may already be refreshed by earlier stages; the final authoritative assembly still belongs to Prompt Builder.
 * Extra diagnostics and meta:
 
   * Per-agent decisions, confidence scores, error messages, and other internal notes.
@@ -121,10 +124,12 @@ Documents and history are never passed as raw text lists between pipeline stages
   * Chunk IDs and metadata (path, session_id, tags, etc.).
   * Embedding vectors hidden behind the vector-store abstraction.
 
-SuperPrompt holds only:
+SuperPrompt currently holds:
 
-* The IDs of chunks selected at each stage.
-* A small number of raw texts (such as the final selection and attachments) needed for LLM input or GUI display.
+* The hydrated `Chunk` objects for the active working set (`base_context_chunks`).
+* Ordered per-stage views for Retrieval / ReRanker / later filtering stages (`views_by_stage`).
+* The currently active selected IDs (`final_selection_ids`).
+* A small number of rendered text blocks (such as S_CTX, attachments, and GUI preview text) needed for LLM input or GUI display.
 
 ### 3.3 Agent configuration data
 
@@ -172,23 +177,23 @@ In intermediate mode, the GUI exposes eight buttons, one per stage. The typical 
    * Controller calls the A2 agent with the current SuperPrompt.
    * A2 is a Chooser-type agent:
 
-     * It receives task/purpose/context and enum lists for system, audience, tone, response_depth, confidence.
+     * It receives task/purpose/context and enum lists for system, audience, tone, depth, confidence.
      * Through AgentFactory → AgentPrompt → llm_client → OpenAI, it chooses 1–3 system roles and single values for the other fields.
    * SuperPrompt’s header fields (system, audience, tone, etc.) are updated.
    * A2 can be re-run later if needed.
 
 4. Retrieval (button “Retrieval”):
 
-   * Controller builds a query from SuperPrompt (often the normalized task + purpose + context) and calls the Retrieval module.
-   * Retrieval queries one or more document vector stores (`chroma_db/<project>`).
-   * It returns an ordered list of candidate chunk IDs.
-   * SuperPrompt records these IDs as the initial RAG context for this run.
+   * Controller builds a retrieval query from SuperPrompt `task + purpose + context` and calls the Retrieval module.
+   * Retrieval splits that query into overlapping pieces, embeds the pieces, reads the active project's Chroma document store, scores stored chunks with LogAvgExp over the query pieces, and keeps the top-k result.
+   * Retrieval reconstructs the real chunk text from `data/doc_raw/<project>` using stored metadata and the same chunking logic as ingestion.
+   * SuperPrompt records the hydrated selected chunks in `base_context_chunks`, writes the Retrieval stage snapshot into `views_by_stage["retrieval"]`, and updates `final_selection_ids`.
 
 5. ReRanker (button “ReRanker”):
 
-   * Controller calls ReRanker on those candidates.
-   * ReRanker (e.g. E-BERT) reorders the chunks deterministically according to semantic relevance.
-   * SuperPrompt updates its “current selection” to the reranked list.
+   * Controller calls ReRanker on those Retrieval candidates.
+   * ReRanker is a deterministic BERT-style cross-encoder stage that scores each `(prompt, chunk)` pair more precisely than embedding-only Retrieval.
+   * SuperPrompt records the reranked stage snapshot in `views_by_stage["reranked"]` and updates the current selection accordingly.
 
 6. A3 NLI Gate (button “A3 NLI Gate”):
 
@@ -210,13 +215,13 @@ In intermediate mode, the GUI exposes eight buttons, one per stage. The typical 
 
 9. Prompt Builder (button “Prompt Builder”):
 
-   * Controller calls Prompt Builder to generate the exact set of messages (system + user content) that constitute the final SuperPrompt:
+   * Controller calls Prompt Builder to generate the exact final prompt package from SuperPrompt:
 
      * System block (System_MD).
      * Main task/purpose/context block (Prompt_MD).
      * Condensed context block (S_CTX).
      * Optional attachments with raw excerpts.
-   * SuperPrompt.prompt_ready becomes a faithful text snapshot of what would be sent to an LLM.
+   * `SuperPrompt.prompt_ready` becomes the final authoritative text snapshot of what would be sent to an LLM. Earlier stages may already refresh a GUI preview, but Prompt Builder remains the final assembly owner.
 
 At any stage, the user may:
 

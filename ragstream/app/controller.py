@@ -90,6 +90,62 @@ class AppController:
         """
         return self.a2_promptshaper.run(sp)
 
+    # Added on 18.03.2026:
+    # Small demo helper for the future memory view in the GUI.
+    # This does NOT change A2 logic. It only builds one simple input/output
+    # record that can be appended by the Streamlit session layer.
+    def build_a2_memory_demo_entry(self, sp: SuperPrompt) -> dict[str, str]:
+        """
+        Build one demo memory entry for the A2 memory view.
+
+        The displayed INPUT contains only the three prompt parts that are
+        important for later retrieval-oriented memory usage:
+        TASK, PURPOSE, CONTEXT.
+
+        The displayed OUTPUT is intentionally dummy text for the demo phase.
+        """
+        input_text = self._build_a2_memory_demo_input(sp)
+        if not input_text:
+            input_text = "(empty)"
+        return {
+            "input_text": input_text,
+            "output_text": "XXXXX",
+            "tag": "Green",
+        }
+
+    def _build_a2_memory_demo_input(self, sp: SuperPrompt) -> str:
+        """
+        Build a simple plain-text prompt for the memory demo.
+
+        Design rule:
+        - Use the current SuperPrompt body after A2 has shaped it.
+        - Keep only TASK / PURPOSE / CONTEXT.
+        - Exclude SYSTEM / DEPTH / retrieval context / other fields.
+        - Return plain text, not markdown-oriented formatting.
+        """
+        lines: list[str] = []
+
+        task_value = (sp.body.get("task") or "").strip()
+        purpose_value = (sp.body.get("purpose") or "").strip()
+        context_value = (sp.body.get("context") or "").strip()
+
+        if task_value:
+            lines.append("TASK")
+            lines.append(task_value)
+            lines.append("")
+
+        if purpose_value:
+            lines.append("PURPOSE")
+            lines.append(purpose_value)
+            lines.append("")
+
+        if context_value:
+            lines.append("CONTEXT")
+            lines.append(context_value)
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
     # Added on 15.03.2026:
     # Retrieval is a separate deterministic stage and must remain independent
     # from ReRanker / A3. The controller only passes the current SuperPrompt,

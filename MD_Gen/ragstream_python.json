@@ -27,6 +27,7 @@
   "~\\ragstream\\retrieval\\doc_score.py",
   "~\\ragstream\\retrieval\\reranker.py",
   "~\\ragstream\\retrieval\\retriever.py",
+  "~\\ragstream\\retrieval\\retriever_old.py",
   "~\\ragstream\\memory\\conversation_memory.py",
   "~\\ragstream\\utils\\logging.py",
   "~\\ragstream\\utils\\paths.py"
