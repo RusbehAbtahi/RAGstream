@@ -92,16 +92,16 @@ GUI / Controller
   A2  Prompt Shaper        (LLM agent: shapes problem, sets system / task / tone, etc.)
       │
       ▼
-      Retrieval            (deterministic: query Chroma with SuperPrompt.search_query)
+      Retrieval            (deterministic: build query from task/purpose/context, split, score Chroma with LogAvgExp)
       │
       ▼
-      ReRanker             (deterministic: sort + cap candidates, form views_by_stage["reranked"])
+      ReRanker             (deterministic: BERT-style cross-encoder reranking, form views_by_stage["reranked"])
       │
       ▼
   A3  NLI Gate             (LLM agent: keep/drop decisions on candidates)
       │
       ▼
-  A4  Condenser            (LLM agent: compress kept context into SuperPrompt.base_context_chunks)
+  A4  Condenser            (LLM agent: compress kept context into SuperPrompt.S_CTX_MD)
       │
       ▼
   A5  Format Enforcer      (LLM agent: ensure final prompt obeys schema / format contract)
@@ -138,7 +138,7 @@ Controller (AppController in controller.py, see Requirements_Orchestration_Contr
 * Each method applies a single stage to the active SuperPrompt (or runs multiple stages in auto-mode) and returns the updated SuperPrompt to the GUI.
 * Manages project configuration (which Chroma DB, which FileManifest, which agent configs).
 * Manages session state such as: last_error, history_profile, and any debug handles.
-* Does not own long-lived agent instances; it always goes through the Agent Stack.
+* May keep shared long-lived helper instances (e.g. AgentFactory, LLMClient, A2 agent wrapper, Retriever) as controller-owned infrastructure objects.
 
 GUI (ui_streamlit.py, see Requirements_GUI.md):
 

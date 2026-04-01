@@ -237,13 +237,22 @@ class SuperPrompt:
 
         return "\n".join(lines).strip()
 
+    def _format_score(self, score: float) -> str:
+        """
+        Format numeric scores compactly for the Related Context headers.
+        """
+        return f"{float(score):.4f}".rstrip("0").rstrip(".")
+
     def _render_related_context_md(self) -> str:
         """
         Render a simple chunk-based context preview from the current selected chunks.
 
         Design intention:
         - The GUI should show only the selected chunk texts.
-        - Technical metadata such as ID, source, score, status, and span remain
+        - During Retrieval, show only Rt-Score in the chunk header.
+        - During ReRanker, show Rk-Score first and Rt-Score second.
+        - For other stages, keep the header simple.
+        - Technical metadata such as ID, source, status, and span remain
           inside SuperPrompt as internal structured data and are not rendered here.
         - If no chunks exist yet, this method returns an empty string and the caller
           simply skips the section.
@@ -252,13 +261,43 @@ class SuperPrompt:
         if not ordered_chunks:
             return ""
 
+        retrieval_score_map: Dict[str, float] = {
+            chunk_id: float(score)
+            for chunk_id, score, _status in self.views_by_stage.get("retrieval", [])
+        }
+
+        reranked_score_map: Dict[str, float] = {
+            chunk_id: float(score)
+            for chunk_id, score, _status in self.views_by_stage.get("reranked", [])
+        }
+
         lines: List[str] = []
         lines.append("## Related Context")
         lines.append("")
 
         chunk_counter = 1
         for chunk_obj in ordered_chunks:
-            lines.append(f"### Chunk {chunk_counter}")
+            header = f"### Chunk {chunk_counter}"
+
+            if self.stage == "retrieval":
+                rt_score = retrieval_score_map.get(chunk_obj.id)
+                if rt_score is not None:
+                    header = f"{header} [Rt-Score={self._format_score(rt_score)}]"
+
+            elif self.stage == "reranked":
+                rk_score = reranked_score_map.get(chunk_obj.id)
+                rt_score = retrieval_score_map.get(chunk_obj.id)
+
+                if rk_score is not None and rt_score is not None:
+                    header = (
+                        f"{header} "
+                        f"[Rk-Score={self._format_score(rk_score)}, "
+                        f"Rt-Score={self._format_score(rt_score)}]"
+                    )
+                elif rk_score is not None:
+                    header = f"{header} [Rk-Score={self._format_score(rk_score)}]"
+
+            lines.append(header)
             lines.append("")
             lines.append(chunk_obj.snippet.strip())
             lines.append("")

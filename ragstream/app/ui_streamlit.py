@@ -1,3 +1,4 @@
+# ui_streamlit.py
 # -*- coding: utf-8 -*-
 """
 Run on a free port, e.g.:
@@ -102,6 +103,8 @@ def main() -> None:
         st.session_state.sp_a2 = SuperPrompt()
     if "sp_rtv" not in st.session_state:
         st.session_state.sp_rtv = SuperPrompt()
+    if "sp_rrk" not in st.session_state:
+        st.session_state.sp_rrk = SuperPrompt()
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
     if "ingestion_status" not in st.session_state:
@@ -262,7 +265,21 @@ def main() -> None:
                     st.error(str(e))
 
         with b1c4:
-            st.button("ReRanker", key="btn_reranker", use_container_width=True)
+            clicked_reranker = st.button("ReRanker", key="btn_reranker", use_container_width=True)
+            if clicked_reranker:
+          #      try:
+                    ctrl: AppController = st.session_state.controller
+                    sp: SuperPrompt = st.session_state.sp
+
+                    sp = ctrl.run_reranker(sp)
+                    sp.compose_prompt_ready()
+
+                    st.session_state.sp = sp
+                    st.session_state.sp_rrk = copy.deepcopy(sp)
+                    st.session_state["super_prompt_text"] = sp.prompt_ready
+
+             #   except Exception as e:
+                #    st.error(str(e))
 
         # Row 2: 4 buttons
         b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")

@@ -57,8 +57,8 @@ DEFAULT_QUERY_CHUNK_SIZE = 500
 DEFAULT_QUERY_OVERLAP = 100
 
 # Agreed retrieval aggregation constant:
-# score(chunk) = tau * log(mean(exp(sim_i / tau)))
-DEFAULT_LOGAVGEXP_TAU = 9.0
+#P value, for P Norm Averaging
+DEFAULT_P_NORM = 10
 
 
 class Retriever:
@@ -311,10 +311,11 @@ class Retriever:
         Q_norm = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-12)
         sims = A_norm @ Q_norm.T
 
-        # LogAvgExp aggregation over the query-piece axis.
-        # score(chunk) = tau * log(mean(exp(sim_i / tau)))
-        tau = float(DEFAULT_LOGAVGEXP_TAU)
-        aggregated_scores = tau * np.log(np.mean(np.exp(sims / tau), axis=1))
+        # P-mean aggregation over the query-piece axis.
+        # Strongly favors the best match, but is still not pure max.
+        p = DEFAULT_P_NORM
+        sims_pos = np.clip(sims, 0.0, None)
+        aggregated_scores = np.power(np.mean(np.power(sims_pos, p), axis=1), 1.0 / p)
 
         rows: List[Dict[str, Any]] = []
         for idx, chunk_id in enumerate(ids):

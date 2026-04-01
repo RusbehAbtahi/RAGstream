@@ -1,3 +1,4 @@
+# controller.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
 # Added on 15.03.2026:
 # Deterministic Retrieval stage.
 from ragstream.retrieval.retriever import Retriever
+from ragstream.retrieval.reranker import Reranker
 
 
 class AppController:
@@ -71,6 +73,12 @@ class AppController:
             doc_root=str(self.doc_root),
             chroma_root=str(self.chroma_root),
         )
+
+        # Added on 31.03.2026:
+        # ReRanker is initialized once and re-used. It consumes the Retrieval
+        # candidates already stored in SuperPrompt and reorders them with the
+        # agreed cross-encoder model.
+        self.reranker = Reranker()
 
     def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
         """
@@ -175,6 +183,25 @@ class AppController:
             project_name=project_name,
             top_k=int(top_k),
         )
+
+    # Added on 31.03.2026:
+    # ReRanker is a separate deterministic stage after Retrieval. The controller
+    # only passes the current SuperPrompt and returns the same updated object.
+    def run_reranker(self, sp: SuperPrompt) -> SuperPrompt:
+        """
+        Run ReRanker on the current SuperPrompt.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt, typically after Retrieval.
+
+        Returns:
+            Updated SuperPrompt after ReRanker has populated:
+            - views_by_stage["reranked"]
+            - final_selection_ids
+            - stage / history_of_stages
+        """
+        return self.reranker.run(sp)
 
     # Added on 10.03.2026:
     # Project-based ingestion helpers for the new Streamlit buttons.
