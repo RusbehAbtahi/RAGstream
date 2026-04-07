@@ -358,7 +358,7 @@ data/
 ## GUI (Streamlit)
 
 ### Current development GUI
-
+ 
 RAGstream includes a Streamlit-based development GUI for stepping through the pipeline manually and inspecting intermediate state.
 
 Current development view includes:
@@ -371,22 +371,28 @@ Current development view includes:
 - active project / DB selection,
 - embedded-file visibility,
 - retrieval and reranking inspection,
-- a development-side memory panel with tag semantics.
+- an evolving memory section.
 
-The current GUI image below is the active development view:
+The current GUI image below shows the active development view:
 
 <p align="center">
   <img src="doc/04-GUI/Dev1.png" alt="Current development GUI">
   <br/><em>Figure 1 – Current development GUI</em>
 </p>
 
-In this development view, the memory panel already illustrates the intended direction of explicit memory policies:
+The memory section reflects the current direction of the memory architecture. It combines two complementary ideas:
 
-- **Green**: normal memory entry,
-- **Black**: excluded entry,
-- **Gold**: pinned persistent entry.
+- a persistent always-fed layer for pinned rules and durable context,
+- and a retrieval-based semantic layer for normal memory selection.
 
-This part should be read as a development prototype of memory management, not as a completed history subsystem. The durable history log, tag-aware retrieval rules, and later cross-session history orchestration are still under construction.
+The tag semantics shown in the current development view already reflect that direction:
+
+- **Gold**: pinned persistent memory, comparable to always-included Layer-G context,
+- **Green**: normal semantic memory entry,
+- **Silver**: semantic memory entry with baseline weighting,
+- **Black**: excluded memory entry, used to remove irrelevant or unwanted prompt/history material from future context.
+
+The full memory workflow is still under construction, and its intended operational shape is the one illustrated in the development GUI shown in `Dev1.png`.
 
 ### Planned GUI (next phases)
 
@@ -415,3 +421,4 @@ Planned directions already documented in the requirements and backlog include:
 This is a personal research and engineering project by **Rusbeh Abtahi**.
 
 The codebase is MIT-licensed. The project is being developed as a transparent, inspectable RAG system whose requirements, architecture, UML, deployment, and implementation can evolve in a controlled way.
+  
