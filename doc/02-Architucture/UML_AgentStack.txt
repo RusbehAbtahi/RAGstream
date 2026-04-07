@@ -72,6 +72,7 @@ package "Agents (app/agents)" {
     class A0_FileScopeSelector
     class A1_DCI
     class A2_PromptShaper
+    class NLP_Splitter
     class A3_NLIGate
     class A4_Condenser
     class A5_SchemaEnforcer
@@ -98,6 +99,7 @@ AppController --> AgentFactory : get(agent_name)
 
 ' Agents use AgentPrompt to build messages/envelopes
 A2_PromptShaper ..> AgentPrompt : compose_messages()
+NLP_Splitter ..> AgentPrompt : compose_messages()
 A3_NLIGate ..> AgentPrompt : compose_messages()
 A4_Condenser ..> AgentPrompt : compose_messages()
 A5_SchemaEnforcer ..> AgentPrompt : envelope_for_call()
@@ -121,6 +123,8 @@ note right of AgentPrompt
   Stateless prompt composer:
   - merges SYSTEM/USER + S_ctx
   - builds JSONEnvelope payload/meta
+  - supports Chooser / Writer /
+    Extractor / Multi-Chooser
   - never calls the LLM directly
 end note
 
@@ -128,6 +132,22 @@ note right of LLMClient
   Thin wrapper around LLM API:
   - knows model/messages/response_format
   - no knowledge of agents or Controller
+end note
+
+note bottom of A3_NLIGate
+  Current agreed future role:
+  - Multi-Chooser-style chunk labeling
+  - Must_Keep / Useful / BorderLine /
+    Discarded
+  - duplicate marking against higher-ranked chunk_id
+end note
+
+note bottom of NLP_Splitter
+  Current agreed future role:
+  - split long prompt into meaning-based
+    query parts
+  - enforce upper token limit per part
+  - helper for bounded ColBERT reranking
 end note
 
 @enduml

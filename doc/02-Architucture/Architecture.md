@@ -92,13 +92,13 @@ GUI / Controller
   A2  Prompt Shaper        (LLM agent: shapes problem, sets system / task / tone, etc.)
       │
       ▼
-      Retrieval            (deterministic: build query from task/purpose/context, split, score Chroma with LogAvgExp)
+      Retrieval            (deterministic: build query from task/purpose/context, run dense + SPLADE first-pass retrieval, fuse with RRF)
       │
       ▼
-      ReRanker             (deterministic: BERT-style cross-encoder reranking, form views_by_stage["reranked"])
+      ReRanker             (deterministic: bounded ColBERT reranking with query splitting and fused final ranking, form views_by_stage["reranked"])
       │
       ▼
-  A3  NLI Gate             (LLM agent: keep/drop decisions on candidates)
+  A3  NLI Gate             (LLM agent: chunk labeling and duplicate marking on reranked candidates)
       │
       ▼
   A4  Condenser            (LLM agent: compress kept context into SuperPrompt.S_CTX_MD)
@@ -213,7 +213,7 @@ The architecture assumes a strong emphasis on determinism and debuggability, as 
 
 * Eligibility Pool — a set of candidate chunks (from documents and history) that are eligible for a given stage, subject to per-file ON/OFF switches and tag rules. The Eligibility Pool concept appears in Requirements_RAG_Pipeline.md and Requirements_Orchestration_Controller.md; architecture only fixes that all RAG-related decisions run over an explicit, inspectable candidate set.
 * No silent deletions — vector stores and history stores do not silently lose data; removals or deactivations are expressed via FileManifest status fields, tags, or explicit “ignore” rules.
-* Explainability — every keep/drop decision (especially in A3 NLI Gate) is traceable via logs and, where appropriate, via structured fields in SuperPrompt (e.g. `views_by_stage`, `history_of_stages`).
+* Explainability — every stage decision (especially Retrieval ranking, ReRanker fusion, and A3 chunk labeling / duplicate marking) is traceable via logs and, where appropriate, via structured fields in SuperPrompt (e.g. `views_by_stage`, `history_of_stages`).
 
 These principles are enforced by the controller and Agent Stack orchestration but belong to the requirements as the ultimate behavioral contract.
 
@@ -247,7 +247,7 @@ Vectors for documents and history persist as Chroma on-disk collections under `d
 
 FileManifest and logs live on the filesystem in JSON / text files; their formats are simple by design so that you can inspect and edit them manually when needed.
 
-Modules are kept small and focused, following the mapping in Requirements_Knowledge_Map.md (MOD_* names). Architecture_2.md does not duplicate that mapping; it only assumes that:
+Modules are kept small and focused, following the mapping in Requirements_Knowledge_Map.md (MOD_* names). Architecture.md does not duplicate that mapping; it only assumes that:
 
 * ingestion/, retrieval/, orchestration/, tooling/, and app/ each own their part of the behavior;
 * cross-cutting concerns (SuperPrompt, logging, paths) sit in utils/ or dedicated modules referenced from the requirements.

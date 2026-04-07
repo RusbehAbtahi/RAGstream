@@ -18,7 +18,7 @@ The goals of this stack are:
 
 * Neutral, stateless behavior (no hidden state, no A2-specific logic inside AgentFactory / AgentPrompt / llm_client).
 * Agents defined as **data** (JSON configs) instead of hard-coded logic.
-* Support for three agent types: **Chooser**, **Writer**, **Extractor**.
+* Support for four agent types: **Chooser**, **Writer**, **Extractor**, **Multi-Chooser**.
 * Clean separation of concerns:
 
   * Agent = domain logic and deterministic post-processing
@@ -26,7 +26,7 @@ The goals of this stack are:
   * AgentPrompt = neutral prompt composer + output validator
   * llm_client = low-level LLM call
 
-A2 PromptShaper is used as the running example, but the same stack must work for PreProcessing, A3, A4, A5 and future agents.
+A2 PromptShaper is used as the running example, but the same stack must work for PreProcessing, A3, A4, A5, the future `NLP_Splitter`, and later agents.
 
 2. High-level data flow (A2 example)
 
@@ -148,7 +148,7 @@ Each agent config JSON MUST follow this conceptual structure:
   "agent_id": "a2_promptshaper",
   "version": "002",
 
-  "mode": "Chooser",         // Chooser | Writer | Extractor
+  "mode": "Chooser",         // Chooser | Writer | Extractor | Multi-Chooser
 
   "system_text": "You are A2 PromptShaper. ...",
   "purpose_text": "You must inspect task/purpose/context and choose labels for system, audience, tone, response_depth, confidence.",
@@ -204,11 +204,12 @@ Requirements:
 
 * `agent_name` and `version` MUST match what the Agent passes to AgentFactory.
 
-* `mode` MUST be one of `"Chooser"`, `"Writer"`, `"Extractor"`.
+* `mode` MUST be one of `"Chooser"`, `"Writer"`, `"Extractor"`, `"Multi-Chooser"`.
 
   * **Chooser:** LLM selects one or more values from enums for each output field.
   * **Writer:** LLM fills text fields (e.g. summaries, explanations) according to schema; enums may be absent or minimal.
   * **Extractor:** LLM extracts structured information from input and maps it into schema fields (e.g. named entities, slots).
+  * **Multi-Chooser:** LLM assigns one structured decision per item in a list (for example one label per chunk, plus duplicate metadata) while still returning one JSON object.
 
 * `system_text` and `purpose_text` are pure text; they define behavior but contain no code.
 
@@ -223,6 +224,22 @@ Requirements:
 * `temperature` and `max_output_tokens` are basic numeric parameters; no further tuning knobs are required at this stage.
 
 Future extension: if you later need multiple providers (OpenAI, local TinyLlama, etc.), a `provider` field can be introduced, but it is not part of this initial requirement.
+
+3.4. Agreed future agent additions
+
+The following agent additions are now part of the agreed future direction and must remain compatible with this Agent Stack:
+
+* `NLP_Splitter`
+
+  * Purpose: read retrieval-relevant prompt fields and split a long prompt into several meaning-based subqueries under a configured upper token limit.
+  * Expected mode: `Writer` or `Extractor`, depending on the final chosen schema.
+  * Expected output shape: a JSON object containing an ordered list of subqueries.
+
+* `A3_NLI_Gate` future upgrade
+
+  * Purpose: inspect multiple reranked chunks at the same time and assign one label per chunk.
+  * Expected mode: `Multi-Chooser`.
+  * Expected output shape: one JSON object containing, for each candidate chunk, a label such as `Must_Keep`, `Useful`, `BorderLine`, or `Discarded`, plus optional duplicate metadata.
 
 4. AgentFactory (agent_factory.py)
 
@@ -338,7 +355,7 @@ An AgentPrompt instance MUST hold the following configuration:
 
 * `agent_name: str`
 * `version: str`
-* `mode: str` (Chooser | Writer | Extractor)
+* `mode: str` (Chooser | Writer | Extractor | Multi-Chooser)
 * `system_text: str`
 * `purpose_text: str`
 * `output_schema: dict` (JSON schema)
@@ -380,6 +397,9 @@ Responsibilities:
 
     * **Extractor:**
       Use `output_schema` to instruct the LLM to extract or map information from `input_payload` into the schema fields.
+
+    * **Multi-Chooser:**
+      Use `output_schema` to instruct the LLM to return one structured decision per listed item, for example one chunk label per candidate plus optional duplicate references.
 
   * End with a fixed sentence such as:
     “Reply with a single JSON object only, no extra text, matching the schema.”

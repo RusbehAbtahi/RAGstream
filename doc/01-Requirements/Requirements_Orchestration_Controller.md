@@ -11,7 +11,7 @@ The focus here is:
 * How it manages SuperPrompt and session state.
 * How it prepares for future auto-mode and richer orchestration without breaking today’s design.
 
-Details of individual agents (PreProcessing, A2, A3, A4, A5) and the agent stack are defined in Requirements_AgentStack.md and Req_PreProcessing.md. Retrieval and reranking mechanics are defined in Requirements_RAG_Pipeline.md and Requirements_Ingestion_Memory.md.
+Details of individual pipeline stages (A0_PreProcessing, A2, A3, A4, A5) are defined in Requirements_RAG_Pipeline.md. The neutral stateless agent infrastructure (AgentFactory, AgentPrompt, llm_client) is defined in Requirements_AgentStack.md. Retrieval and ReRanker mechanics are defined in Requirements_RAG_Pipeline.md, while storage and ingestion dependencies are defined in Requirements_Ingestion_Memory.md.
 
 2. Position in the architecture
 
@@ -25,6 +25,7 @@ The controller sits between:
   * PreProcessing (A0_PreProcessing)
   * A2 PromptShaper
   * Retrieval and ReRanker
+  * future helper agent for ReRanker query splitting
   * A3 NLI Gate
   * A4 Condenser
   * A5 Format Enforcer
@@ -189,13 +190,14 @@ Behavior:
 * Retrieval returns:
 
   * base_context_chunks: list of hydrated `Chunk` objects.
-  * retrieval_view: ordered stage snapshots for stage `"retrieval"`, currently `(chunk_id, retrieval_score, stage_status)`.
-  * final_selection_ids initialized to the same retrieval order for the current intermediate GUI view.
+  * retrieval_view: ordered stage snapshots for stage `"retrieval"`, in fused Retrieval order.
+  * final_selection_ids initialized to the same Retrieval order for the current intermediate GUI view.
+  * optional component-score metadata for dense Retrieval, SPLADE, and fused Retrieval display.
 * Controller updates sp:
 
   * base_context_chunks set from Retrieval output.
   * views_by_stage["retrieval"] = retrieval_view.
-  * final_selection_ids initialized to the retrieval ids (before ReRanker / A3 / A4 adjust them).
+  * final_selection_ids initialized to the Retrieval ids (before ReRanker / A3 / A4 adjust them).
   * stage set to "retrieval".
   * history_of_stages appended with "retrieval".
   * prompt_ready may be regenerated via `sp.compose_prompt_ready()` so the GUI shows a simple Related Context preview.
@@ -211,11 +213,13 @@ Behavior:
 * Require stage >= "retrieval".
 * Call reranker module with:
 
-  * Prompt_MD (normalized ask) from SuperPrompt.
-  * Chunk texts corresponding to `views_by_stage["retrieval"]`.
+  * the current Retrieval-ranked candidate band,
+  * the current prompt fields from SuperPrompt,
+  * and, if needed, the future `NLP_Splitter` helper agent for meaning-based query splitting under the active token limit.
 * Reranker returns:
 
-  * `reranked_view`: ordered stage snapshots in the new order.
+  * `reranked_view`: ordered stage snapshots in the new fused order.
+  * optional component-score metadata for the previous Retrieval ranking, ColBERT ranking, and final fused reranking.
 * Controller updates sp:
 
   * `views_by_stage["reranked"] = reranked_view`.
@@ -236,11 +240,12 @@ Behavior:
 * Call A3 agent module with:
 
   * SuperPrompt (including chunks for current selection).
-* A3 uses its own AgentFactory and llm_client to inspect candidate chunks and decide keep/drop flags using NLI or similar logic.
+* A3 uses its own AgentFactory and llm_client to inspect candidate chunks and assign one structured decision per chunk.
 * A3 returns:
 
-  * updated final_selection_ids (only chunks that pass the gate).
-  * optionally a view list views_by_stage["a3"].
+  * updated final_selection_ids (only chunks that pass the gate or remain eligible under the active policy).
+  * optionally a view list `views_by_stage["a3"]`.
+  * optional label and duplicate metadata per chunk.
 * Controller updates sp:
 
   * final_selection_ids set to A3’s decision.

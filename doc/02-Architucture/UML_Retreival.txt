@@ -1,4 +1,4 @@
-@startuml RAG_Pipeline_Retrieval_2026_03_15
+@startuml RAG_Pipeline_Retrieval_2026_04_07
 left to right direction
 skinparam linetype ortho
 skinparam classAttributeIconSize 0
@@ -11,32 +11,34 @@ hide empty members
 package "Ingestion / External" {
 
     class Chunker {
-        + split(file_path:str, text:str, chunk_size:int, overlap:int) : List[tuple[str, str]]
+        + split(...) : List[tuple[str, str]]
     }
 
     class Embedder {
-        + embed(texts:List[str]) : List[List[float]]
+        + embed(...) : List[List[float]]
         - model : str
     }
 
     class VectorStoreChroma {
         + collection : Any
-        + add(ids:List[str], vectors:List[List[float]], metadatas:List[Dict]=None) : None
+        + add(...) : None
     }
 }
 
 package "Controller / UI (external)" {
-    class AppController {
-        + run_retrieval(sp:SuperPrompt, project_name:str, top_k:int) : SuperPrompt
-    }
-
     class StreamlitUI {
         + retrieval_top_k : int
         + active_project : str
         + sp_rtv : SuperPrompt
+        + sp_rrk : SuperPrompt
     }
 
-    StreamlitUI --> AppController : Retrieval button
+    class AppController {
+        + run_retrieval(...) : SuperPrompt
+        + run_reranker(...) : SuperPrompt
+    }
+
+    StreamlitUI --> AppController
 }
 
 '──────────────────────────────────────────────────────────────
@@ -58,22 +60,34 @@ package "Retrieval Stage" {
         DUPLICATED
     }
 
+    class SPLADERetriever {
+        + rank(...) : List[Dict[str, Any]]
+    }
+
+    class RRFMerger {
+        + fuse(...) : List[Dict[str, Any]]
+    }
+
     class Retriever {
-        + run(sp:SuperPrompt, project_name:str, top_k:int) : SuperPrompt
-        - doc_root : Path
-        - chroma_root : Path
-        - embedder : Embedder
-        - chunker : Chunker
-        - chunk_cls : Chunk
-        - _build_query_text(sp:SuperPrompt) : str
-        - _split_query_into_pieces(query_text:str, chunk_size:int, overlap:int) : List[str]
-        - _retrieve_and_rank(project_name:str, query_pieces:List[str], top_k:int) : List[Dict[str, Any]]
-        - _hydrate_ranked_chunks(ranked_rows:List[Dict[str, Any]]) : tuple[List[Dict[str, Any]], List[Chunk]]
-        - _write_stage_to_superprompt(sp:SuperPrompt, ranked_rows:List[Dict[str, Any]], hydrated_chunks:List[Chunk]) : None
+        + run(...) : SuperPrompt
+        - _build_query(...) : str
+        - _split_query(...) : List[str]
+        - _dense_rank(...) : List[Dict[str, Any]]
+        - _sparse_rank(...) : List[Dict[str, Any]]
+        - _fuse_rows(...) : List[Dict[str, Any]]
+        - _hydrate(...) : tuple[List[Dict[str, Any]], List[Chunk]]
+        - _write_stage(...) : None
+    }
+
+    class NLP_Splitter {
+        + split(...) : List[str]
     }
 
     class Reranker {
-        + rerank(...) : ...
+        + run(...) : SuperPrompt
+        - _split_query(...) : List[str]
+        - _colbert_rank(...) : List[Dict[str, Any]]
+        - _fuse_rows(...) : List[Dict[str, Any]]
     }
 }
 
@@ -98,7 +112,7 @@ package "SuperPrompt & Orchestration" {
     }
 
     class PromptBuilder {
-        + build_from_superprompt(sp:SuperPrompt) : str
+        + build_from_superprompt(...) : str
     }
 }
 
@@ -106,36 +120,56 @@ package "SuperPrompt & Orchestration" {
 '  FLOW / DEPENDENCIES
 '──────────────────────────────────────────────────────────────
 
-AppController --> Retriever : run_retrieval(sp, project_name, top_k)
-AppController --> SuperPrompt : current evolving state
+AppController --> Retriever
+AppController --> Reranker
+AppController --> SuperPrompt
 
-Retriever --> Embedder          : embed query pieces
-Retriever --> Chunker           : split query / rebuild raw chunk text
-Retriever --> VectorStoreChroma : read ids + embeddings + metadatas
-Retriever --> SuperPrompt       : write retrieval results
-Retriever .> Chunk              : hydrate selected chunks
-Retriever .> A3ChunkStatus      : mark SELECTED
+Retriever --> Embedder
+Retriever --> Chunker
+Retriever --> SPLADERetriever
+Retriever --> RRFMerger
+Retriever --> VectorStoreChroma
+Retriever --> SuperPrompt
+Retriever .> Chunk
+Retriever .> A3ChunkStatus
 
-Reranker --> SuperPrompt        : later writes reranked view
-PromptBuilder --> SuperPrompt   : later final render
-SuperPrompt --> Chunk           : holds base_context_chunks
-SuperPrompt ..> A3ChunkStatus   : stores per-stage status triples
+SPLADERetriever --> VectorStoreChroma
+
+Reranker --> NLP_Splitter
+Reranker --> RRFMerger
+Reranker --> SuperPrompt
+Reranker .> Chunk
+
+PromptBuilder --> SuperPrompt
+SuperPrompt --> Chunk
+SuperPrompt ..> A3ChunkStatus
 
 note right of Retriever
-  Updated retrieval design:
-  - no VectorStoreNP
-  - no DocScore return object
-  - no rerank call inside Retriever
+  Retrieval design:
   - reads TASK / PURPOSE / CONTEXT
   - splits query into pieces
-  - uses LogAvgExp over cosine similarities
-  - writes directly into SuperPrompt
+  - dense OpenAI branch
+  - SPLADE branch
+  - RRF merge
+  - writes fused Retrieval order
+  - Retrieval band capped at 50
+end note
+
+note right of Reranker
+  ReRanker design:
+  - consumes top-30 Retrieval chunks
+  - NLP_Splitter builds short query parts
+  - ColBERT reranks piecewise
+  - RRF fuses ColBERT with previous rank
+  - writes fused reranked order
 end note
 
 note bottom of SuperPrompt
-  Current implemented stage view:
   views_by_stage["retrieval"] =
-  ordered (chunk_id, stage_score, stage_status) triples
+  fused Retrieval ranking
+
+  views_by_stage["reranked"] =
+  fused Retrieval + ColBERT ranking
 end note
 
 @enduml

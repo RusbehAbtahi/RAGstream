@@ -41,6 +41,7 @@ class A4_Condenser:
 
 ### ~\ragstream\app\controller.py
 ```python
+# controller.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -69,6 +70,7 @@ from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
 # Added on 15.03.2026:
 # Deterministic Retrieval stage.
 from ragstream.retrieval.retriever import Retriever
+from ragstream.retrieval.reranker import Reranker
 
 
 class AppController:
@@ -115,6 +117,12 @@ class AppController:
             chroma_root=str(self.chroma_root),
         )
 
+        # Added on 31.03.2026:
+        # ReRanker is initialized once and re-used. It consumes the Retrieval
+        # candidates already stored in SuperPrompt and reorders them with the
+        # agreed cross-encoder model.
+        self.reranker = Reranker()
+
     def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
         """
         Keep EXACTLY the old behaviour:
@@ -132,6 +140,62 @@ class AppController:
         Run A2 on the current SuperPrompt.
         """
         return self.a2_promptshaper.run(sp)
+
+    # Added on 18.03.2026:
+    # Small demo helper for the future memory view in the GUI.
+    # This does NOT change A2 logic. It only builds one simple input/output
+    # record that can be appended by the Streamlit session layer.
+    def build_a2_memory_demo_entry(self, sp: SuperPrompt) -> dict[str, str]:
+        """
+        Build one demo memory entry for the A2 memory view.
+
+        The displayed INPUT contains only the three prompt parts that are
+        important for later retrieval-oriented memory usage:
+        TASK, PURPOSE, CONTEXT.
+
+        The displayed OUTPUT is intentionally dummy text for the demo phase.
+        """
+        input_text = self._build_a2_memory_demo_input(sp)
+        if not input_text:
+            input_text = "(empty)"
+        return {
+            "input_text": input_text,
+            "output_text": "XXXXX",
+            "tag": "Green",
+        }
+
+    def _build_a2_memory_demo_input(self, sp: SuperPrompt) -> str:
+        """
+        Build a simple plain-text prompt for the memory demo.
+
+        Design rule:
+        - Use the current SuperPrompt body after A2 has shaped it.
+        - Keep only TASK / PURPOSE / CONTEXT.
+        - Exclude SYSTEM / DEPTH / retrieval context / other fields.
+        - Return plain text, not markdown-oriented formatting.
+        """
+        lines: list[str] = []
+
+        task_value = (sp.body.get("task") or "").strip()
+        purpose_value = (sp.body.get("purpose") or "").strip()
+        context_value = (sp.body.get("context") or "").strip()
+
+        if task_value:
+            lines.append("TASK")
+            lines.append(task_value)
+            lines.append("")
+
+        if purpose_value:
+            lines.append("PURPOSE")
+            lines.append(purpose_value)
+            lines.append("")
+
+        if context_value:
+            lines.append("CONTEXT")
+            lines.append(context_value)
+            lines.append("")
+
+        return "\n".join(lines).strip()
 
     # Added on 15.03.2026:
     # Retrieval is a separate deterministic stage and must remain independent
@@ -162,6 +226,25 @@ class AppController:
             project_name=project_name,
             top_k=int(top_k),
         )
+
+    # Added on 31.03.2026:
+    # ReRanker is a separate deterministic stage after Retrieval. The controller
+    # only passes the current SuperPrompt and returns the same updated object.
+    def run_reranker(self, sp: SuperPrompt) -> SuperPrompt:
+        """
+        Run ReRanker on the current SuperPrompt.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt, typically after Retrieval.
+
+        Returns:
+            Updated SuperPrompt after ReRanker has populated:
+            - views_by_stage["reranked"]
+            - final_selection_ids
+            - stage / history_of_stages
+        """
+        return self.reranker.run(sp)
 
     # Added on 10.03.2026:
     # Project-based ingestion helpers for the new Streamlit buttons.
@@ -407,17 +490,22 @@ class AppController:
 
 ### ~\ragstream\app\ui_streamlit.py
 ```python
+# ui_streamlit.py
 # -*- coding: utf-8 -*-
 """
 Run on a free port, e.g.:
-  /home/rusbeh_ab/venvs/ragstream/bin/python -m streamlit run /home/rusbeh_ab/project/RAGstream/ragstream/app/ui_streamlit_2.py --server.port 8503
+  /home/rusbeh_ab/venvs/ragstream/bin/python -m streamlit run /home/rusbeh_ab/project/RAGstream/ragstream/app/ui_streamlit.py --server.port 8503
 """
 
 from __future__ import annotations
+import copy
+import html
+
 import streamlit as st
+
 from ragstream.app.controller import AppController
 from ragstream.orchestration.super_prompt import SuperPrompt
-import copy
+
 
 def main() -> None:
     st.set_page_config(page_title="RAGstream", layout="wide")
@@ -450,12 +538,52 @@ def main() -> None:
             div[data-testid="stHorizontalBlock"]{
                 gap: 0.4rem !important;
             }
+
+            .memory-box {
+                border-radius: 0.45rem;
+                padding: 0.55rem 0.7rem;
+                border: 1px solid #d8d8d8;
+                font-size: 0.95rem;
+                line-height: 1.35;
+                white-space: normal;
+                word-break: break-word;
+            }
+
+            .memory-input-box {
+                background-color: #ffffff;
+            }
+
+            .memory-output-box {
+                background-color: #f3f4f6;
+            }
+
+            .memory-label {
+                font-size: 0.82rem;
+                font-weight: 700;
+                margin-bottom: 0.25rem;
+                color: #4b5563;
+                letter-spacing: 0.02em;
+            }
+
+            .memory-plain-text {
+                white-space: pre-wrap;
+                font-size: 0.95rem;
+                line-height: 1.35;
+                margin: 0;
+                font-family: inherit;
+            }
+
+            /* Make small select boxes look compact */
+            div[data-baseweb="select"] > div {
+                min-height: 34px;
+            }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
     st.title("RAGstream")
+
     # one controller + one SuperPrompt per user session
     if "controller" not in st.session_state:
         st.session_state.controller = AppController()
@@ -467,6 +595,8 @@ def main() -> None:
         st.session_state.sp_a2 = SuperPrompt()
     if "sp_rtv" not in st.session_state:
         st.session_state.sp_rtv = SuperPrompt()
+    if "sp_rrk" not in st.session_state:
+        st.session_state.sp_rrk = SuperPrompt()
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
     if "ingestion_status" not in st.session_state:
@@ -474,12 +604,15 @@ def main() -> None:
     if "new_project_name" not in st.session_state:
         st.session_state["new_project_name"] = ""
     if "pending_active_project" not in st.session_state:
-        # Added on 10.03.2026:
         # Temporary project switch key. We use this instead of modifying
         # the widget-owned key "active_project" after that widget exists.
         st.session_state["pending_active_project"] = None
     if "retrieval_top_k" not in st.session_state:
         st.session_state["retrieval_top_k"] = 100
+    if "a2_memory_demo_entries" not in st.session_state:
+        st.session_state["a2_memory_demo_entries"] = []
+    if "a2_memory_demo_counter" not in st.session_state:
+        st.session_state["a2_memory_demo_counter"] = 0
 
     # Layout: gutters left/right, two main columns, small spacer between
     gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
@@ -487,8 +620,68 @@ def main() -> None:
     with gutter_l:
         st.empty()
 
-    # LEFT: Prompt + two rows of pipeline buttons
+    # LEFT: Memory Demo + Prompt + two rows of pipeline buttons
     with col_left:
+        st.markdown('<div class="field-title">MEMORY DEMO</div>', unsafe_allow_html=True)
+
+        memory_entries = st.session_state["a2_memory_demo_entries"]
+
+        try:
+            memory_container = st.container(height=780)
+        except TypeError:
+            memory_container = st.container()
+
+        with memory_container:
+            if not memory_entries:
+                st.info("No memory entries yet.")
+            else:
+                for entry in memory_entries:
+                    entry_id = entry["id"]
+                    tag_key = f"a2_memory_tag_{entry_id}"
+
+                    if tag_key not in st.session_state:
+                        st.session_state[tag_key] = entry.get("tag", "Green")
+
+                    input_col, tag_col = st.columns([8.8, 1.0], gap="small")
+
+                    with input_col:
+                        input_html = html.escape(entry.get("input_text", "")).replace("\n", "<br>")
+                        st.markdown(
+                            f"""
+                            <div class="memory-box memory-input-box">
+                                <div class="memory-label">INPUT</div>
+                                <div class="memory-plain-text">{input_html}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                    with tag_col:
+                        selected_tag = st.selectbox(
+                            "Tag",
+                            options=["Platin", "GOLD", "SILVER", "Green", "Black"],
+                            key=tag_key,
+                            index=["Platin", "GOLD", "SILVER", "Green", "Black"].index(
+                                st.session_state[tag_key]
+                            ),
+                            label_visibility="collapsed",
+                        )
+                        entry["tag"] = selected_tag
+
+                    output_html = html.escape(entry.get("output_text", "")).replace("\n", "<br>")
+                    st.markdown(
+                        f"""
+                        <div class="memory-box memory-output-box">
+                            <div class="memory-label">OUTPUT</div>
+                            <div class="memory-plain-text">{output_html}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("<div style='height:0.40rem'></div>", unsafe_allow_html=True)
+
+        st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
         st.markdown('<div class="field-title">Prompt</div>', unsafe_allow_html=True)
         st.text_area(
             label="Prompt (hidden)",
@@ -518,15 +711,27 @@ def main() -> None:
             if clicked_a2:
                 ctrl: AppController = st.session_state.controller
                 sp: SuperPrompt = st.session_state.sp
+
                 sp = ctrl.run_a2_promptshaper(sp)
+                entry = ctrl.build_a2_memory_demo_entry(sp)
+
+                next_id = st.session_state.get("a2_memory_demo_counter", 0) + 1
+                st.session_state["a2_memory_demo_counter"] = next_id
+                entry["id"] = next_id
+
+                st.session_state[f"a2_memory_tag_{next_id}"] = "Green"
+                st.session_state["a2_memory_demo_entries"].append(entry)
+
                 st.session_state.sp = sp
                 st.session_state.sp_a2 = copy.deepcopy(sp)
                 st.session_state["super_prompt_text"] = sp.prompt_ready
 
+                st.rerun()
+
         with b1c3:
             clicked_retrieval = st.button("Retrieval", key="btn_retrieval", use_container_width=True)
             if clicked_retrieval:
-                #try:
+                try:
                     ctrl: AppController = st.session_state.controller
                     sp: SuperPrompt = st.session_state.sp
 
@@ -548,11 +753,25 @@ def main() -> None:
                         st.session_state.sp_rtv = copy.deepcopy(sp)
                         st.session_state["super_prompt_text"] = sp.prompt_ready
 
-                #except Exception as e:
-                   # st.error(str(e))
+                except Exception as e:
+                    st.error(str(e))
 
         with b1c4:
-            st.button("ReRanker", key="btn_reranker", use_container_width=True)
+            clicked_reranker = st.button("ReRanker", key="btn_reranker", use_container_width=True)
+            if clicked_reranker:
+          #      try:
+                    ctrl: AppController = st.session_state.controller
+                    sp: SuperPrompt = st.session_state.sp
+
+                    sp = ctrl.run_reranker(sp)
+                    sp.compose_prompt_ready()
+
+                    st.session_state.sp = sp
+                    st.session_state.sp_rrk = copy.deepcopy(sp)
+                    st.session_state["super_prompt_text"] = sp.prompt_ready
+
+             #   except Exception as e:
+                #    st.error(str(e))
 
         # Row 2: 4 buttons
         b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")
@@ -573,14 +792,12 @@ def main() -> None:
             key="retrieval_top_k",
         )
 
-        # Added on 10.03.2026:
         # New project-based ingestion controls placed below the agent buttons.
         st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
 
         ctrl: AppController = st.session_state.controller
         projects = ctrl.list_projects()
 
-        # Added on 10.03.2026:
         # Apply requested project switch before the "active_project" widget
         # is created in this run. This avoids the Streamlit session-state error.
         pending_project = st.session_state.get("pending_active_project")
@@ -605,7 +822,6 @@ def main() -> None:
                 disabled=True,
             )
 
-        # Added on 10.03.2026:
         # Show the files that are actually ingested/embedded for the currently
         # active project by reading the standardized manifest through the controller.
         active_project = st.session_state.get("active_project")
@@ -613,7 +829,10 @@ def main() -> None:
             embedded_info = ctrl.get_embedded_files(active_project)
 
             st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-            st.markdown('<div class="field-title" style="font-size:1.05rem;">Embedded Files</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="field-title" style="font-size:1.05rem;">Embedded Files</div>',
+                unsafe_allow_html=True,
+            )
 
             if embedded_info.get("success"):
                 embedded_files = embedded_info.get("files", [])
@@ -646,10 +865,6 @@ def main() -> None:
                                 f"manifest: {result['manifest_path']}",
                             ],
                         }
-                        # Added on 10.03.2026:
-                        # Do not write directly to "active_project" here, because
-                        # that widget already exists in this run. Switch via a
-                        # temporary key and rerun safely.
                         st.session_state["pending_active_project"] = result["project_name"]
                         st.rerun()
                     except Exception as e:
@@ -663,9 +878,6 @@ def main() -> None:
             with st.form("add_files_form", clear_on_submit=False):
                 add_projects = ctrl.list_projects()
                 if add_projects:
-                    # Added on 10.03.2026:
-                    # Do not modify "active_project" here. Just derive a safe
-                    # default selection for the form-local project chooser.
                     current_active_project = st.session_state.get("active_project")
                     if current_active_project in add_projects:
                         default_add_project = current_active_project
@@ -709,9 +921,6 @@ def main() -> None:
                                         f"rejected: {item}" for item in result.get("rejected_files", [])
                                     ],
                                 }
-                                # Added on 10.03.2026:
-                                # Same safe pattern as above: switch the active
-                                # project through a temporary key, then rerun.
                                 st.session_state["pending_active_project"] = result["project_name"]
                                 st.rerun()
                             else:
@@ -731,7 +940,6 @@ def main() -> None:
                 else:
                     st.info("Create a project first, then add files.")
 
-        # Added on 10.03.2026:
         # Small status/debug area for the new ingestion workflow.
         status = st.session_state.get("ingestion_status")
         if status:
@@ -758,6 +966,7 @@ def main() -> None:
 
     with gutter_r:
         st.empty()
+
 
 if __name__ == "__main__":
     main()
@@ -2929,13 +3138,22 @@ class SuperPrompt:
 
         return "\n".join(lines).strip()
 
+    def _format_score(self, score: float) -> str:
+        """
+        Format numeric scores compactly for the Related Context headers.
+        """
+        return f"{float(score):.4f}".rstrip("0").rstrip(".")
+
     def _render_related_context_md(self) -> str:
         """
         Render a simple chunk-based context preview from the current selected chunks.
 
         Design intention:
         - The GUI should show only the selected chunk texts.
-        - Technical metadata such as ID, source, score, status, and span remain
+        - During Retrieval, show only Rt-Score in the chunk header.
+        - During ReRanker, show Rk-Score first and Rt-Score second.
+        - For other stages, keep the header simple.
+        - Technical metadata such as ID, source, status, and span remain
           inside SuperPrompt as internal structured data and are not rendered here.
         - If no chunks exist yet, this method returns an empty string and the caller
           simply skips the section.
@@ -2944,13 +3162,43 @@ class SuperPrompt:
         if not ordered_chunks:
             return ""
 
+        retrieval_score_map: Dict[str, float] = {
+            chunk_id: float(score)
+            for chunk_id, score, _status in self.views_by_stage.get("retrieval", [])
+        }
+
+        reranked_score_map: Dict[str, float] = {
+            chunk_id: float(score)
+            for chunk_id, score, _status in self.views_by_stage.get("reranked", [])
+        }
+
         lines: List[str] = []
         lines.append("## Related Context")
         lines.append("")
 
         chunk_counter = 1
         for chunk_obj in ordered_chunks:
-            lines.append(f"### Chunk {chunk_counter}")
+            header = f"### Chunk {chunk_counter}"
+
+            if self.stage == "retrieval":
+                rt_score = retrieval_score_map.get(chunk_obj.id)
+                if rt_score is not None:
+                    header = f"{header} [Rt-Score={self._format_score(rt_score)}]"
+
+            elif self.stage == "reranked":
+                rk_score = reranked_score_map.get(chunk_obj.id)
+                rt_score = retrieval_score_map.get(chunk_obj.id)
+
+                if rk_score is not None and rt_score is not None:
+                    header = (
+                        f"{header} "
+                        f"[Rk-Score={self._format_score(rk_score)}, "
+                        f"Rt-Score={self._format_score(rt_score)}]"
+                    )
+                elif rk_score is not None:
+                    header = f"{header} [Rk-Score={self._format_score(rk_score)}]"
+
+            lines.append(header)
             lines.append("")
             lines.append(chunk_obj.snippet.strip())
             lines.append("")
@@ -3511,16 +3759,313 @@ class DocScore:
 
 ### ~\ragstream\retrieval\reranker.py
 ```python
+# -*- coding: utf-8 -*-
 """
-Reranker
-========
-Cross-encoder reranking placeholder.
+reranker.py
+
+Purpose:
+    Deterministic ReRanker stage for RAGstream.
+
+Scope of this file:
+    - Read the Retrieval candidates already stored in the current SuperPrompt.
+    - Build one semantic reranking query from TASK / PURPOSE / CONTEXT.
+    - Clean chunk text dynamically before cross-encoder scoring.
+    - Score each (query, chunk_text) pair with a BERT-style cross-encoder.
+    - Sort the current candidate set by reranker score.
+    - Write the ReRanker stage result back into the same SuperPrompt.
+
+Non-goals:
+    - No Chroma query here.
+    - No raw-file hydration here.
+    - No A3 filtering here.
+    - No GUI rendering here.
+    - No final prompt composition here.
 """
-from typing import List
+
+from __future__ import annotations
+
+import re
+from typing import Dict, List, Tuple
+
+from sentence_transformers import CrossEncoder
+
+from ragstream.orchestration.super_prompt import A3ChunkStatus, SuperPrompt
+from ragstream.retrieval.chunk import Chunk
+
+
+# ---------------------------------------------------------------------
+# Module-level reranker defaults
+# ---------------------------------------------------------------------
+
+# Agreed current reranker model direction.
+DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+
+# Conceptual cap from the current requirement set for how many Retrieval
+# candidates should be passed into ReRanker.
+DEFAULT_RERANK_TOP_K = 50
+
+# Agreed current runtime direction: CPU-only deterministic stage.
+DEFAULT_DEVICE = "cpu"
+
 
 class Reranker:
-    def rerank(self, ids: List[str], query: str) -> List[str]:
-        return ids
+    """
+    Deterministic ReRanker stage for document chunks.
+
+    Design:
+    - Keep this class stateless with respect to pipeline history.
+      The evolving pipeline state lives in SuperPrompt.
+    - This class only reads the current SuperPrompt, computes reranking,
+      and writes the reranked result back into the same SuperPrompt.
+    - The controller decides when to call this class.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str = DEFAULT_RERANK_MODEL,
+        top_k: int = DEFAULT_RERANK_TOP_K,
+        device: str = DEFAULT_DEVICE,
+    ) -> None:
+        """
+        Initialize ReRanker with the agreed cross-encoder model.
+
+        Args:
+            model_name:
+                Hugging Face / SentenceTransformers model id for the reranker.
+            top_k:
+                Maximum number of Retrieval candidates to rerank.
+            device:
+                Runtime device. Current agreed direction is CPU.
+        """
+        self._model_name = model_name
+        self._top_k = int(top_k) if int(top_k) > 0 else DEFAULT_RERANK_TOP_K
+        self._device = device
+        self._cross_encoder = CrossEncoder(self._model_name, device=self._device)
+
+    # -----------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------
+
+    def run(self, sp: SuperPrompt) -> SuperPrompt:
+        """
+        Execute the ReRanker stage and update the same SuperPrompt in place.
+
+        Inputs:
+            sp:
+                The current evolving SuperPrompt, typically after Retrieval.
+
+        Returns:
+            The same SuperPrompt instance, mutated in place.
+
+        Effects on SuperPrompt:
+            - Writes the reranked stage snapshot into sp.views_by_stage["reranked"]
+            - Writes reranked chunk IDs into sp.final_selection_ids
+            - Appends "reranked" to sp.history_of_stages
+            - Sets sp.stage = "reranked"
+        """
+        query_text, retrieval_rows, chunk_lookup = self._prepare_inputs(sp)
+        scored_rows = self._score_pairs(query_text, retrieval_rows, chunk_lookup)
+        reranked_view, reranked_ids = self._build_reranked_view(scored_rows)
+
+        sp.views_by_stage["reranked"] = reranked_view
+        sp.final_selection_ids = reranked_ids
+        sp.stage = "reranked"
+        sp.history_of_stages.append("reranked")
+
+        return sp
+
+    # -----------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------
+
+    def _prepare_inputs(
+        self,
+        sp: SuperPrompt,
+    ) -> tuple[str, List[tuple[str, float, A3ChunkStatus]], Dict[str, Chunk]]:
+        """
+        Prepare the reranking job from the current SuperPrompt.
+
+        Responsibilities grouped here on purpose:
+        - validate stage and Retrieval availability,
+        - build one semantic query text from TASK / PURPOSE / CONTEXT,
+        - trim Retrieval rows to the active rerank cap,
+        - build chunk_id -> Chunk lookup from base_context_chunks.
+        """
+        if sp is None:
+            raise ValueError("Reranker.run: 'sp' must not be None")
+
+        retrieval_rows = sp.views_by_stage.get("retrieval")
+        if not retrieval_rows:
+            raise ValueError(
+                "Reranker.run: Retrieval candidates are missing. "
+                "Please run Retrieval before ReRanker."
+            )
+
+        if not sp.base_context_chunks:
+            raise ValueError(
+                "Reranker.run: base_context_chunks is empty. "
+                "Please run Retrieval before ReRanker."
+            )
+
+        query_blocks: List[str] = []
+
+        task = (sp.body.get("task") or "").strip()
+        purpose = (sp.body.get("purpose") or "").strip()
+        context = (sp.body.get("context") or "").strip()
+
+        if task:
+            query_blocks.append("## TASK")
+            query_blocks.append(task)
+            query_blocks.append("")
+
+        if purpose:
+            query_blocks.append("## PURPOSE")
+            query_blocks.append(purpose)
+            query_blocks.append("")
+
+        if context:
+            query_blocks.append("## CONTEXT")
+            query_blocks.append(context)
+            query_blocks.append("")
+
+        query_text = "\n".join(query_blocks).strip()
+        if not query_text:
+            raise ValueError(
+                "Reranker.run: reranking query is empty. "
+                "At least one of TASK / PURPOSE / CONTEXT must be present."
+            )
+
+        candidate_rows = list(retrieval_rows)
+        chunk_lookup = {chunk_obj.id: chunk_obj for chunk_obj in sp.base_context_chunks}
+
+        return query_text, candidate_rows, chunk_lookup
+
+    def _clean_chunk_text(self, text: str) -> str:
+        """
+        Clean one chunk dynamically before cross-encoder scoring.
+
+        Design intention:
+        - Remove obvious markdown / YAML / prompt-artifact rubbish.
+        - Keep the original stored Chunk unchanged.
+        - Stay conservative: preserve normal prose headings and content.
+        """
+        text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            return ""
+
+        metadata_key_re = re.compile(
+            r"^(title|author|version|updated|tags|date|created|modified|description)\s*:\s*.*$",
+            re.IGNORECASE,
+        )
+
+        lines = text.split("\n")
+        cleaned_lines: List[str] = []
+
+        front_matter_active = False
+        front_matter_checked = False
+        seen_content = False
+
+        for raw_line in lines:
+            line = raw_line.strip()
+
+            if not front_matter_checked:
+                if not line:
+                    continue
+                if line == "---":
+                    front_matter_active = True
+                    front_matter_checked = True
+                    continue
+                front_matter_checked = True
+
+            if front_matter_active:
+                if line in {"---", "..."}:
+                    front_matter_active = False
+                continue
+
+            if not line:
+                if seen_content and (not cleaned_lines or cleaned_lines[-1] != ""):
+                    cleaned_lines.append("")
+                continue
+
+            if line.startswith("```"):
+                continue
+            if line.lower().startswith("@@meta"):
+                continue
+            if line in {"### END_OF_PROMPT", "## END_OF_PROMPT", "END_OF_PROMPT"}:
+                continue
+            if metadata_key_re.match(line):
+                continue
+
+            cleaned_lines.append(line)
+            seen_content = True
+
+        while cleaned_lines and cleaned_lines[-1] == "":
+            cleaned_lines.pop()
+
+        return "\n".join(cleaned_lines).strip()
+
+    def _score_pairs(
+        self,
+        query_text: str,
+        retrieval_rows: List[tuple[str, float, A3ChunkStatus]],
+        chunk_lookup: Dict[str, Chunk],
+    ) -> List[Tuple[str, float]]:
+        """
+        Score all valid (query, chunk_text) pairs with the cross-encoder.
+
+        Returns:
+            List[(chunk_id, reranker_score)]
+
+        Important robustness rule:
+        - If one Retrieval row references a chunk ID that is no longer present
+          in base_context_chunks, skip that row instead of crashing the stage.
+        """
+        valid_ids: List[str] = []
+        pairs: List[tuple[str, str]] = []
+
+        for row in retrieval_rows:
+            chunk_id = row[0]
+            chunk_obj = chunk_lookup.get(chunk_id)
+            if chunk_obj is None:
+                continue
+
+            cleaned_snippet = self._clean_chunk_text(chunk_obj.snippet or "")
+            if not cleaned_snippet:
+                continue
+
+            valid_ids.append(chunk_id)
+            pairs.append((query_text, cleaned_snippet))
+
+        if not pairs:
+            raise ValueError(
+                "Reranker.run: no valid (query, chunk) pairs could be built from Retrieval output."
+            )
+
+        scores = self._cross_encoder.predict(pairs, convert_to_numpy=False)
+        return [(chunk_id, float(score)) for chunk_id, score in zip(valid_ids, scores)]
+
+    def _build_reranked_view(
+        self,
+        scored_rows: List[Tuple[str, float]],
+    ) -> tuple[List[tuple[str, float, A3ChunkStatus]], List[str]]:
+        """
+        Build the ordered ReRanker stage snapshot.
+
+        Deterministic sort:
+        1) higher reranker score first
+        2) stable fallback by chunk_id
+        """
+        scored_rows.sort(key=lambda row: (-row[1], row[0]))
+
+        reranked_view: List[tuple[str, float, A3ChunkStatus]] = []
+        reranked_ids: List[str] = []
+
+        for chunk_id, score in scored_rows:
+            reranked_view.append((chunk_id, score, A3ChunkStatus.SELECTED))
+            reranked_ids.append(chunk_id)
+
+        return reranked_view, reranked_ids
 ```
 
 ### ~\ragstream\retrieval\retriever.py
@@ -3584,8 +4129,8 @@ DEFAULT_QUERY_CHUNK_SIZE = 500
 DEFAULT_QUERY_OVERLAP = 100
 
 # Agreed retrieval aggregation constant:
-# score(chunk) = tau * log(mean(exp(sim_i / tau)))
-DEFAULT_LOGAVGEXP_TAU = 9.0
+#P value, for P Norm Averaging
+DEFAULT_P_NORM = 10
 
 
 class Retriever:
@@ -3838,10 +4383,11 @@ class Retriever:
         Q_norm = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-12)
         sims = A_norm @ Q_norm.T
 
-        # LogAvgExp aggregation over the query-piece axis.
-        # score(chunk) = tau * log(mean(exp(sim_i / tau)))
-        tau = float(DEFAULT_LOGAVGEXP_TAU)
-        aggregated_scores = tau * np.log(np.mean(np.exp(sims / tau), axis=1))
+        # P-mean aggregation over the query-piece axis.
+        # Strongly favors the best match, but is still not pure max.
+        p = DEFAULT_P_NORM
+        sims_pos = np.clip(sims, 0.0, None)
+        aggregated_scores = np.power(np.mean(np.power(sims_pos, p), axis=1), 1.0 / p)
 
         rows: List[Dict[str, Any]] = []
         for idx, chunk_id in enumerate(ids):

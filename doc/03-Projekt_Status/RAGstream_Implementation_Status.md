@@ -1,6 +1,6 @@
 # RAGstream_Implementation_Status.md
 
-Last update: 2026-03-16
+Last update: 07.04.2026
 
 Purpose:
 - This file is a compact implementation status snapshot.
@@ -19,9 +19,17 @@ RAGstream already has a stable foundation in four major layers:
 3. project-based Chroma ingestion with manifest-based file tracking,
 4. a working AWS Phase-1 deployment with persistent runtime data outside the image.
 
-The most recent implementation wave completed the first real context-selection stage: Retrieval. This means the pipeline now reaches from prompt input and A2 shaping to project-aware chunk selection from the active document database.
+The pipeline now reaches from prompt input and A2 shaping to project-aware chunk selection from the active document database, and it also includes a deterministic ReRanker stage.
 
-The next concrete implementation step is ReRanker. The selected direction is a BERT-style cross-encoder reranker that will read the Retrieval candidates already stored in `SuperPrompt`, produce a stronger semantic ranking, and then hand the reranked context to the later A3/A4/A5 / Prompt Builder stages.
+Current practical truth:
+- Retrieval is implemented and working.
+- ReRanker is implemented and working in code.
+- However, the current BERT-style reranker direction is not accepted as the long-term solution, because in practical tests it often worsened ranking quality instead of improving it.
+
+The currently agreed next implementation direction is no longer "implement ReRanker from zero", but rather:
+- keep the existing Retrieval / ReRanker stage structure,
+- replace the current reranking strategy with a stronger future direction,
+- and upgrade Retrieval itself into a hybrid retrieval stage.
 
 ---
 
@@ -36,7 +44,7 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - Project-based ingestion controls exist.
   - Active project selection exists.
   - Embedded-file display for the selected project exists.
-- The current GUI is therefore no longer only a visual shell. It already supports real operational flows for prompt processing and project/document handling. fileciteturn61file12 fileciteturn61file5
+- The current GUI supports prompt processing, project creation, file ingestion, active project selection, and embedded-file display.
 
 ### 2.2 Deterministic prompt preprocessing
 
@@ -45,7 +53,7 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - Schema-based field mapping exists.
   - MUST/default handling exists.
   - `prompt_ready` generation exists for the current preprocessing path.
-- This stage is already part of the live GUI/controller wiring and acts as the first normalization layer for user input. fileciteturn61file12
+- This stage is already part of the live GUI/controller wiring and acts as the first normalization layer for user input.
 
 ### 2.3 JSON-based agent architecture
 
@@ -60,7 +68,7 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - It calls the LLM.
   - It writes selected values back into `SuperPrompt`.
   - It updates stage/history.
-- This means the agent stack is not theoretical anymore. A2 is already a working live stage in the current app. fileciteturn61file12
+- A2 PromptShaper is implemented, wired into the app, and updates SuperPrompt through the JSON-based agent stack.
 
 ### 2.4 SuperPrompt as shared state
 
@@ -73,7 +81,7 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - recent conversation placeholder fields,
   - rendered prompt fields.
 - In the current implementation direction, `SuperPrompt` is the evolving shared state object across the pipeline rather than a one-off prompt string.
-- A general `compose_prompt_ready()` path is part of the recent implementation direction so that later stages can reuse one central render logic instead of keeping rendering scattered across multiple modules. fileciteturn62file18
+- A general `compose_prompt_ready()` path is part of the recent implementation direction so that later stages can reuse one central render logic instead of keeping rendering scattered across multiple modules.
 
 ### 2.5 Project-based ingestion
 
@@ -86,7 +94,7 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - `data/doc_raw/<project>`
   - `data/chroma_db/<project>`
   - `file_manifest.json` belongs to the matching project DB folder.
-- The embedded-files list for the active project is visible in the GUI through the manifest/controller path. fileciteturn61file12 fileciteturn61file14
+- The embedded-files list for the active project is visible in the GUI through the manifest/controller path.
 
 ### 2.6 Chroma-based document ingestion backend
 
@@ -98,11 +106,11 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - `IngestionManager` exists.
   - manifest-based diff/hash logic exists.
   - deterministic stable chunk IDs exist.
-- This layer is already aligned with the Chroma-based architecture and is no longer in the earlier NumPy-store phase. fileciteturn61file12 fileciteturn61file14
+- This layer is already aligned with the Chroma-based architecture and is no longer in the earlier NumPy-store phase.
 
-### 2.7 Retrieval is now implemented
+### 2.7 Retrieval is implemented
 
-- Retrieval is now a real implemented stage, not only a placeholder idea.
+- Retrieval is implemented as a deterministic, project-aware stage.
 - The implemented Retrieval stage is deterministic and project-aware.
 - Its logic is:
   - read retrieval query text from the current `SuperPrompt`,
@@ -110,20 +118,53 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - split the retrieval query into overlapping pieces,
   - read the active project's Chroma document store,
   - compare each stored chunk embedding against all query-piece embeddings,
-  - aggregate scores with LogAvgExp (`tau = 9`),
+  - aggregate scores with p-norm averaging,
+  - current runtime constant:
+    - `p = 10`
   - keep the top-k chunks,
   - reconstruct the real chunk text from `doc_raw/<project>` using the same chunking logic as ingestion,
   - write the result back into `SuperPrompt`.
-- Retrieval therefore already performs true context selection and not just abstract ranking. fileciteturn62file1 fileciteturn62file3
+- Retrieval ranks chunks, reconstructs their text from `doc_raw/<project>`, and writes the selected chunks into `base_context_chunks`.
 
 ### 2.8 Retrieval-related GUI/controller integration
 
 - The Retrieval Top-K field exists in the GUI.
 - The active project selector exists in the GUI.
-- Snapshot keys such as `sp_pre`, `sp_a2`, and `sp_rtv` were introduced in the recent implementation direction so that stage-specific prompt states can be preserved as snapshots rather than overwritten mentally.
-- The recent implementation direction also introduces Retrieval as the next live button path after PreProcessing and A2, together with `SuperPrompt`-based rendering of the selected context in the GUI. fileciteturn61file5 fileciteturn62file17
+- Snapshot keys such as `sp_pre`, `sp_a2`, `sp_rtv`, and `sp_rrk` exist so that stage-specific prompt states can be preserved as snapshots rather than overwritten mentally.
+- Retrieval is already a live button path after PreProcessing and A2.
+- ReRanker is also already wired as a live stage after Retrieval.
 
-### 2.9 AWS Phase-1 deployment
+### 2.9 ReRanker is implemented
+
+- ReRanker is implemented as a deterministic stage.
+- It is no longer only a planned step.
+- The currently implemented ReRanker direction is:
+  - BERT-style cross-encoder reranking
+  - CPU-only runtime
+  - current model:
+    - `cross-encoder/ms-marco-MiniLM-L-12-v2`
+- Its logic is:
+  - read the Retrieval candidates already stored in `SuperPrompt`,
+  - rebuild one reranking query from:
+    - `task`
+    - `purpose`
+    - `context`
+  - dynamically clean chunk text before scoring,
+  - score each `(query, chunk)` pair with the cross-encoder,
+  - sort by reranker score,
+  - write the reranked view back into `SuperPrompt`.
+- ReRanker reranks Retrieval candidates and writes the reranked view back into `SuperPrompt`.
+
+### 2.10 Why the current ReRanker direction is not accepted as final
+
+- Practical evaluation showed that the current BERT-style reranker often did not improve the already good Retrieval ranking.
+- In important real examples, it made the ranking worse:
+  - relevant chunks were demoted too aggressively,
+  - some weaker or less useful chunks were promoted,
+  - and the final ranking became less trustworthy than dense Retrieval alone.
+- Therefore the current BERT-style reranking direction is considered unsatisfactory as the future production direction.
+
+### 2.11 AWS Phase-1 deployment
 
 - AWS Phase-1 deployment is implemented and working.
 - The current live deployment already provides:
@@ -136,9 +177,9 @@ The next concrete implementation step is ReRanker. The selected direction is a B
   - persistent runtime data on EC2/EBS is working.
 - The public network path is already stable:
   - Route53 → AWS public IPv4 → EC2 Ubuntu host → nginx → Docker → Streamlit.
-- nginx is the public entry point, TLS terminates at nginx, and Streamlit runs behind it on port 8501. fileciteturn57file2 fileciteturn57file13
+- nginx is the public entry point, TLS terminates at nginx, and Streamlit runs behind it on port 8501.
 
-### 2.10 AWS runtime data separation
+### 2.12 AWS runtime data separation
 
 - The AWS runtime model is already correctly separated.
 - The Docker image is code-focused.
@@ -149,37 +190,32 @@ The next concrete implementation step is ReRanker. The selected direction is a B
 - The logical structure stays the same locally and on AWS:
   - `data/doc_raw/<project>`
   - `data/chroma_db/<project>`
-- This means project raw files and Chroma databases are persistent and survive container replacement. fileciteturn57file2
+- This means project raw files and Chroma databases are persistent and survive container replacement.
 
 ---
 
 ## 3. What exists only partially or as scaffold
 
-### 3.1 ReRanker
-
-- ReRanker is still the next major missing implemented stage.
-- The direction is already agreed, but the real working stage is not implemented yet.
-- In other words: Retrieval is now the first real context-selection step, but semantic reranking is still pending.
-
-### 3.2 A3 / A4 / A5 / Prompt Builder
+### 3.1 A3 / A4 / A5 / Prompt Builder
 
 - A3 NLI Gate is still at placeholder/scaffold level.
 - A4 Condenser is still at placeholder/scaffold level.
-- A5 Format Enforcer is not yet a real active working stage.
+- A5 Format Enforcer is not yet an active working stage.
 - Prompt Builder is still not the final authoritative assembly stage in practical code execution.
-- This means the late pipeline still remains to be implemented after Retrieval and ReRanker are stabilized. fileciteturn61file13
+- This means the late pipeline still remains to be implemented after the Retrieval / ReRanker direction is stabilized.
 
-### 3.3 Memory / conversation memory
+### 3.2 Memory / conversation memory
 
 - Memory files and architecture references exist.
 - Real history ingestion, episodic retrieval, and the two-layer memory model are not implemented yet as a working production path.
-- Conversation memory is still one of the largest remaining planned subsystems. fileciteturn61file13 fileciteturn61file14
+- Conversation memory is still one of the largest remaining planned subsystems.
 
-### 3.4 Selected older structural items
+### 3.3 Selected older structural items
 
 - Some older requirement/UML concepts still exist in documents at a higher level than the current code.
 - This is especially relevant where older wording still reflects:
-  - id-only retrieval stage views,
+  - earlier retrieval scoring wording,
+  - older reranker assumptions,
   - earlier rendering ownership assumptions,
   - or earlier retrieval-backend assumptions.
 - The current implementation direction is already more concrete than those older placeholders.
@@ -188,7 +224,7 @@ The next concrete implementation step is ReRanker. The selected direction is a B
 
 ## 4. Current implemented Retrieval details
 
-This section records the Retrieval stage more precisely because it is the most recent major completed step.
+This section records the Retrieval stage more precisely because it is already implemented and forms the current backbone.
 
 ### 4.1 Retrieval inputs
 
@@ -207,25 +243,27 @@ This section records the Retrieval stage more precisely because it is the most r
 - Current values:
   - `chunk_size = 500`
   - `overlap = 100`
+- Important:
+  - in the current codebase, this chunking is character-based, not token-based
 - Embedding model:
-  - `text-embedding-3-large` fileciteturn62file1
+  - `text-embedding-3-large`
 
 ### 4.3 Retrieval scoring
 
 - Similarity is computed between each stored chunk embedding and all query-piece embeddings.
 - Aggregation is not a simple max.
-- Current agreed retrieval score:
-  - LogAvgExp
-  - `tau = 9.0`
-- Retrieval remains deterministic and separate from ReRanker. fileciteturn62file1
+- Current implemented retrieval score:
+  - p-norm averaging
+  - `p = 10`
+- Retrieval remains deterministic and separate from ReRanker.
 
 ### 4.4 Retrieval output and write-back
 
 - Selected chunk objects are written into `base_context_chunks`.
-- Stage-specific retrieval output is written into `views_by_stage`.
+- Stage-specific retrieval output is written into `views_by_stage["retrieval"]`.
 - The currently selected order is written into `final_selection_ids`.
 - `stage` and `history_of_stages` are updated.
-- The GUI-visible Super-Prompt then shows a `## Related Context` section built from the selected chunks. fileciteturn62file1 fileciteturn62file18
+- The GUI-visible Super-Prompt then shows a `## Related Context` section built from the selected chunks.
 
 ### 4.5 Retrieval robustness
 
@@ -235,49 +273,102 @@ This section records the Retrieval stage more precisely because it is the most r
 
 ---
 
-## 5. Current agreed next step: ReRanker
+## 5. Current implemented ReRanker details
 
-The next implementation step is ReRanker.
+This section records the ReRanker stage more precisely because it is already implemented, even though the direction is not accepted as final.
 
-### 5.1 Why ReRanker is next
+### 5.1 ReRanker inputs
 
-- Retrieval is already fast and broad.
-- Retrieval is now good enough to collect candidate chunks from the right project database.
-- The next required improvement is precision, not recall.
-- ReRanker will therefore operate on the chunk set already selected by Retrieval.
+- Input object: current evolving `SuperPrompt`
+- ReRanking query source:
+  - `task`
+  - `purpose`
+  - `context`
+- Candidate source:
+  - Retrieval candidates already stored in `views_by_stage["retrieval"]`
+  - hydrated chunks already stored in `base_context_chunks`
 
-### 5.2 Selected ReRanker direction
+### 5.2 ReRanker model and runtime
 
-- The selected direction is a BERT-style cross-encoder reranker.
-- Current agreed model direction:
-  - `cross-encoder/ms-marco-MiniLM-L-6-v2`
-- The reranker will not replace Retrieval.
-- It will consume Retrieval results and produce a stronger semantic ranking.
+- Current model:
+  - `cross-encoder/ms-marco-MiniLM-L-12-v2`
+- Current runtime direction:
+  - CPU-only deterministic stage
 
-### 5.3 Planned ReRanker flow
+### 5.3 ReRanker behavior
 
-- Read the current `SuperPrompt`.
-- Read the chunk candidates already selected by Retrieval.
-- For each candidate chunk, score the pair:
-  - `(Prompt_MD, chunk_text)`
-- Sort the candidates by reranker score.
-- Keep the top reranked subset.
-- Write the reranked stage back into `SuperPrompt`.
-- Refresh the GUI-visible Super-Prompt from the updated object state.
+- Build one semantic reranking query from:
+  - `task`
+  - `purpose`
+  - `context`
+- Dynamically clean chunk text before scoring.
+- Score each `(query, chunk)` pair.
+- Sort by reranker score.
+- Write:
+  - `views_by_stage["reranked"]`
+  - `final_selection_ids`
+  - updated `stage`
+  - updated `history_of_stages`
 
-### 5.4 Expected practical effect
+### 5.4 Current practical conclusion
 
-- Retrieval remains the fast recall stage.
-- ReRanker becomes the precision-improving semantic stage.
-- This is the intended bridge from naive vector retrieval to stronger context quality before A3 and A4.
+- ReRanker is implemented.
+- ReRanker is usable for experimentation and analysis.
+- But the current BERT-style reranker is not accepted as the future stable strategy.
 
 ---
 
-## 6. Current AWS compute decision for the next phase
+## 6. Current agreed next implementation direction
+
+The next implementation direction is no longer "implement ReRanker from zero".
+The next implementation direction is to improve the current Retrieval / ReRanker design.
+
+### 6.1 Retrieval direction to change
+
+- Retrieval should move from:
+  - dense Retrieval only
+- toward:
+  - dense Retrieval
+  - plus SPLADE sparse retrieval
+  - plus RRF fusion
+- The future Retrieval stage should use a smaller result band:
+  - target direction:
+    - maximum 50 chunks
+
+### 6.2 ReRanker direction to change
+
+- The current BERT-style cross-encoder reranker should not remain the main long-term strategy.
+- The agreed future direction is:
+  - ColBERT instead of the current BERT-style reranker
+- ReRanking should operate only on a bounded candidate pool:
+  - target direction:
+    - top 30 Retrieval chunks
+
+### 6.3 Query splitting helper direction
+
+- A new helper or agent direction is agreed for the future ReRanker path:
+  - split long prompts into smaller meaning-based query parts under an upper token limit
+- This helper is intended for the future ColBERT path.
+- Detailed design belongs in the requirement files, not here.
+
+### 6.4 A3 direction to change
+
+- A3 should become a selection stage after ReRanking.
+- A3 should classify chunks with labels such as:
+  - `Must_Keep`
+  - `Useful`
+  - `BorderLine`
+  - `Discarded`
+- A3 should also detect duplicates / near-duplicates.
+- Detailed A3 behavior belongs in the requirement files, not here.
+
+---
+
+## 7. Current AWS compute decision for the next phase
 
 The current AWS deployment stays in place structurally.
 
-### 6.1 What remains unchanged
+### 7.1 What remains unchanged
 
 - ECR workflow remains unchanged.
 - Docker deployment model remains unchanged.
@@ -288,25 +379,25 @@ The current AWS deployment stays in place structurally.
 - EBS-backed runtime data remains unchanged.
 - The persistent runtime path model remains unchanged.
 
-### 6.2 What is planned to change
+### 7.2 What is planned to change
 
 - The current EC2 instance type is planned to be upgraded.
 - Direction:
   - from `t3.small`
   - to `m7i-flex.xlarge`
 
-### 6.3 Why this change is planned
+### 7.3 Why this change is planned
 
 - Retrieval is already working on the current deployment model.
-- ReRanker will be substantially more CPU/RAM-demanding than Retrieval.
+- ReRanking experiments and future ColBERT-related work will be more CPU/RAM-demanding than Retrieval alone.
 - The selected instance is intended to bring AWS runtime performance much closer to the local laptop class.
-- The goal is to make the future ReRanker stage practically usable on AWS without changing the surrounding deployment architecture.
+- The goal is to make the next retrieval/reranking phase practically usable on AWS without changing the surrounding deployment architecture.
 
 ---
 
-## 7. What this means operationally now
+## 8. What this means operationally now
 
-RAGstream has already passed the purely architectural/planning phase.
+RAGstream now includes working prompt processing, ingestion, retrieval, reranking, and AWS deployment layers.
 
 The system now has:
 - a working prompt entry path,
@@ -315,21 +406,25 @@ The system now has:
 - a working Chroma document store,
 - a working active-project GUI path,
 - a working AWS public deployment,
-- and a now-completed first Retrieval implementation wave.
+- a working Retrieval stage,
+- and a working ReRanker stage.
 
-The project is therefore no longer “planning + ingestion only.”
-The system now has a real first context-retrieval pipeline stage.
+The project now includes controller-driven prompt processing, ingestion, retrieval, and reranking in code.
+The system now has context retrieval and reranking stages in code.
 
 The immediate development focus is now clear:
-- implement ReRanker,
+- stabilize the Retrieval / ReRanker direction,
+- replace the current unsatisfactory reranking direction,
 - then continue with A3 / A4 / A5 / Prompt Builder,
 - while keeping the AWS deployment architecture stable and only increasing compute capacity where needed.
 
 ---
 
-## 8. Important note
+## 9. Important note
 
 - This file is an implementation status snapshot.
-- It records the current working system and the currently agreed next step.
+- It records the current working system and the currently agreed next direction.
 - It is intentionally more practical than the requirement files.
+- Future-direction sections here stay shorter on purpose.
+- The detailed behavioral design belongs in the requirement files.
 - If the implementation changes again, this file should be updated again accordingly.

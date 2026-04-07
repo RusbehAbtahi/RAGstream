@@ -43,8 +43,8 @@ package "Ingestion & Memory" {
 '──────────────────────────────────────────────────────────────
 package "RAG Pipeline & Retrieval" {
 
-    class Reranker
     class Retriever
+    class Reranker
 
     class A0_FileScopeSelector
     class A1_DCI
@@ -90,7 +90,6 @@ package "Controller & GUI" {
 ' 6) STRUCTURAL RELATIONSHIPS (NO CONTROLLER/GUI LINES)
 '──────────────────────────────────────────────────────────────
 
-' Inheritance for vector stores
 VectorStoreChroma -|> ChromaVectorStoreBase : specializes
 HistoryStoreChroma -|> ChromaVectorStoreBase : specializes
 
@@ -98,68 +97,87 @@ HistoryStoreChroma -|> ChromaVectorStoreBase : specializes
 ' INGESTION & MEMORY – FLOWS
 '──────────────────────────────────────────────────────────────
 
-DocumentLoader --> Chunker        : raw files → text chunks
-Chunker        --> Embedder       : chunks → vectors
-Embedder       --> VectorStoreChroma : vectors → Chroma collection
+DocumentLoader --> Chunker
+Chunker        --> Embedder
+Embedder       --> VectorStoreChroma
 
-IngestionManager --> DocumentLoader      : orchestrates load
-IngestionManager --> Chunker            : orchestrates split
-IngestionManager --> Embedder           : orchestrates embed
-IngestionManager --> VectorStoreChroma  : writes chunk vectors
-IngestionManager --> FileManifest       : diff & publish
+IngestionManager --> DocumentLoader
+IngestionManager --> Chunker
+IngestionManager --> Embedder
+IngestionManager --> VectorStoreChroma
+IngestionManager --> FileManifest
 
-FileManifest --> DocumentLoader   : provides relative paths
+FileManifest --> DocumentLoader
 
-Paths ..> DocumentLoader          : doc_root paths
-Paths ..> VectorStoreChroma       : chroma_db path
-Paths ..> ConversationLog         : logs path
-Paths ..> ConvMemStore            : convmem path
+Paths ..> DocumentLoader
+Paths ..> VectorStoreChroma
+Paths ..> ConversationLog
+Paths ..> ConvMemStore
 
-ConversationMemory --> ConversationLog       : reads recent (G)
-ConversationMemory --> HistoryStoreChroma    : reads episodic (E)
-ConversationMemory --> ConvMemStore          : metadata / fading
+ConversationMemory --> ConversationLog
+ConversationMemory --> HistoryStoreChroma
+ConversationMemory --> ConvMemStore
 
-HistoryIngestionWorker --> ConversationLog    : read new tail
-HistoryIngestionWorker --> HistoryStoreChroma : write snapshots
+HistoryIngestionWorker --> ConversationLog
+HistoryIngestionWorker --> HistoryStoreChroma
 
 '──────────────────────────────────────────────────────────────
 ' RETRIEVAL – FLOWS
 '──────────────────────────────────────────────────────────────
 
-Retriever --> ChromaVectorStoreBase : vector search
-Retriever --> Embedder              : encode query
+Retriever --> ChromaVectorStoreBase
+Retriever --> Embedder
+Retriever --> SuperPrompt
+
+Reranker --> SuperPrompt
 
 '──────────────────────────────────────────────────────────────
 ' RAG PIPELINE (A0…A5) & SUPERPROMPT
 '──────────────────────────────────────────────────────────────
 
-A0_FileScopeSelector --> FileManifest : select eligible files
-A1_DCI              --> FileManifest  : build ❖ FILES block
+A0_FileScopeSelector --> FileManifest
+A1_DCI              --> FileManifest
 
-A2_PromptShaper     --> SuperPrompt   : set intent/audience/etc.
-A3_NLIGate          --> SuperPrompt   : mark kept/dropped context
-A4_Condenser        --> SuperPrompt   : compress S_ctx
-A5_SchemaEnforcer   --> SuperPrompt   : validate / mark errors
-PromptBuilder       --> SuperPrompt   : build final prompt text
+A2_PromptShaper     --> SuperPrompt
+A3_NLIGate          --> SuperPrompt
+A4_Condenser        --> SuperPrompt
+A5_SchemaEnforcer   --> SuperPrompt
+PromptBuilder       --> SuperPrompt
 
 '──────────────────────────────────────────────────────────────
 ' AGENT STACK – FLOWS
 '──────────────────────────────────────────────────────────────
 
-AgentFactory --> AgentConfig      : load & validate JSON
-AgentFactory --> AgentPrompt      : build configured agent
+AgentFactory --> AgentConfig
+AgentFactory --> AgentPrompt
 
-AgentPrompt  --> LLMClient        : send messages
-AgentPrompt  --> JSONEnvelope     : wrap request/response
-AgentPrompt  --> AgentPromptValidationError : raise on invalid
+AgentPrompt  --> LLMClient
+AgentPrompt  --> JSONEnvelope
+AgentPrompt  --> AgentPromptValidationError
 
-LLMClient --> JSONEnvelope        : use as logical envelope
+LLMClient --> JSONEnvelope
 
 '──────────────────────────────────────────────────────────────
 ' CONFIG – BASIC WIRING (NO CONTROLLER/GUI LINES)
 '──────────────────────────────────────────────────────────────
 
-Settings ..> LLMClient            : model/api config
-Settings ..> Embedder             : embedding model config
+Settings ..> LLMClient
+Settings ..> Embedder
+
+note right of Retriever
+  Retrieval remains one stage in UML_All.
+  Detailed internals live in UML_Retrieval:
+  - dense retrieval
+  - SPLADE branch
+  - RRF merge
+end note
+
+note right of Reranker
+  ReRanker remains one stage in UML_All.
+  Detailed internals live in UML_Retrieval:
+  - NLP_Splitter
+  - ColBERT rerank
+  - fused final ranking
+end note
 
 @enduml

@@ -133,7 +133,13 @@ The intermediate GUI must provide at least the following UI elements:
    * Options correspond to directories under `data/chroma_db` (e.g. `Project1`, `Project2`, …).
    * The currently selected project name is passed to Retrieval/ReRanker so they know which DB to query.
 
-6. Minimal debug/status info
+6. Retrieval / ReRanker score display
+
+   * The intermediate GUI must support score-aware inspection for Retrieval and ReRanker.
+   * After Retrieval, the GUI should be able to show the fused Retrieval order together with the component Retrieval signals used for that order.
+   * After ReRanker, the GUI should be able to show the final reranked order together with the previous Retrieval ranking and the ReRanker-related score or rank data used for the fused final order.
+
+7. Minimal debug/status info
 
    * A small area (or a few lines) showing:
 
@@ -230,6 +236,9 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
 
    * In addition to the prompt text, the resulting `prompt_ready` should include a simple textual list of all retrieved raw chunks (RAG context) at the bottom or in a clearly separated block.
 
+   * The displayed order must reflect the final Retrieval ranking used by the stage.
+   * If the Retrieval stage uses more than one retrieval signal, the GUI may additionally show those component scores or ranks for debugging.
+
    * For the intermediate GUI, this can be a minimal debug list, e.g.:
 
      ```
@@ -251,6 +260,9 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
      [chunk_id_3] <snippet3...>
      ...
      ```
+
+   * The displayed order must reflect the final fused ReRanker result used by the stage.
+   * If the ReRanker stage uses more than one ranking signal, the GUI may additionally show those component scores or ranks for debugging.
 
 5. After “A3 – NLI Gate”
 
@@ -300,6 +312,17 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
    * `data/chroma_db/<project_name>`
 
 6. This GUI requirement does not require changes to the internal ingestion backend; it only requires correct GUI/controller wiring for project-based ingestion.
+
+3.3.4 Retrieval / ReRanker evolution compatibility
+
+1. The intermediate GUI must remain compatible if Retrieval evolves from one signal to multiple first-pass signals, as long as it still remains one button and one stage from the user perspective.
+
+2. The intermediate GUI must remain compatible if ReRanker evolves from one reranking model to a fused reranking stage, as long as it still remains one button and one stage from the user perspective.
+
+3. This means the GUI contract is stable at stage level even if the internal ranking logic becomes:
+
+   * multi-signal Retrieval, and/or
+   * fused ReRanker ranking.
 
 3.4 Non-goals for Intermediate GUI
 

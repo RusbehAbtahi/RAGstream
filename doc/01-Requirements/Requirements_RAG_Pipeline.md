@@ -11,7 +11,7 @@ Goal: define the 8-step RAG pipeline (A0…A5 + Prompt Builder), how each stage 
    * manually via the 8 GUI buttons in `ui_streamlit_2.py`, or
    * automatically by the controller in the same order.
 2. The canonical state carrier is `SuperPrompt` (class in `ragstream/orchestration/super_prompt.py`). All stages are **memoryless**: they take `(SuperPrompt, config)` as input, mutate it in a controlled way, and return it; no stage keeps its own long-lived internal memory.
-3. Retrieval and reranking are fully **deterministic**, running on CPU-only embeddings + cross-encoder as agreed. All other “A-agents” use the neutral agent stack (`AgentFactory`, `AgentPrompt`, `llm_client`) defined in `Requirements_AgentStack.md`.
+3. Retrieval and reranking are fully **deterministic** at ranking level. Retrieval uses CPU-friendly dense + sparse retrieval, and ReRanker uses a bounded late-interaction reranking stage. All other “A-agents” use the neutral agent stack (`AgentFactory`, `AgentPrompt`, `llm_client`) defined in `Requirements_AgentStack.md`.
 4. The pipeline is designed so that constants (N0, N1, …) are **configurable** via JSON/YAML; no hard-coded “magic numbers” are allowed in code.
 
 ---
@@ -50,9 +50,9 @@ Button sequence (manual mode), which is also the execution order in auto mode:
 | ---- | ------------------ | -------------- | -------------- | ------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1    | A0_PreProcessing   | `preprocessed` | Function/Agent | Deterministic + optional LLM fallback | Extractor + Chooser (if LLM enabled) | Canonicalize user prompt into `sp.body`, enforce MUST fields, build `prompt_ready`.                                                                     |
 | 2    | A2_PromptShaper    | `a2`           | Agent          | LLM-only                              | Chooser                              | Classify `system`, `audience`, `tone`, `depth`, `confidence` from task/context/purpose.                                                                 |
-| 3    | Retrieval          | `retrieval`    | Function       | No LLM                                | –                                    | Vector retrieval from conversation history + long-term memory, populate `base_context_chunks` and `views_by_stage["retrieval"]`.                        |
-| 4    | ReRanker           | `reranked`     | Function       | No LLM                                | –                                    | Cross-encoder reranking of top candidates, write `views_by_stage["reranked"]`.                                                                          |
-| 5    | A3_NLI_Gate        | `a3`           | Agent          | Hybrid                                | Chooser                              | LLM-based keep/drop decision on candidate chunks (relevance, contradiction, duplicates), write `views_by_stage["a3"]` and update `final_selection_ids`. |
+| 3    | Retrieval          | `retrieval`    | Function       | No LLM                                | –                                    | Hybrid first-pass retrieval (dense bi-encoder + SPLADE + RRF), populate `base_context_chunks` and `views_by_stage["retrieval"]`.                      |
+| 4    | ReRanker           | `reranked`     | Function       | Helper agent allowed for query split  | –                                    | Bounded ColBERT reranking of top Retrieval candidates, with query splitting and fused ranking written to `views_by_stage["reranked"]`.                |
+| 5    | A3_NLI_Gate        | `a3`           | Agent          | Hybrid                                | Multi-Chooser                        | LLM-based chunk labeling and duplicate marking on the reranked candidates, write `views_by_stage["a3"]` and update `final_selection_ids`.            |
 | 6    | A4_Condenser       | `a4`           | Agent          | LLM-only                              | Writer                               | Condense selected chunks into `S_CTX_MD`, enforce token budget, finalize `final_selection_ids`.                                                         |
 | 7    | A5_Format_Enforcer | `a5`           | Agent          | LLM-only                              | Writer/Extractor                     | Normalize instructions and output format rules in `sp.body`/`extras` so final answer obeys structure.                                                   |
 | 8    | Prompt_Builder     | (stays `a5`)   | Function       | No LLM                                | –                                    | Render `System_MD`, `Prompt_MD`, `S_CTX_MD`, `Attachments_MD`, final `prompt_ready` from `SuperPrompt`.                                                 |
@@ -81,15 +81,18 @@ The pipeline uses named limits instead of uncontrolled magic numbers. The curren
 * `QUERY_OVERLAP = 100`
 
   * Overlap between retrieval query pieces.
-* `DEFAULT_TOP_K = 100`
+* `DEFAULT_TOP_K = 50`
 
-  * Default GUI/runtime value for the number of retrieval candidates to keep.
-* `N1_RETR_MAX_CANDIDATES = 200`
+  * Default GUI/runtime value for the number of Retrieval candidates to keep.
+* `N1_RETR_MAX_CANDIDATES = 50`
 
-  * Conceptual upper cap for retrieval experiments and future config alignment.
-* `N2_RERANK_TOP_K = 50`
+  * Hard cap for the Retrieval result band after dense + SPLADE fusion.
+* `N2_RERANK_TOP_K = 30`
 
-  * Number of candidates from `views_by_stage["retrieval"]` passed into the cross-encoder reranker. (Matches the earlier “~50 candidates per query” decision.)
+  * Number of candidates from `views_by_stage["retrieval"]` passed into the ReRanker stage.
+* `N2B_SPLITTER_MAX_TOKENS = 32`
+
+  * Upper token limit for each meaning-based query part produced for the future ColBERT reranking path.
 * `N3_FINAL_SELECTION_MAX = 24`
 
   * Upper bound on `final_selection_ids` after A4 (token budget + readability constraint).
@@ -202,7 +205,7 @@ Inputs
 * Active project Chroma store (`data/chroma_db/<project>`), with raw source files in `data/doc_raw/<project>`.
 * Config:
 
-  * runtime `top_k`, query `chunk_size`, query `overlap`, embedding model name, τ for LogAvgExp.
+  * runtime `top_k`, query `chunk_size`, query `overlap`, dense embedding model name, SPLADE model/config, and RRF parameters.
 
 Behaviour
 
@@ -227,43 +230,48 @@ The retrieval step remains independent from ReRanker and A3.
 
 Purpose
 
-* Use a cross-encoder to refine the ranking of the top candidates from Retrieval, independent of embedding geometry.
+* Use a bounded late-interaction reranker to refine the ranking of the top candidates from Retrieval without discarding the Retrieval backbone.
 
 Nature
 
 * Kind: Function.
-* Type: deterministic.
+* Type: deterministic at ranking level, with an optional helper agent for query splitting.
 
 Inputs
 
 * `sp: SuperPrompt` with `stage="retrieval"`.
-* Candidate stage snapshots: `sp.views_by_stage["retrieval"][:N2_RERANK_TOP_K]`.
-* Model: `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+* Candidate stage snapshots: first `N2_RERANK_TOP_K` items from `sp.views_by_stage["retrieval"]`.
+* ReRanker model direction: ColBERT.
+* Optional helper agent: `NLP_Splitter`.
 
 Behaviour
 
-1. Render a **single query string** `Prompt_MD` from `sp.body` (task/purpose/context/format) for reranking; do **not** include `System_MD` or attachments.
-2. For each candidate snapshot (up to `N2_RERANK_TOP_K`), read its `chunk_id`, look up the corresponding `Chunk` text (`snippet`), and run the cross-encoder on `(Prompt_MD, snippet)`.
-3. Sort by cross-encoder score descending and write:
+1. Build the ReRanker query source from `sp.body["task"]`, `sp.body["context"]`, and `sp.body["purpose"]`.
+2. If the query is short enough for the active ColBERT configuration, use it directly.
+3. If the query is too long, call the helper agent `NLP_Splitter` to produce several meaning-based query parts under the configured token limit `N2B_SPLITTER_MAX_TOKENS`.
+4. For each query part, run ColBERT against the bounded candidate pool from Retrieval.
+5. Fuse the per-part ColBERT rankings into one ColBERT ranking.
+6. Fuse that ColBERT ranking with the previous Retrieval ranking for the same top-30 candidate pool.
+7. Write:
 
-   * `sp.views_by_stage["reranked"] = [(chunk_id, rerank_score, SELECTED), ...]` in the new order.
-4. Update:
+   * `sp.views_by_stage["reranked"] = [(chunk_id, reranked_fused_score, SELECTED), ...]` in the new fused order.
+8. Update:
 
    * `sp.final_selection_ids` to the reranked ids for the current intermediate view.
    * `sp.stage = "reranked"`; append history.
 
-Still no mutations to `final_selection_ids`.
+ReRanker must therefore act as a bounded refinement stage, not as a blind overwrite of the Retrieval backbone.
 
 ### 5.5 A3_NLI_Gate
 
 Purpose
 
-* Filter and clean the reranked list using an LLM as a **semantic gate** (NLI / contradiction / redundancy checks).
+* Filter and clean the reranked list using an LLM as a semantic gate and structured chunk labeler.
 
 Nature
 
 * Kind: Agent.
-* Type: **Hybrid**: Python pre-filters + LLM Chooser.
+* Type: **Hybrid**: optional Python pre-filters + LLM Multi-Chooser.
 
 Inputs
 
@@ -272,29 +280,37 @@ Inputs
 * A3 agent config JSON (via AgentFactory), including:
 
   * max candidates to consider,
-  * NLI labels / thresholds,
-  * allowed decisions: `{keep, drop_irrelevant, drop_duplicate, drop_conflict}`, etc.
+  * allowed labels,
+  * duplicate-detection fields,
+  * final-selection policy parameters.
 
 Behaviour
 
 1. Optional deterministic pre-filter:
 
-   * Cap candidates to a working set (e.g. first 80) to keep the LLM payload manageable.
+   * Cap candidates to the working set produced by ReRanker.
    * Remove obviously empty or trivial chunks.
-2. Build an A3 AgentPrompt (Chooser over many items):
+2. Build an A3 AgentPrompt (Multi-Chooser over many items):
 
-   * Input payload: `Prompt_MD` + a numbered list of candidate summaries `(id, short snippet, source)`.
-   * Enums: for each candidate id, the agent must choose `keep` or `drop`, possibly with a tag (`duplicate`, `off-topic`, `conflicting`).
-3. Call LLM via llm_client; parse the JSON response; keep only candidates with `decision == "keep"`.
-4. Write:
+   * Input payload: the current prompt plus the ordered list of reranked candidate chunks.
+   * Output: one structured decision per chunk.
+3. Call LLM via llm_client and parse the JSON response.
+4. For each candidate chunk, A3 assigns one label from the agreed set, for example:
 
-   * `sp.views_by_stage["a3"] = [(chunk_id, a3_score, a3_status), ...]`, where selected items use `a3_score = 1.0`, rejected items use `0.0`, and `a3_status` captures `SELECTED / DISCARDED / DUPLICATED`.
-   * `sp.final_selection_ids` becomes the ordered list of kept ids (initial final selection).
-5. Update stage:
+   * `Must_Keep`
+   * `Useful`
+   * `BorderLine`
+   * `Discarded`
+5. A3 also marks duplicates / near-duplicates. If two chunks are effectively the same in meaning, only the weaker-ranked chunk is marked as duplicated and points to the stronger `chunk_id`.
+6. Write:
+
+   * `sp.views_by_stage["a3"] = [(chunk_id, a3_score, a3_status), ...]`.
+   * `sp.final_selection_ids` becomes the ordered list that survives A3, with a target corridor from a small minimum working set up to `N3_FINAL_SELECTION_MAX`.
+7. Update stage:
 
    * `sp.stage = "a3"`; append history.
 
-A3 must **never** mutate `Chunk` contents; it only changes which ids survive.
+A3 must **never** mutate `Chunk` contents; it only changes labels, duplicate markers, and which ids survive.
 
 ### 5.6 A4_Condenser
 
@@ -448,7 +464,7 @@ The RAG pipeline is considered correctly implemented when:
 3. The number of candidates at each stage respects the N-constants:
 
    * `len(views_by_stage["retrieval"]) ≤ N1_RETR_MAX_CANDIDATES`,
-   * candidates passed to the cross-encoder ≤ `N2_RERANK_TOP_K`,
+   * candidates passed to ReRanker ≤ `N2_RERANK_TOP_K`,
    * `len(final_selection_ids) ≤ N3_FINAL_SELECTION_MAX`.
 4. Turning LLM fallbacks off (A0 semantic mapping, A3, A4, A5) either:
 

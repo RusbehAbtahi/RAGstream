@@ -1,14 +1,47 @@
 # RAGstream
 
-RAGstream is a local-first RAG workbench for building transparent, controllable multi-agent pipelines around large language models. It ingests project documents into local vector stores (Chroma), runs a deterministic retrieval and reranking pipeline, and then assembles an explicit Super-Prompt that can be sent either to the ChatGPT UI or to APIs. Each intelligent step (prompt shaping, semantic gating, condensation, format enforcement) is implemented as a stateless agent whose behaviour is defined as data rather than hard-coded logic: JSON configurations are interpreted by an AgentFactory, so agents can be versioned and evolved like a small database. On top of this, the project is evolving toward a richer GUI where multi-project database selection, tagged conversation history (e.g. GOLD / SILVER / RED / BLUE), and V-model-inspired tooling for software-engineering tasks are orchestrated through the same agent stack.
+RAGstream is a local-first RAG workbench for building transparent, controllable pipelines around large language models. It ingests project documents into local vector stores, runs a deterministic retrieval and reranking path, and assembles an explicit Super-Prompt that can be sent either to the ChatGPT UI or to APIs. LLM-based stages are routed through a neutral Agent Stack (`AgentFactory`, `AgentPrompt`, `llm_client`) so that agent behavior is defined by JSON configurations rather than scattered prompt logic.
 
-The emphasis here is on *transparent RAG*: human-agent orchestration, deterministic where possible, and explicit about which parts are LLM-driven and which are pure retrieval / control logic.
+Current implementation focus is already beyond pure planning. A0_PreProcessing, A2_PromptShaper, project-scoped ingestion, and Retrieval are implemented and wired. ReRanker is also implemented in code and currently being redesigned after practical evaluation. Memory and tag-aware history management are under active development: the current GUI already exposes a development-side memory prototype, while the durable history ingestion and retrieval path remains under construction.
+
+RAGstream is also already deployed on AWS. The current deployment uses GitHub Actions for image build/push, Amazon ECR as the image registry, EC2 + Docker for runtime, nginx for reverse proxy and TLS termination, Route 53 for DNS, SSM Parameter Store for secrets, and EBS-backed persistent runtime data outside the image.
+
+The emphasis here is transparent RAG: human-agent orchestration, deterministic where possible, and explicit about which parts are LLM-driven and which parts are retrieval, selection, or control logic.
+
+---
+
+## Deployment & DevOps
+
+RAGstream already has a working Phase-1 deployment path. Public traffic goes through HTTPS to nginx on EC2, and the application runs inside Docker behind the reverse proxy. Runtime project data is stored outside the image so that ingested files and Chroma databases survive container replacement. Detailed operational steps live in `RAGstream_AWS_Deployment_Guide_v02.md` and `RAGstream_HTTP_Proxy_Arch.md`.
+
+```mermaid
+flowchart LR
+  DEV[Developer] --> GH[GitHub Repository]
+  GH --> GA[GitHub Actions]
+  GA --> ECR[Amazon ECR]
+  ECR --> EC2[EC2 Runtime]
+  EC2 --> DOCKER[Docker Container]
+  DOCKER --> NGINX[nginx Reverse Proxy]
+  NGINX --> HTTPS[HTTPS Endpoint]
+```
+
+```mermaid
+flowchart LR
+  USER[Browser] --> DNS[Route 53]
+  DNS --> EC2[EC2 Public IP]
+  EC2 --> NGINX[nginx :80/:443]
+  NGINX --> APP[Docker / Streamlit]
+  APP --> DATA[EBS-backed runtime data]
+  EC2 --> SSM[SSM Parameter Store]
+```
+
+Near-term deployment direction remains incremental rather than architectural replacement. The current path stays GitHub Actions -> ECR -> EC2 -> Docker -> nginx, while later authentication and user-facing control can be extended further, for example with Cognito-based flows that are already documented as future work in the deployment and GUI requirements.
 
 ---
 
 ## Architecture
 
-At a high level, RAGstream keeps ingestion and retrieval strictly separated from generation, runs a linear 8-step RAG pipeline inside a Controller, and uses a neutral “Agent Stack” (AgentFactory + AgentPrompt + llm_client) to instantiate all LLM-based agents before composing the final Super-Prompt.
+At a high level, RAGstream keeps ingestion and retrieval separated from generation, runs a linear 8-step RAG pipeline inside a Controller, and uses a neutral Agent Stack (`AgentFactory` + `AgentPrompt` + `llm_client`) for all LLM-based stages.
 
 ```mermaid
 flowchart TD
@@ -19,36 +52,38 @@ flowchart TD
     CHK["Chunker"]
     EMB["Embedder (OpenAI text-embedding-3-large)"]
     VS["VectorStore (Chroma, on-disk)"]
-    FM["FileManifest (path, sha256, mtime, size)"]
+    FM["FileManifest"]
+    MEM["History / Tags (under development)"]
 
     IM --> LDR --> CHK --> EMB --> VS
     IM --> FM
+    MEM --> VS
   end
 
   subgraph "Application"
-    UI["Streamlit GUI (manual 8-step pipeline)"]
+    UI["Streamlit GUI"]
     CTRL["Controller"]
 
     subgraph "RAG Pipeline"
-      A0["A0_PreProcessing (normalize + schema)"]
+      A0["A0_PreProcessing"]
       A2["A2 PromptShaper"]
-      N1["N1_Retrieval"]
-      N2["N2_Reranker"]
+      RET["Retrieval"]
+      RRK["ReRanker"]
       A3["A3 NLI Gate"]
-      A4["A4 Context Condenser (S_CTX)"]
+      A4["A4 Condenser"]
       A5["A5 Format Enforcer"]
-      PB["PromptBuilder (SuperPrompt)"]
+      PB["PromptBuilder"]
     end
 
     subgraph "Agent Stack"
-      AF["AgentFactory (JSON-defined agents)"]
-      AP["AgentPrompt (wire-format builder)"]
-      LLM["llm_client (OpenAI / future backends)"]
+      AF["AgentFactory"]
+      AP["AgentPrompt"]
+      LLM["llm_client"]
     end
   end
 
   UI --> CTRL
-  CTRL --> A0 --> A2 --> N1 --> N2 --> A3 --> A4 --> A5 --> PB
+  CTRL --> A0 --> A2 --> RET --> RRK --> A3 --> A4 --> A5 --> PB
 
   A2 --> AF
   A3 --> AF
@@ -56,28 +91,28 @@ flowchart TD
   A5 --> AF
   AF --> AP --> LLM
 
-  N1 --> VS
+  RET --> VS
 ```
 
 ### Design principles
 
 - **Local-first, inspectable**  
-  All project data lives in a local directory tree (documents, Chroma DBs, logs, JSON configs). You can see and version everything in Git.
+  Project data lives in a local directory tree (documents, Chroma DBs, logs, JSON configs). The same relative runtime structure is preserved on AWS through the EC2 bind mount.
 
 - **Explicit file and context control**  
-  Ingestion and retrieval keep track of *what* is in memory. The long-term goal is that you can always answer: “Which files and chunks are influencing this answer, and why?”
+  Ingestion and retrieval keep track of which files, chunks, and later history items are eligible to influence a run.
 
-- **Agents as orthogonal, data-defined modules**  
-  A0/A2/A3/A4/A5 are stateless agents configured by JSON files (loaded via `AgentFactory`). Behaviour lives in data; Python classes just interpret that data. This makes agents easier to version, compare, and evolve.
+- **Agent Stack as neutral infrastructure**  
+  A2, A3, A4, A5, and future helper agents use a neutral, stateless Agent Stack. A0_PreProcessing remains primarily deterministic, with optional LLM help later.
 
 - **Separation of concerns**  
-  Ingestion, retrieval, agent logic, and GUI are separate packages. The Controller glues them together but does not hide the stages.
+  Ingestion, retrieval, agent logic, controller orchestration, and GUI remain separate packages. The Controller wires stages together without hiding them.
 
 - **LLM-neutral**  
-  The `llm_client` is designed to talk to OpenAI models first (both base and fine-tuned), but the interface is meant to be extendable to local SLMs/LLMs (TinyLlama, etc.) or other cloud backends later.
+  `llm_client` talks to OpenAI models today and is designed so that future backends can be added without changing stage contracts.
 
-- **History and attention as first-class concepts (future)**  
-  Conversation history will be ingested into the same memory system with tags (e.g. GOLD/SILVER/RED/BLUE), decay, and project labels, so that attention over time can be controlled explicitly rather than implicitly.
+- **Transparent evolution path**  
+  The implementation is documented through requirements, UML, architecture, deployment notes, and implementation-status snapshots so that code and documentation can evolve in a controlled way.
 
 ---
 
@@ -85,127 +120,85 @@ flowchart TD
 
 ### Ingestion & Memory
 
-Static documents and, later, conversation history are ingested through the same pipeline.
+Static documents are ingested through a deterministic pipeline.
 
 - **Loader (`ingestion/loader.py`)**  
-  Walks a raw document directory (`data/doc_raw/<project>/`), reads supported files (`.txt`, `.md`, `.json`, `.yml` for now), and emits document objects.
+  Walks a raw document directory (`data/doc_raw/<project>/`) and reads the supported source files.
 
 - **Chunker (`ingestion/chunker.py`)**  
-  Splits each document into semantic chunks (headings, paragraphs, code blocks) with size and overlap suitable for retrieval.
+  Splits each document into chunks with configurable size and overlap. The current implementation is deterministic and character-based.
 
 - **Embedder (`ingestion/embedder.py`)**  
   Uses OpenAI `text-embedding-3-large` (configurable) to embed chunks into vectors.
 
 - **Vector stores**  
-  - **Layer-E (embeddings)**: ChromaDB on-disk collections under `data/chroma_db/<project>/`. Used by N1_Retrieval and N2_Reranker.  
-  - **History embeddings (future)**: conversation turns stored in a shared “history” Chroma collection, with tags (`project`, `session_id`, `tags[]`, etc.) and decay weights.
+  - **Document store**: ChromaDB collections under `data/chroma_db/<project>/`.  
+  - **History store**: a separate tagged history layer is planned and partially reflected in the architecture and GUI work, but is not yet complete as a durable production path.
 
-- **File manifest (`ingestion/file_manifest.py`) — Layer-G**  
-  A manifest stored as JSON tracks each raw file (path, hash, mtime, size). It is used to:
-  - Detect changes and re-embed only what changed.
-  - Provide a “file-level” view of what the system knows, independent of chunk embeddings.
+- **File manifest (`ingestion/file_manifest.py`)**  
+  A JSON manifest tracks each raw file (path, hash, mtime, size) so that ingestion can update only changed content and keep the persistent store traceable.
 
-In later phases, the same abstractions will be reused for conversation history:
-
-- All question/answer pairs will be written to a log file and ingested into a history Chroma collection.
-- Each entry will carry tags (e.g. `["GOLD"]`, `["OFF_TOPIC"]`, `["PROJECT:RAGstream"]`) so that retrieval can filter by both semantic similarity and explicit user tags.
-- Multiple histories can be combined by importing selected tagged turns from other sessions.
+Memory management is under active development. The current GUI already contains a development-side memory panel and tag semantics, while the durable history log, history embeddings, and tag-aware retrieval rules are still being built from the requirements and backlog.
 
 ### Retrieval & Ranking
 
-Retrieval is implemented as separate, stateless modules so that they can be reused and composed in the Controller.
+Retrieval and reranking are separate deterministic stages.
 
-- **N1_Retrieval (`retrieval/retriever.py`)**  
-  - Given a query (from PreProcessing / A2) and a selected Chroma collection, returns the top-K candidate chunks.  
-  - Supports multi-DB use: the Controller can call N1 on different `project` collections and then merge or keep them separate.  
-  - Purely deterministic: no LLM involved.
+- **Retrieval (`retrieval/retriever.py`)**  
+  - Current implementation: project-aware dense retrieval using OpenAI embeddings, query splitting, and p-norm aggregation over query pieces.  
+  - Current agreed next direction: hybrid first-pass retrieval with dense retrieval + SPLADE + RRF.
 
-- **N2_Reranker (`retrieval/reranker.py`)**  
-  - Takes candidate chunks from N1 and re-scores them using a cross-encoder or LLM-based scoring (e.g. E-BERT or an OpenAI model).  
-  - Returns a smaller, better-ordered list of chunks plus metadata (scores, file origins).  
-  - Designed so that the same reranker can be reused for both documents and history.
+- **ReRanker (`retrieval/reranker.py`)**  
+  - Current implementation: CPU-based cross-encoder reranking with `cross-encoder/ms-marco-MiniLM-L-12-v2`, dynamic chunk cleaning, and direct reranked ordering.  
+  - Current agreed next direction: bounded ColBERT reranking on the Retrieval candidate band, with query splitting and fused ranking instead of full ranking replacement.
 
-The output of N2 feeds into A3 (NLI Gate) and then A4 (Context Condenser).
+The current practical conclusion is simple: Retrieval already works well enough to serve as the backbone; the current ReRanker exists in code but is being replaced as a long-term ranking strategy.
 
 ### Agents inside the Controller
 
-Agents are stateless *runners* that orchestrate the LLM-based parts of the pipeline. All of them rely on the `AgentStack`:
+LLM-based stages are orchestrated through the Agent Stack.
 
-- `AgentFactory.py` loads a JSON config for a given agent name/version and builds an `AgentPrompt` instance.
-- `AgentPrompt.py` holds neutral fields like:
-  - `system_text`, `purpose_text`
-  - `input_payload` (e.g. `{task, purpose, context}` for A2)
-  - `enums` (forced choices for labels)
-  - `agent_type` (Chooser / Writer / Extractor)
-- `llm_client.py` takes `AgentPrompt` plus a model ID (base or fine-tuned) and returns a parsed result.
+- `AgentFactory` loads the JSON config for a given agent name/version and builds a configured `AgentPrompt`.
+- `AgentPrompt` holds the neutral prompt-composition and validation logic.
+- `llm_client` executes the actual model call.
 
-On top of this neutral stack, we define concrete agents:
+On top of this infrastructure, the pipeline uses concrete stages:
 
 - **A0_PreProcessing**  
-  - Nature: function today; can become Hybrid (function + agent) later.  
-  - Responsibility:
-    - Normalise raw user input: detect if it is free text, Markdown, JSON, TOON, YAML, etc.  
-    - Map it into the internal SuperPrompt schema (`SYSTEM / AUDIENCE / TASK / PURPOSE / CONTEXT / TONE / CONFIDENCE`), using deterministic rules and, optionally, an LLM helper.  
-  - Output: an initial `SuperPrompt` instance and a `prompt_ready` flag.
+  Deterministic normalization and schema mapping from raw prompt text into the internal SuperPrompt structure.
 
 - **A2 PromptShaper**  
-  - Type: *Chooser* agent (LLM-only).  
-  - Input: `task`, `purpose`, `context` from the SuperPrompt (plus any pre-filled hints).  
-  - Uses enums for:
-    - `system` roles (e.g. Python programmer, AWS architect, friend, etc.; up to 1–3 roles)
-    - `audience`, `tone`, `response_depth`, `confidence`  
-  - Output: five labels (system, audience, tone, response_depth, confidence) that are written back into the SuperPrompt. The same fine-tuned model (A2) can be used in 2 passes:
-    1. Infer the labels from `task/purpose/context`.
-    2. Optionally re-check its own decision by seeing the full SuperPrompt.
-
-- **N1_Retrieval**  
-  - Not an agent; purely deterministic, described above.
-
-- **N2_Reranker**  
-  - Also deterministic (or numeric/model-driven without acting as an “agent”); described above.
+  Chooser-style agent that classifies `system`, `audience`, `tone`, `depth`, and `confidence` from `task`, `purpose`, and `context`.
 
 - **A3 NLI Gate**  
-  - Type: *Hybrid Chooser* agent.  
-  - Input: ranked chunks from N2 and the SuperPrompt.  
-  - Task: decide which chunks *really* belong to the current question, using NLI-style decisions (entails / contradicts / irrelevant).  
-  - Output: `final_selection_ids` — a pruned list of chunks that will be condensed.
+  Current agreed direction: Multi-Chooser-style chunk labeling and duplicate marking on the reranked candidate set.
 
 - **A4 Context Condenser**  
-  - Type: *Writer* agent (LLM-only).  
-  - Input: selected chunks + the SuperPrompt.  
-  - Task: write `S_CTX_MD`, the condensed context block used in the final prompt, structured as:
-    - Facts
-    - Constraints
-    - Open issues / questions  
-  - Output: a compact markdown context that the LLM can “think from,” instead of raw chunk soup.
+  Writer-style agent that produces `S_CTX_MD` from the selected chunks.
 
 - **A5 Format Enforcer**  
-  - Type: *Writer / Extractor* agent (LLM-only).  
-  - Task: ensure that the final SuperPrompt and expected answer format follow a strict JSON / Markdown / code template (depending on the use case).  
-  - This is where “contract style” prompts live.
+  Writer / Extractor-style agent that normalizes the final response contract.
 
-- **PromptBuilder (deterministic)**  
-  - Pure Python. Takes the SuperPrompt object (with fields filled by A0/A2/A4/A5 and retrieval output) and composes the final prompt string that will be sent to the LLM (or shown in the GUI for manual copy-paste).
+- **PromptBuilder**  
+  Deterministic assembly of the final prompt blocks from the SuperPrompt.
 
 ### Prompt orchestration
 
-The final prompt is built from a small number of explicit regions. A simplified mental model looks like this:
+The final prompt is built from a small number of explicit regions.
 
 ```text
 [RAG Context]
 
 1. Hard Rules
    - Global system constraints
-   - Safety / guardrails
    - Non-negotiable principles
 
-2. Project Memory
-   - Persistent project-level notes (e.g. “this repo is RAGstream”, global assumptions)
-   - Later: tagged GOLD history snippets
+2. Project / Memory Context
+   - Project-level assumptions
+   - Later: tagged history according to explicit retrieval rules
 
-3. Optional FILES block (future Fetcher)
-   - Explicitly fetched files or code blocks, if any
-   - “If the user says PACK <file>, show it here verbatim.”
+3. Optional explicitly loaded material
+   - Future deterministic fetcher-style loading of files, code blocks, or notes
 
 4. S_CTX_MD (from A4)
    - Facts
@@ -213,225 +206,212 @@ The final prompt is built from a small number of explicit regions. A simplified 
    - Open issues / questions
 
 5. Attachments (optional)
-   - Longer excerpts or references that do not fit into S_CTX_MD
-   - Kept mainly for traceability and citations
+   - Longer excerpts kept for traceability and citations
 ```
 
-Below this “RAG Context” block, the prompt carries the `SYSTEM`, `AUDIENCE`, `TASK`, `PURPOSE`, `TONE`, and `CONFIDENCE` fields coming from the SuperPrompt, plus any additional instructions defined per use case.
+Below this context block, the prompt carries the `SYSTEM`, `AUDIENCE`, `TASK`, `PURPOSE`, `TONE`, and `CONFIDENCE` fields from the SuperPrompt.
 
 ### Deterministic vs model-driven
 
-| Component          | Nature                         | Notes                                                                 |
-|--------------------|--------------------------------|-----------------------------------------------------------------------|
-| A0_PreProcessing   | Deterministic → Hybrid (later) | Normalisation + schema mapping; can optionally invoke an LLM helper. |
-| A2 PromptShaper    | Model-driven (Chooser)         | Fine-tuned A2 model maps `task/purpose/context` to five labels.      |
-| N1_Retrieval       | Deterministic function         | Pure vector search over Chroma collections.                           |
-| N2_Reranker        | Deterministic / numeric        | Cross-encoder / LLM scoring, but no long-form generation.            |
-| A3 NLI Gate        | Model-driven (Hybrid Chooser)  | Decides which chunks enter S_CTX_MD.                                 |
-| A4 Condenser       | Model-driven (Writer)          | Generates S_CTX_MD from selected chunks.                             |
-| A5 Format Enforcer | Model-driven (Writer/Extractor)| Enforces response format / contracts.                                |
-| PromptBuilder      | Deterministic function         | Concatenates everything into a final prompt string.                  |
+| Component          | Nature                               | Notes |
+|--------------------|--------------------------------------|-------|
+| A0_PreProcessing   | Deterministic → Hybrid (later)       | Normalisation + schema mapping; optional LLM help later. |
+| A2 PromptShaper    | Model-driven (Chooser)               | Fine-tuned A2 model maps `task/purpose/context` to five labels. |
+| Retrieval          | Deterministic function               | Current dense retrieval is implemented; hybrid Retrieval is the agreed next step. |
+| ReRanker           | Deterministic ranking stage          | Current cross-encoder reranker is implemented; bounded ColBERT reranking is the agreed next step. |
+| A3 NLI Gate        | Model-driven (Multi-Chooser direction) | Chunk labeling and duplicate marking are under construction. |
+| A4 Condenser       | Model-driven (Writer)                | Generates `S_CTX_MD` from selected chunks. |
+| A5 Format Enforcer | Model-driven (Writer/Extractor)      | Enforces response format / contracts. |
+| PromptBuilder      | Deterministic function               | Concatenates everything into a final prompt string. |
 
 ---
 
 ## Current Status
 
-*Truth in delivery (pre-MVP, November 2025).*
-
 Implemented / available:
 
-- Modular requirements and architecture documents:
+- Core documentation set:
   - `Requirements_Main.md`
   - `Requirements_AgentStack.md`
   - `Requirements_RAG_Pipeline.md`
   - `Requirements_Ingestion_Memory.md`
   - `Requirements_GUI.md`
   - `Requirements_Orchestration_Controller.md`
-  - `Backlog_Future_Features.md`
-- Working **document ingestion pipeline** for `.txt`, `.md`, `.json`, `.yml`:
-  - File manifest (Layer-G) with change detection.
-  - Chunking and embedding via OpenAI.
-  - Chroma-based vector store under `data/chroma_db/<project>/`.
-- A first version of **PreProcessing**:
-  - Schema (`prompt_schema.py`), name matching (`name_matcher.py`), and deterministic normalisation logic (`preprocessing.py`) that produces an initial SuperPrompt.
-- **Streamlit GUI skeleton**:
-  - Text areas for input prompt and SuperPrompt.
-  - 8-button layout matching the pipeline (A0, A2, Retrieval, ReRanker, A3, A4, A5, PromptBuilder).
-  - A0_PreProcessing is wired; the other buttons are placeholders awaiting pipeline wiring.
-- Initial scaffolding for retrieval, reranker, orchestration, and SuperPrompt handling.
+  - `Requirements_Quality_Governance.md`
+  - `Architecture.md`
+  - UML files for the main subsystem views
+- Working document ingestion pipeline with Chroma-backed persistence.
+- Deterministic A0_PreProcessing.
+- JSON-based Agent Stack in code.
+- A2 PromptShaper wired and live.
+- Retrieval wired and live.
+- ReRanker wired and live in code.
+- Streamlit development GUI with:
+  - prompt input,
+  - SuperPrompt inspection,
+  - 8 pipeline buttons,
+  - project creation,
+  - file import,
+  - active DB selection,
+  - embedded-file display,
+  - Retrieval Top-K,
+  - Retrieval / ReRanker inspection.
+- AWS Phase-1 deployment with:
+  - GitHub Actions -> ECR,
+  - EC2 + Docker runtime,
+  - nginx reverse proxy,
+  - HTTPS,
+  - Route 53,
+  - SSM-backed secrets,
+  - persistent runtime data outside the image.
 
-Not yet implemented (or only partially stubbed):
+Implemented but under redesign or still under construction:
 
-- Full end-to-end execution of all 8 pipeline stages via the Controller.
-- JSON-defined AgentStack in code (`AgentFactory`, `AgentPrompt`, `llm_client`) driving A2/A3/A4/A5.
-- Cross-encoder / LLM reranker integration with proper scoring, thresholds, and evaluation.
-- Conversation history ingestion, tagging, and history-aware retrieval.
-- Advanced GUI features (history panel, tag filters, model picker, cost estimation, multi-project attention control).
-
-What this README intentionally does *not* provide (yet):
-
-- A one-line “Quick Start” script. The project is used experimentally on a local dev machine and the setup is still evolving.
-- Any guarantees of stability. Names and file structure may still change while the design converges.
+- ReRanker exists, but the current cross-encoder direction is not accepted as the long-term solution.
+- A3, A4, A5, and final PromptBuilder stabilization are still under construction.
+- Memory / history ingestion and tagged retrieval are under construction.
+- Evaluation, benchmarking, and richer governance automation are still being built on top of the current foundation.
 
 ---
 
 ## Roadmap (near term)
 
-Near-term priorities (subject to change as experiments evolve):
+Near-term priorities:
 
-1. **Wire the full 8-step pipeline in the Controller + GUI**  
-   - Each button in the Streamlit GUI should call the corresponding function/agent.  
-   - Make it possible to step through A0 → A2 → N1 → N2 → A3 → A4 → A5 → PromptBuilder for a single prompt.
+1. **Upgrade Retrieval from dense-only to hybrid Retrieval**  
+   - Add SPLADE as the sparse branch.  
+   - Fuse dense Retrieval and sparse Retrieval with RRF.
 
-2. **Implement the AgentStack in code (A2, A3, A4, A5)**  
-   - JSON configs for each agent (enums, system text, purpose, model IDs, agent type).  
-   - `AgentFactory` to build `AgentPrompt` instances from these configs.  
-   - `llm_client` that can call OpenAI base models *and* the fine-tuned A2 model.
+2. **Replace the current ReRanker direction**  
+   - Keep ReRanker as a separate stage.  
+   - Move from the current cross-encoder path toward bounded ColBERT reranking with query splitting and fused ranking.
 
-3. **Finish Retrieval + ReRanker integration**  
-   - Solid API for N1_Retrieval and N2_Reranker.  
-   - Support for multiple Chroma collections per project and combined retrieval strategies.
+3. **Implement A3 as a real chunk-selection stage**  
+   - Label reranked chunks (`Must_Keep`, `Useful`, `BorderLine`, `Discarded`).  
+   - Mark duplicates against higher-ranked chunks.
 
-4. **First-class history and tagging**  
-   - Log all question/answer pairs to a durable log.  
-   - Ingest them into a history vector store with tags (GOLD / SILVER / OFF_TOPIC / PROJECT:XYZ).  
-   - Add basic GUI controls to include/exclude tagged history from retrieval.
+4. **Continue the memory layer**  
+   - durable history logging,  
+   - tag-aware retrieval rules,  
+   - explicit include/exclude semantics,  
+   - cross-session import of selected history later.
 
-5. **Model selection and cost awareness**  
-   - Simple dropdown in the GUI to choose the final answer model.  
-   - Rough token and cost estimates for a given SuperPrompt (including agent pipeline usage).
+5. **Stabilize the late pipeline**  
+   - A4 Condenser, A5 Format Enforcer, PromptBuilder.
 
-6. **Ingestion extensions**  
-   - Add support for PDFs / DOCX where feasible.  
-   - Keep file manifest the single source of truth for what is in memory.
+6. **Extend development governance and synchronization**  
+   - keep requirements, architecture, UML, and implementation aligned as the system evolves.
 
 ---
 
-## Repository Layout (planned)
+## Repository Layout
 
-This is the intended structure; some parts are already present, others are still evolving.
+The repository already contains a real working tree. A trimmed high-level view looks like this:
 
 ```text
 ragstream/
+  agents/                  # A2, A3, A4 agent modules
   app/
     controller.py          # Orchestrates pipeline stages
-    ui_streamlit.py        # Streamlit GUI (intermediate manual-first UI)
-    __init__.py
-
+    ui_streamlit.py        # Current Streamlit GUI
   config/
-    settings.py            # Global config (paths, model names, etc.)
-    # (future) agents/*.json  # Agent definitions (A2, A3, A4, A5)
-    __init__.py
-
-  data/
-    doc_raw/               # Raw project documents (per-project directories)
-    chroma_db/             # Chroma collections for each project
-    history/               # (future) Conversation logs + embeddings
-
+    prompt_schema.json
+    settings.py
   ingestion/
-    loader.py              # Load raw files
-    chunker.py             # Chunk documents
-    embedder.py            # Embed chunks
-    file_manifest.py       # Track files in Layer-G
+    loader.py
+    chunker.py
+    embedder.py
+    file_manifest.py
     chroma_vector_store_base.py
     vector_store_chroma.py
-    ingestion_manager.py   # High-level ingestion orchestrator
-    __init__.py
-
-  retrieval/
-    retriever.py           # N1_Retrieval
-    reranker.py            # N2_Reranker (numeric/LLM scoring)
-    attention.py           # (future) Eligibility / attention logic
-    __init__.py
-
+    ingestion_manager.py
+  memory/
+    conversation_memory.py
   orchestration/
-    super_prompt.py        # SuperPrompt data model
-    prompt_builder.py      # Deterministic PromptBuilder
-    llm_client.py          # OpenAI and future backends
-    agent_factory.py       # AgentFactory (planned)
-    agent_prompt.py        # AgentPrompt (planned)
-    __init__.py
-
-  tooling/
-    # (future) utilities, tools, etc.
-    __init__.py
-
+    super_prompt.py
+    prompt_builder.py
+    llm_client.py
+    agent_factory.py
+    agent_prompt.py
+  preprocessing/
+    preprocessing.py
+    prompt_schema.py
+    name_matcher.py
+  retrieval/
+    chunk.py
+    retriever.py
+    reranker.py
+    attention.py
   utils/
-    logging.py             # Logging helpers
-    paths.py               # Centralised path handling
-    __init__.py
+    logging.py
+    paths.py
+
+data/
+  agents/
+  doc_raw/
+  chroma_db/
+  A2_SLM_Training/
 ```
 
 ---
 
 ## GUI (Streamlit)
 
-### Intermediate GUI (Phase 1 – manual pipeline debugger)
+### Current development GUI
 
-RAGstream includes a custom-built GUI developed with Streamlit. The intermediate “lab” GUI is intentionally simple:
+RAGstream includes a Streamlit-based development GUI for stepping through the pipeline manually and inspecting intermediate state.
 
-- A text area for the **raw user input** (what you would normally type into ChatGPT).
-- A text area for the **SuperPrompt** (what RAGstream constructs as the final prompt).
-- Eight buttons matching the pipeline:
+Current development view includes:
 
-  1. `A0_PreProcessing` – run deterministic normalisation and schema mapping.
-  2. `A2_PromptShaper` – (future) call the A2 agent via AgentStack to infer system/audience/tone/depth/confidence.
-  3. `N1_Retrieval` – (future) run vector search on the selected Chroma DB.
-  4. `N2_Reranker` – (future) refine candidate chunks.
-  5. `A3_NLI_Gate` – (future) keep/drop chunks with NLI reasoning.
-  6. `A4_Condenser` – (future) generate S_CTX_MD.
-  7. `A5_Format_Enforcer` – (future) enforce final format.
-  8. `PromptBuilder` – (future) compose the final prompt string.
+- raw prompt input,
+- SuperPrompt inspection,
+- manual 8-stage pipeline control,
+- Retrieval Top-K control,
+- project creation and file import,
+- active project / DB selection,
+- embedded-file visibility,
+- retrieval and reranking inspection,
+- a development-side memory panel with tag semantics.
 
-- Additional controls (planned / partially implemented):
-  - A button to **ingest a document directory** into Chroma (`data/doc_raw/<project>` → `data/chroma_db/<project>`).  
-  - A widget to **select the active project/DB** for retrieval.
-
-The idea is to let the user run each stage manually, inspect the intermediate SuperPrompt in the right-hand box, and understand exactly what each component is doing before moving to a fully automated flow.
+The current GUI image below is the active development view:
 
 <p align="center">
-  <img src="doc/04-GUI/Dev1.png" alt="Development prototype – manual 8-button mode">
-  <br/><em>Figure 1 – Development view (manual 8-button mode)</em>
+  <img src="doc/04-GUI/Dev1.png" alt="Current development GUI">
+  <br/><em>Figure 1 – Current development GUI</em>
 </p>
 
+In this development view, the memory panel already illustrates the intended direction of explicit memory policies:
 
-### Planned GUI (Phase 2 – history + tagging)
+- **Green**: normal memory entry,
+- **Black**: excluded entry,
+- **Gold**: pinned persistent entry.
 
-The next major GUI milestone is a more “product-like” interface:
+This part should be read as a development prototype of memory management, not as a completed history subsystem. The durable history log, tag-aware retrieval rules, and later cross-session history orchestration are still under construction.
 
-- A main chat area where:
-  - You can type prompts and choose the target model.
-  - Either send the prompt directly to an API or just generate the SuperPrompt and paste it into the ChatGPT UI manually.
-- A **history panel**:
-  - Shows previous question/answer pairs.
-  - Lets you apply tags (GOLD, SILVER, OFF_TOPIC, etc.) per turn.
-  - Lets you filter which history segments participate in retrieval.
-- A **context panel**:
-  - Shows which project DBs are active.
-  - Shows which chunks are in S_CTX_MD and which are in Attachments.
-- Basic **cost estimation**:
-  - Roughly estimate tokens and cost per call based on the SuperPrompt size and chosen model.
+### Planned GUI (next phases)
 
-A much more advanced “Phase 3” GUI is sketched in the backlog:
+The next GUI phases extend the current development view rather than replacing its logic.
 
-- Multi-history management (import GOLD snippets from other sessions).
-- Fine-grained attention controls (turn sources on/off, weight them, inspect eligibility).
-- V-model-inspired tools for software development (link requirements, UML, code, and tests).
-- Multi-agent views where different agents (PromptShaper, Judge, Planner, Coder) can be inspected separately.
+Planned directions already documented in the requirements and backlog include:
+
+- history view and tag editing,
+- manual answer capture from external UIs,
+- model selection and cost awareness,
+- richer per-stage inspection,
+- multi-history and multi-project controls,
+- dynamic attention controls,
+- deterministic loading of explicit text/material into context,
+- later V-model-oriented development tooling.
 
 <p align="center">
   <img src="doc/04-GUI/Vision1.png" alt="Vision mock-up – complete GUI">
-  <br/><em>Figure 2 – Conceptual vision of the complete RAGstream GUI</em>
-</p>)
+  <br/><em>Figure 2 – Conceptual vision of the later GUI direction</em>
+</p>
 
 ---
 
 ## License & Author
 
-This is a personal research project by **Rusbeh Abtahi**.
+This is a personal research and engineering project by **Rusbeh Abtahi**.
 
-The project is currently shared under an MIT-style license. The intention is not to build a polished library, but a clear, inspectable reference implementation of a modern, agentic RAG system that can evolve over time.
-
-Feedback, issues, and thoughtful critique are very welcome.
-
-
+The codebase is MIT-licensed. The project is being developed as a transparent, inspectable RAG system whose requirements, architecture, UML, deployment, and implementation can evolve in a controlled way.
