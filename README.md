@@ -2,7 +2,7 @@
 
 RAGstream is a local-first RAG workbench for building transparent, controllable pipelines around large language models. It ingests project documents into local vector stores, runs a deterministic retrieval and reranking path, and assembles an explicit Super-Prompt that can be sent either to the ChatGPT UI or to APIs. LLM-based stages are routed through a neutral Agent Stack (`AgentFactory`, `AgentPrompt`, `llm_client`) so that agent behavior is defined by JSON configurations rather than scattered prompt logic.
 
-Current implementation focus is already beyond pure planning. A0_PreProcessing, A2_PromptShaper, project-scoped ingestion, and Retrieval are implemented and wired. ReRanker is also implemented in code and currently being redesigned after practical evaluation. Memory and tag-aware history management are under active development: the current GUI already exposes a development-side memory prototype, while the durable history ingestion and retrieval path remains under construction.
+A0_PreProcessing, A2_PromptShaper, project-scoped ingestion, and Retrieval are implemented and wired. ReRanker is also implemented in code and currently being redesigned after practical evaluation. Memory and tag-aware history management are under active development: the current GUI already exposes a development-side memory prototype, while the durable history ingestion and retrieval path remains under construction.
 
 RAGstream is also already deployed on AWS. The current deployment uses GitHub Actions for image build/push, Amazon ECR as the image registry, EC2 + Docker for runtime, nginx for reverse proxy and TLS termination, Route 53 for DNS, SSM Parameter Store for secrets, and EBS-backed persistent runtime data outside the image.
 
