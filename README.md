@@ -62,7 +62,7 @@ At a high level, RAGstream keeps ingestion and retrieval separated from generati
     "rankSpacing": 35
   }
 }}%%
-flowchart LR
+flowchart TB
 
   classDef gui fill:#FCE7F3,stroke:#EC4899,stroke-width:1.5px,color:#4A1D36;
   classDef ctrl fill:#DCEEFF,stroke:#3B82F6,stroke-width:1.5px,color:#123;
@@ -71,47 +71,54 @@ flowchart LR
   classDef gen fill:#FDE2E4,stroke:#D9485F,stroke-width:1.5px,color:#421;
   classDef agent fill:#EDE7FF,stroke:#7C3AED,stroke-width:1.5px,color:#213;
 
-  UI[Streamlit GUI]:::gui --> CTRL[AppController]:::ctrl
-
   subgraph APP["Application"]
-    direction LR
+    direction TB
 
-    subgraph PIPE["8-Step RAG Pipeline"]
+    subgraph HEAD[" "]
+      direction LR
+      UI[Streamlit GUI]:::gui --> CTRL[AppController]:::ctrl
+    end
+
+    subgraph BODY[" "]
       direction LR
 
-      subgraph BOX1["Prompt Shaping"]
-        direction TB
-        A0[A0<br/>PreProcessing]:::prep --> A2[A2<br/>PromptShaper]:::prep
+      subgraph PIPE["8-Step RAG Pipeline"]
+        direction LR
+
+        subgraph BOX1["Prompt Shaping"]
+          direction TB
+          A0[A0<br/>PreProcessing]:::prep --> A2[A2<br/>PromptShaper]:::prep
+        end
+
+        subgraph BOX2["Retrieval / Selection"]
+          direction TB
+          RET[Retrieval<br/>Dense + SPLADE + RRF]:::retr --> RRK[ReRanker<br/>Bounded ColBERT Path]:::retr
+          RRK --> A3[A3<br/>NLI Gate]:::retr
+        end
+
+        subgraph BOX3["Context / Final Prompt"]
+          direction TB
+          A4[A4<br/>Condenser]:::gen --> A5[A5<br/>Format Enforcer]:::gen
+          A5 --> PB[Prompt Builder]:::gen
+        end
+
+        BOX1 --> BOX2 --> BOX3
       end
 
-      subgraph BOX2["Retrieval / Selection"]
+      subgraph AG["Agent Stack"]
         direction TB
-        RET[Retrieval<br/>Dense + SPLADE + RRF]:::retr --> RRK[ReRanker<br/>Bounded ColBERT Path]:::retr
-        RRK --> A3[A3<br/>NLI Gate]:::retr
+        AF[AgentFactory]:::agent --> AP[AgentPrompt]:::agent
+        AP --> LLM[llm_client]:::agent
       end
-
-      subgraph BOX3["Context / Final Prompt"]
-        direction TB
-        A4[A4<br/>Condenser]:::gen --> A5[A5<br/>Format Enforcer]:::gen
-        A5 --> PB[Prompt Builder]:::gen
-      end
-
-      BOX1 --> BOX2 --> BOX3
     end
 
-    subgraph AG["Agent Stack"]
-      direction TB
-      AF[AgentFactory]:::agent --> AP[AgentPrompt]:::agent
-      AP --> LLM[llm_client]:::agent
-    end
+    CTRL --> A0
+
+    A2 -.-> AF
+    A3 -.-> AF
+    A4 -.-> AF
+    A5 -.-> AF
   end
-
-  CTRL --> A0
-
-  A2 -.-> AF
-  A3 -.-> AF
-  A4 -.-> AF
-  A5 -.-> AF
 ```
 ```mermaid
 %%{init: {
