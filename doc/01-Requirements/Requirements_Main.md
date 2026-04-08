@@ -5,12 +5,13 @@
 This document gives the top-level requirements for RAGstream as a whole.
 It explains how the major subsystems work together, which files define their details, and how a single user prompt flows through the system from GUI to final SuperPrompt (and optionally to an external LLM).
 
-RAGstream is a personal, research-grade RAG / agentic system designed to:
+RAGstream is an agentic software engineering system designed to:
 
-* Turn free-form user prompts into a structured “SuperPrompt”.
-* Retrieve and compress relevant knowledge from local vector stores.
-* Use small, stateless, JSON-driven agents (A0, A2, A3, A4, A5) to shape the prompt.
-* Keep the design compatible with future ML-Ops / AWS / local SLM deployments.
+* Turn free-form user prompts into a structured `SuperPrompt`.
+* Retrieve, rerank, and compress relevant knowledge from persistent vector stores.
+* Combine deterministic pipeline stages with JSON-defined LLM stages through a neutral Agent Stack.
+* Support memory, tag-aware history management, and explicit context control as first-class system concepts.
+* Remain compatible with AWS deployment, DevOps delivery, and future local or remote model backends.
 
 This main requirement file is the “spine” for the following subsystem specifications:
 

@@ -94,6 +94,7 @@
     │       └── 002.json
     ├── chroma_db
     │   ├── project1
+    │   │   ├── 2d71b43d-3226-411e-8ff2-2cede3dcb9a0
     │   └── project2
     │       ├── 526ca8ff-c00e-4657-b10c-94f6a376684e
     │       └── file_manifest.json

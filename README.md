@@ -1,12 +1,12 @@
 # RAGstream
 
-RAGstream is a local-first RAG workbench for building transparent, controllable pipelines around large language models. It ingests project documents into local vector stores, runs a deterministic retrieval and reranking path, and assembles an explicit Super-Prompt that can be sent either to the ChatGPT UI or to APIs. LLM-based stages are routed through a neutral Agent Stack (`AgentFactory`, `AgentPrompt`, `llm_client`) so that agent behavior is defined by JSON configurations rather than scattered prompt logic.
+RAGstream is an agentic software engineering system for building controllable multi-stage knowledge, retrieval, memory, and orchestration pipelines around large language models, with AWS deployment and DevOps delivery built into its architecture. It ingests project documents into persistent vector stores, combines deterministic preprocessing, retrieval, reranking, and prompt construction with JSON-defined LLM stages, and assembles an explicit SuperPrompt that can be sent either to external UIs or directly to APIs. Its LLM-facing stages run through a neutral Agent Stack (`AgentFactory`, `AgentPrompt`, `llm_client`), so agent behavior is versioned as configuration rather than scattered prompt logic.
 
-A0_PreProcessing, A2_PromptShaper, project-scoped ingestion, and Retrieval are implemented and wired. ReRanker is also implemented in code and currently being redesigned after practical evaluation. Memory and tag-aware history management are under active development: the current GUI already exposes a development-side memory prototype, while the durable history ingestion and retrieval path remains under construction.
+A0_PreProcessing, A2_PromptShaper, project-scoped ingestion, and Retrieval are implemented and wired. ReRanker is implemented in code and is currently being redesigned after practical evaluation. Memory and tag-aware history management are under active development: the current GUI already exposes the intended direction of the memory layer, while durable history ingestion, semantic retrieval, and tag-governed memory workflows are being completed.
 
-RAGstream is also already deployed on AWS. The current deployment uses GitHub Actions for image build/push, Amazon ECR as the image registry, EC2 + Docker for runtime, nginx for reverse proxy and TLS termination, Route 53 for DNS, SSM Parameter Store for secrets, and EBS-backed persistent runtime data outside the image.
+RAGstream is also deployed on AWS through a GitHub Actions → ECR → EC2/Docker → nginx → HTTPS delivery path and an active DevOps pipeline. The current deployment uses Route 53 for DNS, SSM Parameter Store for secrets, and EBS-backed runtime data outside the image, so project documents and vector stores persist independently of container replacement.
 
-The emphasis here is transparent RAG: human-agent orchestration, deterministic where possible, and explicit about which parts are LLM-driven and which parts are retrieval, selection, or control logic.
+The system is designed to keep deterministic control logic, LLM-driven stages, memory, and deployment operations explicit at each layer, while remaining aligned with requirements, architecture, UML, code, and evaluation work as the project evolves.
 
 ---
 
