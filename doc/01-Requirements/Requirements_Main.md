@@ -10,7 +10,7 @@ RAGstream is an agentic software engineering system designed to:
 * Turn free-form user prompts into a structured `SuperPrompt`.
 * Retrieve, rerank, and compress relevant knowledge from persistent vector stores.
 * Combine deterministic pipeline stages with JSON-defined LLM stages through a neutral Agent Stack.
-* Support memory, tag-aware history management, and explicit context control as first-class system concepts.
+* Add memory, tag-governed history handling, and explicit context selection to the same pipeline.
 * Remain compatible with AWS deployment, DevOps delivery, and future local or remote model backends.
 
 This main requirement file is the “spine” for the following subsystem specifications:
@@ -19,7 +19,7 @@ This main requirement file is the “spine” for the following subsystem specif
   – Defines the 8-step pipeline (A0, A2, Retrieval, ReRanker, A3, A4, A5, Prompt Builder), how each step mutates the SuperPrompt, and the deterministic vs LLM nature of each stage.
 
 * Requirements_AgentStack.md
-  – Defines the neutral, stateless agent stack (AgentFactory, AgentPrompt, llm_client), agent JSON configs, and the three agent types (Chooser, Writer, Extractor).
+  – Defines the neutral, stateless agent stack (AgentFactory, AgentPrompt, llm_client), agent JSON configs, and the four agent types (Chooser, Writer, Extractor, Multi-Chooser).
 
 * Requirements_Ingestion_Memory.md
   – Defines document ingestion (already implemented) and conversation history ingestion (future), including directory layout (`doc_raw`, `chroma_db`, `history`) and vector-store invariants.
@@ -53,9 +53,9 @@ At the highest level, RAGstream consists of:
 
   * A0_PreProcessing (deterministic, optional LLM help later).
   * A2 PromptShaper (LLM-based Chooser agent).
-  * Retrieval (deterministic vector search).
-  * ReRanker (deterministic BERT-style cross-encoder stage).
-  * A3 NLI Gate (LLM-based filtering agent).
+  * Retrieval (deterministic hybrid first-pass retrieval stage).
+  * ReRanker (deterministic bounded reranking stage).
+  * A3 NLI Gate (LLM-based chunk labeling and duplicate-marking agent).
   * A4 Condenser (LLM-based summarization / context compressor).
   * A5 Format Enforcer (LLM-based format / style agent).
   * Prompt Builder (deterministic prompt composer).
@@ -137,7 +137,7 @@ SuperPrompt currently holds:
 Each agent (A0, A2, A3, A4, A5, and future agents) is described by JSON config files (and optionally YAML profiles later if needed). They define, for that agent:
 
 * Agent name and version.
-* Agent type: Chooser, Writer, or Extractor.
+* Agent type: Chooser, Writer, Extractor, or Multi-Chooser.
 * Enums:
 
   * Fields where the agent must choose from a finite list (e.g. tone, confidence, system roles).
@@ -186,20 +186,20 @@ In intermediate mode, the GUI exposes eight buttons, one per stage. The typical 
 4. Retrieval (button “Retrieval”):
 
    * Controller builds a retrieval query from SuperPrompt `task + purpose + context` and calls the Retrieval module.
-   * Retrieval splits that query into overlapping pieces, embeds the pieces, reads the active project's Chroma document store, scores stored chunks with LogAvgExp over the query pieces, and keeps the top-k result.
+   * Retrieval splits that query into overlapping pieces, runs dense retrieval and SPLADE sparse retrieval on the active project's Chroma document store, fuses the rankings with RRF, and keeps the bounded candidate set.
    * Retrieval reconstructs the real chunk text from `data/doc_raw/<project>` using stored metadata and the same chunking logic as ingestion.
    * SuperPrompt records the hydrated selected chunks in `base_context_chunks`, writes the Retrieval stage snapshot into `views_by_stage["retrieval"]`, and updates `final_selection_ids`.
 
 5. ReRanker (button “ReRanker”):
 
    * Controller calls ReRanker on those Retrieval candidates.
-   * ReRanker is a deterministic BERT-style cross-encoder stage that scores each `(prompt, chunk)` pair more precisely than embedding-only Retrieval.
+   * ReRanker is a deterministic bounded reranking stage that uses query splitting and ColBERT-based reranking on the Retrieval candidate band, then fuses that result with the previous Retrieval ranking.
    * SuperPrompt records the reranked stage snapshot in `views_by_stage["reranked"]` and updates the current selection accordingly.
 
 6. A3 NLI Gate (button “A3 NLI Gate”):
 
    * Controller calls A3, another agent driven via AgentFactory/AgentPrompt/llm_client.
-   * A3 inspects each candidate chunk with respect to the question and decides which to keep/drop (NLI-style “supports / contradicts / irrelevant”).
+   * A3 inspects the reranked candidate set, assigns labels such as `Must_Keep`, `Useful`, `BorderLine`, or `Discarded`, and records duplicate relations against higher-ranked chunks.
    * SuperPrompt’s selection is filtered; only “keep” chunks remain.
 
 7. A4 Condenser (button “A4 Condenser”):
@@ -431,7 +431,7 @@ Across all subsystems, RAGstream follows these principles:
 
 3. Deterministic retrieval:
 
-   * Retrieval and ReRanker never call LLMs; they use embedding similarity and explicit models.
+   * Retrieval remains deterministic at ranking level. ReRanker remains deterministic at ranking level, while allowing a helper agent for bounded query splitting in the agreed future design.
    * The rules for which chunks are eligible and how they are scored are defined in RAG_Pipeline and are reproducible.
 
 4. JSON as internal standard:

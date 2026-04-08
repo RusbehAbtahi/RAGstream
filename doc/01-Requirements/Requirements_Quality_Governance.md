@@ -14,7 +14,7 @@ This document covers exactly five feature families:
 4. security hardening and operational monitoring,
 5. component cards and stakeholder-facing technical documentation.
 
-These five families are intentionally separable. The system may implement one without forcing the immediate implementation of all others. However, they are not equally mature in timing. Based on the current implementation state, Features 1 and 2 can start immediately with little architectural disturbance, while Feature 3 becomes most useful once Retrieval is stabilized and ReRanker is implemented. Features 4 and 5 can begin independently, but both become stronger when Feature 3 later provides measured evidence.
+These five families are intentionally separable. The system may implement one without forcing the immediate implementation of all others. However, they are not equally mature in timing. Based on the current implementation state, Features 1 and 2 can start immediately with little architectural disturbance, while Feature 3 becomes most useful once the Retrieval and ReRanker directions are stabilized. Features 4 and 5 can begin independently, but both become stronger when Feature 3 later provides measured evidence.
 
 This document does not redefine stage behavior, controller behavior, or ingestion behavior. Those remain defined in the subsystem requirements. This document adds professional quality obligations around them.
 
@@ -31,7 +31,7 @@ At present, the relevant baseline is:
 * A2 PromptShaper exists and is live through the JSON-based agent stack.
 * Chroma-based project ingestion with file manifests exists.
 * Retrieval exists and is deterministic, project-aware, and writes into SuperPrompt.
-* ReRanker is the next agreed major implementation step.
+* ReRanker exists in code and the current ranking direction is under agreed redesign.
 * A3, A4, A5, and Prompt Builder are not yet complete as stable operational stages.
 * The current AWS deployment uses GitHub Actions, ECR, EC2, Docker, nginx, HTTPS via Certbot, Route53 update, SSM Parameter Store, and EBS-backed runtime data under `/home/ubuntu/ragstream_data` mounted to `/app/data`.
 
@@ -86,7 +86,7 @@ Automated testing shall apply to:
 * retrieval modules,
 * agent-stack modules,
 * project-ingestion GUI/controller flows at the action boundary,
-* ReRanker when implemented.
+* ReRanker stage, including its current implementation and agreed redesign direction.
 
 This first wave does not require full browser-level UI automation.
 
@@ -306,7 +306,7 @@ Mandatory first, because Retrieval is already implemented.
 
 #### 6.3.2 Wave 2 — ReRanker evaluation
 
-Mandatory when ReRanker becomes real, because ReRanker is the next agreed implementation step and is explicitly intended to improve precision over Retrieval.
+Mandatory because ReRanker already exists in code and remains the main precision stage under redesign relative to Retrieval.
 
 #### 6.3.3 Wave 3 — A3/A4/A5/Prompt Builder evaluation
 
@@ -324,18 +324,18 @@ Retrieval shall be evaluated on:
 * stale-row robustness,
 * correctness of hydrated chunk reconstruction from raw project data.
 
-This is directly grounded in the actual Retrieval design: query text comes from `task`, `purpose`, and `context`; it is split into overlapping pieces; embeddings are matched against the active project’s Chroma store; scores are aggregated by LogAvgExp; and raw chunk text is reconstructed from `doc_raw/<project>`.
+This is directly grounded in the agreed Retrieval design: query text comes from `task`, `purpose`, and `context`; dense and SPLADE branches run against the active project’s Chroma store; rankings are fused with RRF; and raw chunk text is reconstructed from `doc_raw/<project>`.
 
 ### 6.5 ReRanker evaluation requirements
 
-When ReRanker is implemented, it shall be evaluated on:
+ReRanker shall be evaluated on both the current implemented baseline and the agreed redesigned direction:
 
 * quality improvement over Retrieval baseline,
 * latency,
 * runtime resource cost,
 * practical AWS viability on the deployment path that is planned to remain architecturally stable.
 
-This is grounded in the current implementation status, which states that ReRanker is next, is intended as the precision stage, and is expected to be more CPU/RAM-demanding than Retrieval while keeping the surrounding AWS deployment architecture unchanged.
+This is grounded in the current implementation status, which states that ReRanker already exists in code, that the current cross-encoder direction is not accepted as final, and that the agreed future direction remains a bounded precision stage over Retrieval while keeping the surrounding AWS deployment architecture unchanged.
 
 ### 6.6 Late-stage evaluation requirements
 
@@ -497,7 +497,7 @@ RAGstream is not only a collection of learned models. It is a mixed architecture
 
 * deterministic ingestion,
 * deterministic Retrieval,
-* planned deterministic ReRanker orchestration around a model,
+* deterministic ReRanker orchestration around a model,
 * stateless LLM-based agents,
 * controller orchestration,
 * deployment/runtime infrastructure.
@@ -510,7 +510,7 @@ Component cards shall eventually exist for at least:
 
 * A2 PromptShaper,
 * Retrieval,
-* ReRanker when implemented,
+* ReRanker,
 * A3 when real,
 * A4 when real,
 * A5 when real,

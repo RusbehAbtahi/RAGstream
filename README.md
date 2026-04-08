@@ -16,23 +16,29 @@ RAGstream already has a working Phase-1 deployment path. Public traffic goes thr
 
 ```mermaid
 flowchart LR
-  DEV[Developer] --> GH[GitHub Repository]
-  GH --> GA[GitHub Actions]
-  GA --> ECR[Amazon ECR]
-  ECR --> EC2[EC2 Runtime]
-  EC2 --> DOCKER[Docker Container]
-  DOCKER --> NGINX[nginx Reverse Proxy]
-  NGINX --> HTTPS[HTTPS Endpoint]
+  classDef dev fill:#EAF3FF,stroke:#3B82F6,color:#123;
+  classDef build fill:#EEFBEF,stroke:#16A34A,color:#123;
+  classDef run fill:#FFF7E8,stroke:#F59E0B,color:#321;
+
+  DEV[Developer]:::dev --> GH[GitHub Repository]:::dev
+  GH --> GA[GitHub Actions]:::build
+  GA --> ECR[Amazon ECR]:::build
+  ECR --> EC2[EC2 Host]:::run
 ```
 
 ```mermaid
 flowchart LR
-  USER[Browser] --> DNS[Route 53]
-  DNS --> EC2[EC2 Public IP]
-  EC2 --> NGINX[nginx :80/:443]
-  NGINX --> APP[Docker / Streamlit]
-  APP --> DATA[EBS-backed runtime data]
-  EC2 --> SSM[SSM Parameter Store]
+  classDef edge fill:#EAF3FF,stroke:#3B82F6,color:#123;
+  classDef host fill:#EEFBEF,stroke:#16A34A,color:#123;
+  classDef data fill:#FFF7E8,stroke:#F59E0B,color:#321;
+  classDef sec fill:#FDEDEE,stroke:#E74C3C,color:#611;
+
+  USER[Browser]:::edge --> R53[Route 53]:::edge
+  R53 --> IP[EC2 Public IP]:::edge
+  IP --> NGINX[nginx :80 / :443]:::host
+  NGINX --> APP[Docker / Streamlit :8501]:::host
+  APP --> DATA[EBS-backed /app/data]:::data
+  EC2[EC2 Host]:::host --> SSM[SSM Parameter Store]:::sec
 ```
 
 Near-term deployment direction remains incremental rather than architectural replacement. The current path stays GitHub Actions -> ECR -> EC2 -> Docker -> nginx, while later authentication and user-facing control can be extended further, for example with Cognito-based flows that are already documented as future work in the deployment and GUI requirements.
@@ -44,56 +50,113 @@ Near-term deployment direction remains incremental rather than architectural rep
 At a high level, RAGstream keeps ingestion and retrieval separated from generation, runs a linear 8-step RAG pipeline inside a Controller, and uses a neutral Agent Stack (`AgentFactory` + `AgentPrompt` + `llm_client`) for all LLM-based stages.
 
 ```mermaid
-flowchart TD
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontSize": "20px"
+  },
+  "flowchart": {
+    "htmlLabels": true,
+    "curve": "basis",
+    "nodeSpacing": 30,
+    "rankSpacing": 35
+  }
+}}%%
+flowchart LR
 
-  subgraph "Ingestion / Memory"
-    IM["IngestionManager"]
-    LDR["DocumentLoader"]
-    CHK["Chunker"]
-    EMB["Embedder (OpenAI text-embedding-3-large)"]
-    VS["VectorStore (Chroma, on-disk)"]
-    FM["FileManifest"]
-    MEM["History / Tags (under development)"]
+  classDef gui fill:#FCE7F3,stroke:#EC4899,stroke-width:1.5px,color:#4A1D36;
+  classDef ctrl fill:#DCEEFF,stroke:#3B82F6,stroke-width:1.5px,color:#123;
+  classDef prep fill:#FFF4D6,stroke:#E0A100,stroke-width:1.5px,color:#321;
+  classDef retr fill:#E7F8EF,stroke:#19A974,stroke-width:1.5px,color:#114;
+  classDef gen fill:#FDE2E4,stroke:#D9485F,stroke-width:1.5px,color:#421;
+  classDef agent fill:#EDE7FF,stroke:#7C3AED,stroke-width:1.5px,color:#213;
 
-    IM --> LDR --> CHK --> EMB --> VS
-    IM --> FM
-    MEM --> VS
-  end
+  UI[Streamlit GUI]:::gui --> CTRL[AppController]:::ctrl
 
-  subgraph "Application"
-    UI["Streamlit GUI"]
-    CTRL["Controller"]
+  subgraph APP["Application"]
+    direction LR
 
-    subgraph "RAG Pipeline"
-      A0["A0_PreProcessing"]
-      A2["A2 PromptShaper"]
-      RET["Retrieval"]
-      RRK["ReRanker"]
-      A3["A3 NLI Gate"]
-      A4["A4 Condenser"]
-      A5["A5 Format Enforcer"]
-      PB["PromptBuilder"]
+    subgraph PIPE["8-Step RAG Pipeline"]
+      direction LR
+
+      subgraph BOX1["Prompt Shaping"]
+        direction TB
+        A0[A0<br/>PreProcessing]:::prep --> A2[A2<br/>PromptShaper]:::prep
+      end
+
+      subgraph BOX2["Retrieval / Selection"]
+        direction TB
+        RET[Retrieval<br/>Dense + SPLADE + RRF]:::retr --> RRK[ReRanker<br/>Bounded ColBERT Path]:::retr
+        RRK --> A3[A3<br/>NLI Gate]:::retr
+      end
+
+      subgraph BOX3["Context / Final Prompt"]
+        direction TB
+        A4[A4<br/>Condenser]:::gen --> A5[A5<br/>Format Enforcer]:::gen
+        A5 --> PB[Prompt Builder]:::gen
+      end
+
+      BOX1 --> BOX2 --> BOX3
     end
 
-    subgraph "Agent Stack"
-      AF["AgentFactory"]
-      AP["AgentPrompt"]
-      LLM["llm_client"]
+    subgraph AG["Agent Stack"]
+      direction TB
+      AF[AgentFactory]:::agent --> AP[AgentPrompt]:::agent
+      AP --> LLM[llm_client]:::agent
     end
   end
 
-  UI --> CTRL
-  CTRL --> A0 --> A2 --> RET --> RRK --> A3 --> A4 --> A5 --> PB
+  CTRL --> A0
 
-  A2 --> AF
-  A3 --> AF
-  A4 --> AF
-  A5 --> AF
-  AF --> AP --> LLM
-
-  RET --> VS
+  A2 -.-> AF
+  A3 -.-> AF
+  A4 -.-> AF
+  A5 -.-> AF
 ```
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontSize": "16px"
+  },
+  "flowchart": {
+    "htmlLabels": true,
+    "curve": "basis",
+    "nodeSpacing": 30,
+    "rankSpacing": 35
+  }
+}}%%
+flowchart LR
 
+  classDef core fill:#EAF7EA,stroke:#22A06B,stroke-width:1.5px,color:#123;
+  classDef io fill:#EAF3FF,stroke:#3B82F6,stroke-width:1.5px,color:#123;
+  classDef store fill:#FFE9E7,stroke:#E76F51,stroke-width:1.5px,color:#611;
+  classDef mem fill:#FDE2E4,stroke:#D9485F,stroke-width:1.5px,color:#421;
+
+  subgraph ING["Ingestion / Memory"]
+    direction LR
+
+    subgraph DOC["Document Ingestion"]
+      direction LR
+      IM[IngestionManager]:::core --> LDR[DocumentLoader]:::io
+      LDR --> CHK[Chunker]:::io
+      CHK --> EMB[Embedder]:::io
+      EMB --> VS[Chroma Vector Store]:::store
+      IM --> FM[FileManifest]:::store
+    end
+
+    subgraph MEM["History / Memory"]
+      direction TB
+      LOG[Conversation Log]:::mem
+      TAG[Tags / Metadata]:::mem
+      HIST[History Store<br/>under development]:::mem
+      LOG --> HIST
+      TAG --> HIST
+    end
+  end
+
+  HIST --> VS
+  ```
 ### Design principles
 
 - **Local-first, inspectable**  
