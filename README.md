@@ -1,12 +1,64 @@
 # RAGstream
 
-RAGstream is an agentic software engineering system for building controllable multi-stage knowledge, retrieval, memory, and orchestration pipelines around large language models, with AWS deployment and DevOps delivery built into its architecture. It ingests project documents into persistent vector stores, combines deterministic preprocessing, retrieval, reranking, and prompt construction with JSON-defined LLM stages, and assembles an explicit SuperPrompt that can be sent either to external UIs or directly to APIs. Its LLM-facing stages run through a neutral Agent Stack (`AgentFactory`, `AgentPrompt`, `llm_client`), so agent behavior is versioned as configuration rather than scattered prompt logic.
+RAGstream is an agentic, memory-aware AI system for software engineering. It combines deterministic NLP, retrieval, reranking, tag-governed memory, and JSON-defined LLM agents inside a neutral Agent Stack to build controllable multi-stage knowledge and orchestration pipelines. The system is designed to keep requirements, architecture, code, and tests aligned through structured context analysis and version-aware synchronization, and it is deployed on AWS through a CI/CD DevOps pipeline, with governance-oriented support for testing, observability, benchmarking, and system evaluation
 
-A0_PreProcessing, A2_PromptShaper, project-scoped ingestion, and Retrieval are implemented and wired. ReRanker is implemented in code and is currently being redesigned after practical evaluation. Memory and tag-aware history management are under active development: the current GUI already exposes the intended direction of the memory layer, while durable history ingestion, semantic retrieval, and tag-governed memory workflows are being completed.
 
-RAGstream is also deployed on AWS through a GitHub Actions → ECR → EC2/Docker → nginx → HTTPS delivery path and an active DevOps pipeline. The current deployment uses Route 53 for DNS, SSM Parameter Store for secrets, and EBS-backed runtime data outside the image, so project documents and vector stores persist independently of container replacement.
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontSize": "20px"
+  },
+  "flowchart": {
+    "htmlLabels": true,
+    "curve": "basis",
+    "nodeSpacing": 35,
+    "rankSpacing": 40
+  }
+}}%%
+flowchart TB
 
-The system is designed to keep deterministic control logic, LLM-driven stages, memory, and deployment operations explicit at each layer, while remaining aligned with requirements, architecture, UML, code, and evaluation work as the project evolves.
+  classDef ingest fill:#EAF7EA,stroke:#22A06B,stroke-width:1.5px,color:#123;
+  classDef app fill:#FFF4D6,stroke:#E0A100,stroke-width:1.5px,color:#321;
+  classDef agent fill:#EDE7FF,stroke:#7C3AED,stroke-width:1.5px,color:#213;
+  classDef gui fill:#FCE7F3,stroke:#EC4899,stroke-width:1.5px,color:#4A1D36;
+  classDef ctrl fill:#DCEEFF,stroke:#3B82F6,stroke-width:1.5px,color:#123;
+  classDef aws fill:#FFE9E7,stroke:#E76F51,stroke-width:1.5px,color:#611;
+
+  subgraph LEFT["**Ingestion / Memory**"]
+    direction TB
+    DOC["**Project Documents**"]:::ingest
+    ING["**Ingestion Pipeline**<br/>Chunking + Embeddings + Vector Store"]:::ingest
+    MEM["**Memory / Tags**"]:::ingest
+    DOC --> ING
+    MEM --> ING
+  end
+
+  subgraph MID["**Application**"]
+    direction TB
+    GUI["**Streamlit GUI**"]:::gui
+    CTRL["**AppController**"]:::ctrl
+    PIPE["**Agentic RAG Pipeline**<br/>PreProcessing + Retrieval + ReRanker + Prompt Building"]:::app
+    ASTACK["**Neutral Agent Stack**<br/>JSON-defined Agents"]:::agent
+    GUI --> CTRL --> PIPE
+    ASTACK --> PIPE
+  end
+
+  subgraph RIGHT["**AWS / DevOps**"]
+    direction TB
+    CICD["**GitHub + CI/CD**"]:::aws
+    RUN["**AWS Runtime**<br/>ECR + EC2 + Docker + nginx"]:::aws
+    CICD --> RUN
+  end
+
+  ING --> PIPE
+  PIPE --> RUN
+  
+```
+
+At the system level, RAGstream treats ingestion, retrieval, prompt orchestration, and LLM behavior as explicit architectural components within a structured agentic software system. Project documents are ingested into persistent vector stores, while the memory layer extends the same architecture toward durable conversation history, tag-governed context management, and history-aware retrieval. The pipeline builds an explicit SuperPrompt as its shared working state, and LLM-facing stages run through a neutral Agent Stack built around AgentFactory, AgentPrompt, and llm_client, so agent behavior is versioned as configuration instead of being scattered across ad hoc prompts. This makes the flow inspectable from raw documents and chunked storage up to retrieval, reranking, context construction, and final prompt delivery to either external UIs or direct API calls.
+
+In its current implementation state, A0_PreProcessing, A2_PromptShaper, project-scoped ingestion, and Retrieval are implemented and wired, while ReRanker is implemented in code and is being redesigned in the stronger agreed direction after practical evaluation. The deployed system already runs through GitHub Actions -> ECR -> EC2/Docker -> nginx -> HTTPS, with Route 53 for DNS, SSM Parameter Store for secrets, and EBS-backed runtime data outside the image so project documents and vector stores persist independently of container replacement. Memory and tag-aware history management are under active development as the next major subsystem on top of this foundation.
 
 ---
 
@@ -71,44 +123,44 @@ flowchart TB
   classDef gen fill:#FDE2E4,stroke:#D9485F,stroke-width:1.5px,color:#421;
   classDef agent fill:#EDE7FF,stroke:#7C3AED,stroke-width:1.5px,color:#213;
 
-  subgraph APP["Application"]
+  subgraph APP["**Application**"]
     direction TB
 
     subgraph HEAD[" "]
       direction LR
-      UI[Streamlit GUI]:::gui --> CTRL[AppController]:::ctrl
+      UI["**Streamlit GUI**"]:::gui --> CTRL["**AppController**"]:::ctrl
     end
 
     subgraph BODY[" "]
       direction LR
 
-      subgraph PIPE["8-Step RAG Pipeline"]
+      subgraph PIPE["**8-Step RAG Pipeline**"]
         direction LR
 
-        subgraph BOX1["Prompt Shaping"]
+        subgraph BOX1["**Prompt Shaping**"]
           direction TB
-          A0[A0<br/>PreProcessing]:::prep --> A2[A2<br/>PromptShaper]:::prep
+          A0["**A0**<br/>**PreProcessing**"]:::prep --> A2["**A2**<br/>**PromptShaper**"]:::prep
         end
 
-        subgraph BOX2["Retrieval / Selection"]
+        subgraph BOX2["**Retrieval / Selection**"]
           direction TB
-          RET[Retrieval<br/>Dense + SPLADE + RRF]:::retr --> RRK[ReRanker<br/>Bounded ColBERT Path]:::retr
-          RRK --> A3[A3<br/>NLI Gate]:::retr
+          RET["**Retrieval**<br/>**Dense + SPLADE + RRF**"]:::retr --> RRK["**ReRanker**<br/>**Bounded ColBERT Path**"]:::retr
+          RRK --> A3["**A3**<br/>**NLI Gate**"]:::retr
         end
 
-        subgraph BOX3["Context / Final Prompt"]
+        subgraph BOX3["**Context / Final Prompt**"]
           direction TB
-          A4[A4<br/>Condenser]:::gen --> A5[A5<br/>Format Enforcer]:::gen
-          A5 --> PB[Prompt Builder]:::gen
+          A4["**A4**<br/>**Condenser**"]:::gen --> A5["**A5**<br/>**Format Enforcer**"]:::gen
+          A5 --> PB["**Prompt Builder**"]:::gen
         end
 
         BOX1 --> BOX2 --> BOX3
       end
 
-      subgraph AG["Agent Stack"]
+      subgraph AG["**Agent Stack**"]
         direction TB
-        AF[AgentFactory]:::agent --> AP[AgentPrompt]:::agent
-        AP --> LLM[llm_client]:::agent
+        AF["**AgentFactory**"]:::agent --> AP["**AgentPrompt**"]:::agent
+        AP --> LLM["**llm_client**"]:::agent
       end
     end
 
