@@ -222,3 +222,10 @@ training/slm_a2/runs/**
 *.npy
 .huggingface/
 .cache/
+
+
+data/A2_SLM_Training/
+data/chroma_db/
+data/doc_raw/
+data/project1/
+training/slm_a2/data/
