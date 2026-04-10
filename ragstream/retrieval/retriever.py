@@ -1,76 +1,77 @@
+# retriever.py
 # -*- coding: utf-8 -*-
 """
 retriever.py
 
 Purpose:
-    Deterministic Retrieval stage for RAGstream.
+    Deterministic Retrieval stage orchestrator for RAGstream.
 
-Scope of this file:
-    - Read retrieval query text from the current SuperPrompt
-      (TASK / PURPOSE / CONTEXT).
-    - Split that retrieval query into overlapping query pieces.
-    - Open the active project's Chroma document store.
-    - Compare every stored chunk embedding against all query-piece embeddings.
-    - Aggregate per-chunk similarities with LogAvgExp (tau = 9).
-    - Keep the top-k chunks.
-    - Hydrate real Chunk objects from doc_raw using the same chunking logic
-      as ingestion.
-    - Write the Retrieval stage result back into the same SuperPrompt.
+Stage-1 refactor design:
+    - Keep Retriever as the top-level stage class used by the controller.
+    - Move query-building / query-splitting support logic outside this file.
+    - Move the current embedding-based ranking core into RetrieverEmb.
+    - Keep hydration and SuperPrompt write-back in this file for now.
+    - Preserve the current external Retriever.run(...) contract and current
+      retrieval behavior as closely as possible.
 
-Non-goals:
-    - No reranking here.
-    - No A3 filtering here.
-    - No GUI rendering here.
-    - No final prompt composition here.
+Current Stage-1 flow inside Retriever.run(...):
+    1) PreProcessing
+       - build retrieval query text from SuperPrompt
+       - split the query into overlapping query pieces
+    2) Retriever_EMB
+       - run the current embedding-based retrieval backend
+    3) Retriever_SPLADE
+       - reserved for the later stage (commented placeholder only)
+    4) PostProcessing
+       - hydrate ranked rows into real Chunk objects
+       - write the retrieval result into SuperPrompt
+
+Non-goals of this Stage-1 refactor:
+    - No SPLADE implementation yet
+    - No RRF implementation yet
+    - No reranking changes yet
+    - No controller / GUI / SuperPrompt contract changes
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
-
-import numpy as np
+from typing import Any, Dict, List, Tuple
 
 from ragstream.ingestion.chunker import Chunker
 from ragstream.ingestion.embedder import Embedder
-from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
 from ragstream.orchestration.super_prompt import A3ChunkStatus, SuperPrompt
 from ragstream.retrieval.chunk import Chunk
 from ragstream.retrieval.doc_score import DocScore  # compatibility re-export
+from ragstream.retrieval.retriever_emb import RetrieverEmb
+from ragstream.retrieval.smart_query_splitter import  split_query_into_pieces
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
+
 
 # Keep old import compatibility:
 # from ragstream.retrieval.retriever import DocScore
 DocScore = DocScore
 
+# Ranked row returned by RetrieverEmb:
+# (chunk_id, retrieval_score, metadata)
+RankedRow = Tuple[str, float, Dict[str, Any]]
 
-# ---------------------------------------------------------------------
-# Module-level retrieval defaults
-# ---------------------------------------------------------------------
-
-# Fallback number of chunks to keep if the caller gives no valid top-k.
-DEFAULT_TOP_K = 100
-
-# Retrieval query splitting reuses the same deterministic windowing idea
-# as ingestion. These values MUST stay aligned with the active ingestion
-# chunking contract unless you intentionally change both sides together.
+# Retrieval query splitting defaults.
+# These MUST stay aligned with the current behavior during Stage 1 so that
+# the refactor preserves the same practical output as before.
 DEFAULT_QUERY_CHUNK_SIZE = 500
 DEFAULT_QUERY_OVERLAP = 100
-
-# Agreed retrieval aggregation constant:
-#P value, for P Norm Averaging
-DEFAULT_P_NORM = 10
 
 
 class Retriever:
     """
-    Deterministic Retrieval stage for document chunks.
+    Deterministic Retrieval stage orchestrator for document chunks.
 
     Design:
-    - Keep this class stateless with respect to pipeline history.
-      The evolving pipeline state lives in SuperPrompt.
-    - This class only reads the current SuperPrompt, computes retrieval,
-      and writes the retrieval result back into the same SuperPrompt.
-    - The controller decides when to call this class.
+    - Keep this class focused on stage orchestration.
+    - Keep low-level retrieval engine logic outside this file.
+    - Keep hydration + SuperPrompt write-back here for now.
+    - The evolving pipeline state still lives in SuperPrompt.
     """
 
     def __init__(
@@ -87,14 +88,12 @@ class Retriever:
         Args:
             doc_root:
                 Absolute path to the doc_raw root folder.
-                Example: .../data/doc_raw
             chroma_root:
                 Absolute path to the chroma_db root folder.
-                Example: .../data/chroma_db
             embedder:
-                Optional shared Embedder instance. If omitted, a default one is created.
+                Optional shared Embedder instance.
             chunker:
-                Optional shared Chunker instance. If omitted, a default one is created.
+                Optional shared Chunker instance.
         """
         self.doc_root = Path(doc_root).resolve()
         self.chroma_root = Path(chroma_root).resolve()
@@ -105,6 +104,15 @@ class Retriever:
         # Keep the chunk class explicit so hydration remains readable and testable.
         self.chunk_cls = Chunk
 
+        # Stage-1 backend: current embedding-based retriever moved out.
+        self.retriever_emb = RetrieverEmb(
+            chroma_root=str(self.chroma_root),
+            embedder=self.embedder,
+        )
+
+        # Future Stage-2 placeholder:
+        # self.retriever_splade = RetrieverSplade(...)
+
     # -----------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------
@@ -113,233 +121,92 @@ class Retriever:
         """
         Execute the Retrieval stage and update the same SuperPrompt in place.
 
-        Inputs:
-            sp:
-                The current evolving SuperPrompt, typically after PreProcessing / A2.
-            project_name:
-                The active project selected in the GUI.
-            top_k:
-                Number of chunks to keep after retrieval ranking.
+        Stage-1 refactor goal:
+        keep run(...) visually simple and orchestration-oriented.
+
+        Current visible flow:
+            1) PreProcessing
+            2) Retriever_EMB
+            3) Retriever_SPLADE (reserved for later)
+            4) PostProcessing
 
         Returns:
             The same SuperPrompt instance, mutated in place.
-
-        Effects on SuperPrompt:
-            - Writes hydrated Chunk objects into sp.base_context_chunks
-            - Writes the retrieval stage snapshot into sp.views_by_stage["retrieval"]
-            - Writes ordered chunk IDs into sp.final_selection_ids
-            - Appends "retrieval" to sp.history_of_stages
-            - Sets sp.stage = "retrieval"
         """
-        if sp is None:
-            raise ValueError("Retriever.run: 'sp' must not be None")
+        query_pieces = self._preprocess(sp)
 
-        project_name = (project_name or "").strip()
-        if not project_name:
-            raise ValueError("Retriever.run: project_name must not be empty")
-
-        if not self.doc_root.exists():
-            raise FileNotFoundError(f"Retriever.run: doc_root does not exist: {self.doc_root}")
-
-        project_db_dir = self.chroma_root / project_name
-        if not project_db_dir.exists():
-            raise FileNotFoundError(
-                f"Retriever.run: active project Chroma DB does not exist: {project_db_dir}"
-            )
-
-        query_text = self._build_query_text(sp)
-        if not query_text:
-            raise ValueError(
-                "Retriever.run: retrieval query is empty. "
-                "At least one of TASK / PURPOSE / CONTEXT must be present."
-            )
-
-        query_pieces = self._split_query_into_pieces(
-            query_text=query_text,
-            chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
-            overlap=DEFAULT_QUERY_OVERLAP,
-        )
-
-        ranked_rows = self._retrieve_and_rank(
+        ranked_rows_emb = self.retriever_emb.run(
             project_name=project_name,
             query_pieces=query_pieces,
             top_k=top_k,
         )
 
-        valid_ranked_rows, hydrated_chunks = self._hydrate_ranked_chunks(ranked_rows)
-        self._write_stage_to_superprompt(sp, valid_ranked_rows, hydrated_chunks)
+        # Future Stage-2 placeholder:
+        # ranked_rows_splade = self.retriever_splade.run(
+        #     project_name=project_name,
+        #     query_pieces=query_pieces,
+        #     top_k=top_k,
+        # )
+        #
+        # Future Stage-2 placeholder:
+        # ranked_rows = rrf_merge(ranked_rows_emb, ranked_rows_splade)
+        #
+        # Stage-1 refactor:
+        # only the embedding-based branch exists, so it is the final retrieval
+        # result for now.
+        ranked_rows = ranked_rows_emb
 
+        sp = self._postprocess(sp, ranked_rows)
         return sp
 
     # -----------------------------------------------------------------
-    # Internal helpers
+    # Stage-level orchestration helpers
     # -----------------------------------------------------------------
 
-    def _build_query_text(self, sp: SuperPrompt) -> str:
+    def _preprocess(self, sp: SuperPrompt) -> List[str]:
         """
-        Build the retrieval query text from the structured SuperPrompt body.
+        Build the retrieval query text from SuperPrompt and split it into
+        overlapping query pieces.
 
-        Current design choice:
-        - Use only TASK / PURPOSE / CONTEXT.
-        - Keep the order explicit and stable.
-        - Skip empty fields.
+        Stage-1 refactor note:
+        - The actual query-building and query-splitting support logic lives
+          outside this file.
+        - Retriever keeps only the stage-level orchestration.
         """
-        blocks: List[str] = []
+        query_text = SuperPromptProjector.build_query_text(sp)
 
-        task = (sp.body.get("task") or "").strip()
-        purpose = (sp.body.get("purpose") or "").strip()
-        context = (sp.body.get("context") or "").strip()
-
-        if task:
-            blocks.append("## TASK")
-            blocks.append(task)
-            blocks.append("")
-
-        if purpose:
-            blocks.append("## PURPOSE")
-            blocks.append(purpose)
-            blocks.append("")
-
-        if context:
-            blocks.append("## CONTEXT")
-            blocks.append(context)
-            blocks.append("")
-
-        return "\n".join(blocks).strip()
-
-    def _split_query_into_pieces(
-        self,
-        *,
-        query_text: str,
-        chunk_size: int,
-        overlap: int,
-    ) -> List[str]:
-        """
-        Split the retrieval query into overlapping query pieces.
-
-        We intentionally reuse the same deterministic chunking idea as ingestion
-        so the prompt side and document side follow the same windowing culture.
-        """
-        query_text = (query_text or "").strip()
-        if not query_text:
-            return []
-
-        pieces = self.chunker.split(
-            file_path="__prompt__",
-            text=query_text,
-            chunk_size=chunk_size,
-            overlap=overlap,
+        query_pieces = split_query_into_pieces(
+            query_text=query_text,
+            chunker=self.chunker,
+            chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
+            overlap=DEFAULT_QUERY_OVERLAP,
         )
 
-        return [chunk_text for _fp, chunk_text in pieces if (chunk_text or "").strip()]
+        return query_pieces
 
-    def _retrieve_and_rank(
-        self,
-        *,
-        project_name: str,
-        query_pieces: List[str],
-        top_k: int,
-    ) -> List[Dict[str, Any]]:
+    def _postprocess(self, sp: SuperPrompt, ranked_rows: List[RankedRow]) -> SuperPrompt:
         """
-        Read all stored chunk embeddings from the active project Chroma DB,
-        score them against all query pieces, aggregate with LogAvgExp, and keep top-k.
+        Complete the Retrieval stage after the backend retriever has finished.
 
-        Return format:
-            List of dictionaries, one per selected chunk:
-            {
-                "id": <chunk_id>,
-                "score": <retrieval_score>,
-                "status": A3ChunkStatus.SELECTED,
-                "meta": <stored metadata dict>
-            }
+        Current Stage-1 responsibilities:
+        - hydrate ranked rows into real Chunk objects
+        - write the retrieval result into SuperPrompt
 
-        Notes:
-        - This stage is deterministic.
-        - No reranking happens here.
-        - We read ALL stored chunk embeddings because the agreed Retrieval stage
-          should compute its own final ranking across the complete project store.
+        Future Stage-2 location:
+        - RRF fusion can also live in this post-processing layer before hydration
         """
-        if not query_pieces:
-            return []
+        valid_ranked_rows, hydrated_chunks = self._hydrate_ranked_chunks(ranked_rows)
+        self._write_stage_to_superprompt(sp, valid_ranked_rows, hydrated_chunks)
+        return sp
 
-        k = int(top_k) if int(top_k) > 0 else DEFAULT_TOP_K
-
-        store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
-
-        raw = store.collection.get(include=["embeddings", "metadatas"])
-        ids: List[str] = raw.get("ids", []) if raw else []
-        metadatas: List[Dict[str, Any] | None] = raw.get("metadatas", []) if raw else []
-        embeddings = raw.get("embeddings", []) if raw else []
-
-        # embeddings may come back as a NumPy array, so never test it with
-        # "if not embeddings". Use explicit length checks instead.
-        if len(ids) == 0 or len(embeddings) == 0:
-            return []
-
-        if len(ids) != len(embeddings):
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: Chroma returned mismatched ids/embeddings lengths"
-            )
-
-        if len(metadatas) > 0 and len(metadatas) != len(ids):
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: Chroma returned mismatched ids/metadatas lengths"
-            )
-
-        query_vectors = self.embedder.embed(query_pieces)
-
-        # query_vectors may also be array-like, so use explicit length checks.
-        if len(query_vectors) == 0:
-            return []
-
-        A = np.asarray(embeddings, dtype=np.float32)    # stored chunks: [N, D]
-        Q = np.asarray(query_vectors, dtype=np.float32) # query pieces:  [M, D]
-
-        if A.ndim != 2 or Q.ndim != 2:
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: unexpected embedding dimensions returned by Chroma/OpenAI"
-            )
-
-        if A.shape[1] != Q.shape[1]:
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: stored vectors and query vectors have different dimensions"
-            )
-
-        # Normalize rows to compute cosine similarity as a matrix product.
-        # Similarities shape: [N_chunks, M_query_pieces]
-        A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
-        Q_norm = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-12)
-        sims = A_norm @ Q_norm.T
-
-        # P-mean aggregation over the query-piece axis.
-        # Strongly favors the best match, but is still not pure max.
-        p = DEFAULT_P_NORM
-        sims_pos = np.clip(sims, 0.0, None)
-        aggregated_scores = np.power(np.mean(np.power(sims_pos, p), axis=1), 1.0 / p)
-
-        rows: List[Dict[str, Any]] = []
-        for idx, chunk_id in enumerate(ids):
-            meta = metadatas[idx] if (len(metadatas) > 0 and metadatas[idx] is not None) else {}
-            rows.append(
-                {
-                    "id": chunk_id,
-                    "score": float(aggregated_scores[idx]),
-                    "status": A3ChunkStatus.SELECTED,
-                    "meta": meta,
-                }
-            )
-
-        # Deterministic sort:
-        # 1) higher score first
-        # 2) stable fallback by chunk_id
-        rows.sort(key=lambda row: (-row["score"], row["id"]))
-
-        return rows[: min(k, len(rows))]
+    # -----------------------------------------------------------------
+    # Internal helpers kept in retriever.py for Stage 1
+    # -----------------------------------------------------------------
 
     def _hydrate_ranked_chunks(
         self,
-        ranked_rows: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], List[Chunk]]:
+        ranked_rows: List[RankedRow],
+    ) -> tuple[List[RankedRow], List[Chunk]]:
         """
         Reconstruct real Chunk objects for the selected ranked rows.
 
@@ -360,7 +227,7 @@ class Retriever:
             hydrated_chunks:
                 Chunk objects aligned 1:1 with valid_ranked_rows.
         """
-        valid_ranked_rows: List[Dict[str, Any]] = []
+        valid_ranked_rows: List[RankedRow] = []
         hydrated: List[Chunk] = []
 
         # Local caches avoid re-reading and re-splitting the same source file
@@ -370,9 +237,8 @@ class Retriever:
 
         step = DEFAULT_QUERY_CHUNK_SIZE - DEFAULT_QUERY_OVERLAP
 
-        for row in ranked_rows:
-            chunk_id = row["id"]
-            meta = row.get("meta", {}) or {}
+        for chunk_id, score, meta in ranked_rows:
+            meta = meta or {}
 
             rel_path = str(meta.get("path") or "").strip()
             if not rel_path:
@@ -418,7 +284,7 @@ class Retriever:
                 meta=dict(meta),
             )
 
-            valid_ranked_rows.append(row)
+            valid_ranked_rows.append((chunk_id, float(score), dict(meta)))
             hydrated.append(chunk_obj)
 
         return valid_ranked_rows, hydrated
@@ -426,7 +292,7 @@ class Retriever:
     def _write_stage_to_superprompt(
         self,
         sp: SuperPrompt,
-        ranked_rows: List[Dict[str, Any]],
+        ranked_rows: List[RankedRow],
         hydrated_chunks: List[Chunk],
     ) -> None:
         """
@@ -452,13 +318,9 @@ class Retriever:
         retrieval_view: List[tuple[str, float, A3ChunkStatus]] = []
         final_ids: List[str] = []
 
-        for row in ranked_rows:
-            chunk_id = str(row["id"])
-            score = float(row["score"])
-            status = row["status"]
-
-            retrieval_view.append((chunk_id, score, status))
-            final_ids.append(chunk_id)
+        for chunk_id, score, _meta in ranked_rows:
+            retrieval_view.append((str(chunk_id), float(score), A3ChunkStatus.SELECTED))
+            final_ids.append(str(chunk_id))
 
         sp.views_by_stage["retrieval"] = retrieval_view
         sp.final_selection_ids = final_ids
