@@ -228,3 +228,6 @@ data/*
 !data/agents/
 !data/agents/**
 training/*
+ragstream/app/Hook_ChatGTP.py
+ragstream/app/Hook_ChatGTP2.py
+ragstream/app/Hook_ChatGTP_TO_DO.txt
