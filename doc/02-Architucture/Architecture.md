@@ -1,5 +1,9 @@
-````markdown
-# Architecture – RAGstream (Nov 2025)
+# Architecture – RAGstream (14.04.2026)
+
+Last sync: 14.04.2026
+
+Note for future maintenance:
+- When new implementation-aligned decisions or features are added here, they should be date-stamped inline so the chronology stays visible.
 
 This document describes the end-to-end architecture of RAGstream and sits between the requirements and the UML diagrams. It explains how the main subsystems (Ingestion & Memory, RAG Pipeline, Agent Stack, Controller, GUI, and Session/History) fit together and how the core data models flow between them.
 
@@ -26,8 +30,10 @@ The rest of this document reuses the previous Architecture_2 structure but assum
                                      │───────────────────────────────────│
  User adds / updates docs  ─────────►│ 1  DocumentLoader (paths / watch) │
                                      │ 2  Chunker  (recursive splitter)  │
-                                     │ 3  Embedder (OpenAI embeddings)   │
-                                     │ 4  VectorStore.add() (Chroma DB)  │
+                                     │ 3  Dense Embedder                 │
+                                     │ 4  SPLADE Embedder                │
+                                     │ 5  DenseStore.add() (Chroma DB)   │
+                                     │ 6  SparseStore.add() (SPLADE DB)  │
                                      └───────────────────────────────────┘
                          ▲              ▲
                          │ builds       │ required
@@ -63,7 +69,7 @@ The ingestion pipeline, FileManifest, and vector store behavior are defined in d
 
 Conceptually, RAGstream runs as a loop over “sessions” in the GUI:
 
-1. The user selects a project (which fixes the active `data/chroma_db/<project>/` and FileManifest).
+1. The user selects a project (which fixes the active `data/chroma_db/<project>/`, `data/splade_db/<project>/`, and the project FileManifest).
 2. The GUI creates or reuses a controller instance with an associated SuperPrompt.
 3. The user writes a free-form prompt and either steps through the pipeline or runs it automatically.
 4. The controller calls deterministic functions (preprocessing, retrieval, reranking) and LLM-based agents (A2, A3, A4, A5) in the order defined in Requirements_RAG_Pipeline.md.
@@ -73,7 +79,7 @@ The core data carriers from the requirements:
 
 * SuperPrompt — the central “what we are doing now” object, owned by the controller and passed through the 8 stages.
 * FileManifest — the authoritative, append-only record of project documents and their versions.
-* VectorStore — Chroma collections that store embeddings and metadata for retrieval.
+* VectorStores — the dense Chroma store plus the parallel SPLADE sparse store that together support hybrid retrieval.
 * Conversation log + Layer-G/E — the history representation (append-only log for G, selection-only vector store for E).
 
 ---
@@ -92,10 +98,10 @@ GUI / Controller
   A2  Prompt Shaper        (LLM agent: shapes problem, sets system / task / tone, etc.)
       │
       ▼
-      Retrieval            (deterministic: build query from task/purpose/context, run dense + SPLADE first-pass retrieval, fuse with RRF)
+      Retrieval            (deterministic: build query from task/purpose/context, run dense + SPLADE first-pass retrieval, fuse with weighted RRF)
       │
       ▼
-      ReRanker             (deterministic: bounded ColBERT reranking with query splitting and fused final ranking, form views_by_stage["reranked"])
+      ReRanker             (deterministic: current bounded reranking stage; immediate next direction is ColBERT)
       │
       ▼
   A3  NLI Gate             (LLM agent: chunk labeling and duplicate marking on reranked candidates)
@@ -136,7 +142,7 @@ Controller (AppController in controller.py, see Requirements_Orchestration_Contr
 * Owns the current SuperPrompt instance and controls its lifecycle.
 * Provides methods like `preprocess()`, `run_a2()`, `run_retrieval()`, `run_reranker()`, `run_a3()`, `run_a4()`, `run_a5()`, `build_final_prompt()`.
 * Each method applies a single stage to the active SuperPrompt (or runs multiple stages in auto-mode) and returns the updated SuperPrompt to the GUI.
-* Manages project configuration (which Chroma DB, which FileManifest, which agent configs).
+* Manages project configuration (which dense store, which sparse store, which FileManifest, which agent configs).
 * Manages session state such as: last_error, history_profile, and any debug handles.
 * May keep shared long-lived helper instances (e.g. AgentFactory, LLMClient, A2 agent wrapper, Retriever) as controller-owned infrastructure objects.
 
@@ -158,8 +164,9 @@ The ingestion subsystem turns project files and (later) conversation history int
 
 Static documents:
 
-* Directory layout under `data/` separates raw documents (`data/doc_raw/`) from vector stores (`data/chroma_db/<project>/`).
-* Loader, chunker, embedder, and vector_store modules form a simple pipeline that can be run via CLI or GUI.
+* Directory layout under `data/` separates raw documents (`data/doc_raw/`) from the dense store (`data/chroma_db/<project>/`) and the sparse store (`data/splade_db/<project>/`).
+* Loader, chunker, dense embedder, SPLADE embedder, and vector store modules form one parallel ingestion pipeline that can be run via CLI or GUI.
+* [14.04.2026] The current ingestion architecture uses one canonical chunking pass and writes the same chunk IDs and metadata into both the dense and sparse document stores.
 * FileManifest is the single source of truth for “which files and versions are active in this project”.
 
 Conversation history (future / partial):
@@ -239,9 +246,10 @@ The architectural point is that debug logging and user transparency are separate
 
 ## Persistence & Modularity
 
-Vectors for documents and history persist as Chroma on-disk collections under `data/chroma_db/`. This allows you to:
+Dense document vectors persist as Chroma on-disk collections under `data/chroma_db/`. Sparse document representations persist separately under `data/splade_db/`. This allows you to:
 
-* swap embedding models with a controlled migration path,
+* keep dense and sparse retrieval physically separate but logically aligned,
+* swap embedding or sparse models with a controlled migration path,
 * back up and restore project knowledge,
 * and run multiple projects side by side without collisions.
 
@@ -259,24 +267,19 @@ Modules are kept small and focused, following the mapping in Requirements_Knowle
 The non-functional targets (performance, cost, robustness, extensibility) are specified more precisely in the requirements and backlog, but at architecture level the main points are:
 
 * Local-first, research-grade: everything can run on your local machine without external services beyond the LLM API and embeddings.
-* Deterministic where possible: retrieval, reranking, and selection logic are deterministic functions over FileManifest and vector stores.
+* Deterministic where possible: ingestion, retrieval, reranking, and selection logic are deterministic functions over FileManifest and the aligned dense/sparse stores.
 * Agentic but controlled: LLM-based stages are stateless, small, and driven by explicit JSON configs rather than ad-hoc prompts.
 * Extensible: new agents or stages can be added without breaking existing ones, as long as they respect the SuperPrompt and Agent Stack contracts.
 
 ---
 
-# Sync Report (this update)
+# Sync Report (14.04.2026 update)
 
 **Precisely applied changes (minimal edits only):**
 
-* Added an explicit “Relationship to the requirements” section that ties this architecture to:
-  * Requirements_Main.md
-  * Requirements_RAG_Pipeline.md
-  * Requirements_AgentStack.md
-  * Requirements_Orchestration_Controller.md
-  * Requirements_Ingestion_Memory.md
-  * Requirements_GUI.md
-* Added an explicit “Relationship to UML” section describing how the skeleton UML and per-module UMLs relate to this document.
-* Clarified that this file is a narrative glue layer: requirements are behavioral truth, UML is structural truth, Architecture_2.md explains how the pieces fit together.
-* Left the existing subsystem and feature descriptions intact, treating them as summaries of the new requirement files rather than independent specifications.
-````
+* Added a current sync date at the top and a small maintenance note for future inline date-stamps.
+* Updated the architecture narrative from dense-only document persistence to parallel dense + SPLADE document persistence.
+* Updated the high-level runtime wording so project selection now fixes both `chroma_db/<project>` and `splade_db/<project>`.
+* Updated Retrieval wording from generic RRF to weighted RRF.
+* Corrected the ReRanker wording so it no longer claims that ColBERT is already the active implementation; ColBERT remains the immediate next direction.
+* Updated persistence/modularity wording so dense Chroma and sparse SPLADE stores are both part of the architecture.

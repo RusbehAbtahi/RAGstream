@@ -1,5 +1,10 @@
 # Requirements_RAG_Pipeline.md
 
+Last update: 14.04.2026
+
+Note for future maintenance:
+- When new implementation-aligned decisions or stage changes are added here, they should be date-stamped inline so the chronology stays visible.
+
 Goal: define the 8-step RAG pipeline (A0…A5 + Prompt Builder), how each stage mutates `SuperPrompt`, which parts are deterministic vs LLM/hybrid, and how the stages fit together in both manual (GUI buttons) and auto mode. This document assumes the data model in `super_prompt.py` and the agent stack described in `Requirements_AgentStack.md`.
 
 ---
@@ -8,10 +13,10 @@ Goal: define the 8-step RAG pipeline (A0…A5 + Prompt Builder), how each stage 
 
 1. The pipeline is a single linear chain of stages, driven either:
 
-   * manually via the 8 GUI buttons in `ui_streamlit_2.py`, or
+   * manually via the 8 GUI buttons in `ui_streamlit.py`, or
    * automatically by the controller in the same order.
 2. The canonical state carrier is `SuperPrompt` (class in `ragstream/orchestration/super_prompt.py`). All stages are **memoryless**: they take `(SuperPrompt, config)` as input, mutate it in a controlled way, and return it; no stage keeps its own long-lived internal memory.
-3. Retrieval and reranking are fully **deterministic** at ranking level. Retrieval uses CPU-friendly dense + sparse retrieval, and ReRanker uses a bounded late-interaction reranking stage. All other “A-agents” use the neutral agent stack (`AgentFactory`, `AgentPrompt`, `llm_client`) defined in `Requirements_AgentStack.md`.
+3. Retrieval and reranking are fully **deterministic** at ranking level. Retrieval uses CPU-friendly dense + sparse retrieval, and ReRanker uses a bounded deterministic reranking stage. The current implementation is cross-encoder based; the agreed immediate next direction is ColBERT. All other “A-agents” use the neutral agent stack (`AgentFactory`, `AgentPrompt`, `llm_client`) defined in `Requirements_AgentStack.md`.
 4. The pipeline is designed so that constants (N0, N1, …) are **configurable** via JSON/YAML; no hard-coded “magic numbers” are allowed in code.
 
 ---
@@ -50,8 +55,8 @@ Button sequence (manual mode), which is also the execution order in auto mode:
 | ---- | ------------------ | -------------- | -------------- | ------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1    | A0_PreProcessing   | `preprocessed` | Function/Agent | Deterministic + optional LLM fallback | Extractor + Chooser (if LLM enabled) | Canonicalize user prompt into `sp.body`, enforce MUST fields, build `prompt_ready`.                                                                     |
 | 2    | A2_PromptShaper    | `a2`           | Agent          | LLM-only                              | Chooser                              | Classify `system`, `audience`, `tone`, `depth`, `confidence` from task/context/purpose.                                                                 |
-| 3    | Retrieval          | `retrieval`    | Function       | No LLM                                | –                                    | Hybrid first-pass retrieval (dense bi-encoder + SPLADE + RRF), populate `base_context_chunks` and `views_by_stage["retrieval"]`.                      |
-| 4    | ReRanker           | `reranked`     | Function       | Helper agent allowed for query split  | –                                    | Bounded ColBERT reranking of top Retrieval candidates, with query splitting and fused ranking written to `views_by_stage["reranked"]`.                |
+| 3    | Retrieval          | `retrieval`    | Function       | No LLM                                | –                                    | Hybrid first-pass retrieval: dense branch selects the candidate IDs, SPLADE scores exactly those same candidate IDs, then weighted RRF populates `base_context_chunks` and `views_by_stage["retrieval"]`. |
+| 4    | ReRanker           | `reranked`     | Function       | No LLM in the current code path       | –                                    | Current bounded cross-encoder reranking of top Retrieval candidates; agreed immediate next direction is ColBERT.                                        |
 | 5    | A3_NLI_Gate        | `a3`           | Agent          | Hybrid                                | Multi-Chooser                        | LLM-based chunk labeling and duplicate marking on the reranked candidates, write `views_by_stage["a3"]` and update `final_selection_ids`.            |
 | 6    | A4_Condenser       | `a4`           | Agent          | LLM-only                              | Writer                               | Condense selected chunks into `S_CTX_MD`, enforce token budget, finalize `final_selection_ids`.                                                         |
 | 7    | A5_Format_Enforcer | `a5`           | Agent          | LLM-only                              | Writer/Extractor                     | Normalize instructions and output format rules in `sp.body`/`extras` so final answer obeys structure.                                                   |
@@ -75,10 +80,10 @@ All stages use the same `SuperPrompt` invariants:
 
 The pipeline uses named limits instead of uncontrolled magic numbers. The current retrieval implementation uses these practical defaults:
 
-* `QUERY_CHUNK_SIZE = 500`
+* `QUERY_CHUNK_SIZE = 1200`
 
   * Query decomposition window size for Retrieval. The same chunking idea as ingestion is reused.
-* `QUERY_OVERLAP = 100`
+* `QUERY_OVERLAP = 120`
 
   * Overlap between retrieval query pieces.
 * `DEFAULT_TOP_K = 50`
@@ -86,7 +91,16 @@ The pipeline uses named limits instead of uncontrolled magic numbers. The curren
   * Default GUI/runtime value for the number of Retrieval candidates to keep.
 * `N1_RETR_MAX_CANDIDATES = 50`
 
-  * Hard cap for the Retrieval result band after dense + SPLADE fusion.
+  * Hard cap for the Retrieval result band after dense + SPLADE scoring over the dense-selected candidate set.
+* `RRF_K = 60`
+
+  * Current reciprocal-rank fusion constant.
+* `RRF_WEIGHT_DENSE = 5.9`
+
+  * Current weight for the dense branch in Retrieval fusion.
+* `RRF_WEIGHT_SPLADE = 0.0`
+
+  * Current weight for the SPLADE branch in Retrieval fusion.
 * `N2_RERANK_TOP_K = 30`
 
   * Number of candidates from `views_by_stage["retrieval"]` passed into the ReRanker stage.
@@ -192,7 +206,9 @@ No retrieval fields are touched here.
 
 Purpose
 
-* Build the first ranked candidate list of chunks from the active project document store.
+* Build the first ranked candidate list of chunks from the active project document stores.
+* [14.04.2026] The current implemented Retrieval stage is hybrid and already uses dense + SPLADE + weighted RRF.
+* [14.04.2026] The current candidate-selection rule is now fixed as: dense first, SPLADE second. Dense Retrieval selects the candidate IDs, and SPLADE must score exactly those same IDs instead of running an independent top-k search.
 
 Nature
 
@@ -202,7 +218,7 @@ Nature
 Inputs
 
 * `sp: SuperPrompt` with `stage="a2"`.
-* Active project Chroma store (`data/chroma_db/<project>`), with raw source files in `data/doc_raw/<project>`.
+* Active project dense store (`data/chroma_db/<project>`), active project sparse store (`data/splade_db/<project>`), with raw source files in `data/doc_raw/<project>`.
 * Config:
 
   * runtime `top_k`, query `chunk_size`, query `overlap`, dense embedding model name, SPLADE model/config, and RRF parameters.
@@ -212,25 +228,39 @@ Behaviour
 1. Query decomposition:
 
    * Build a **normalized query string** from `sp.body["task"]`, `sp.body["context"]`, `sp.body["purpose"]`.
-   * Split that query string with deterministic chunking (`chunk_size = 500`, `overlap = 100`).
-2. Embed all query pieces and compare them against all stored vectors from the active project Chroma collection.
-3. Aggregate per-chunk scores across pieces with **LogAvgExp (τ = 9)**.
-4. Sort descending by retrieval score and keep the active runtime top-k.
-5. Reconstruct the real chunk text from `data/doc_raw/<project>` using the stored metadata (`path`, `chunk_idx`) and the same chunker. If a stale DB row points to a missing raw file, skip that row instead of failing the stage.
-6. Populate `sp.base_context_chunks` with the hydrated `Chunk` objects.
-7. Write:
+   * Split that query string with deterministic chunking (`chunk_size = 1200`, `overlap = 120`).
+2. Dense branch:
 
-   * `sp.views_by_stage["retrieval"] = [(chunk_id, retrieval_score, SELECTED), ...]` in score order.
+   * Embed all query pieces with the dense embedding model.
+   * Compare them against all stored dense vectors from the active project Chroma collection.
+   * Aggregate per-chunk dense scores across pieces with p-norm averaging (`p = 10`).
+   * Sort globally and select the active `top_k` dense candidate IDs.
+3. SPLADE branch:
+
+   * Encode all query pieces with the active SPLADE query encoder.
+   * Compare them against the active project sparse store in `data/splade_db/<project>`.
+   * Aggregate per-chunk sparse scores across pieces with p-norm averaging (`p = 10`).
+   * [14.04.2026] SPLADE does not perform its own independent top-k selection anymore in the Retrieval stage.
+   * [14.04.2026] SPLADE must score exactly the dense-selected candidate IDs from step 2.
+4. Fuse both ranked lists with weighted reciprocal-rank fusion using the active RRF parameters.
+5. [14.04.2026] The current implemented weighting is dense `5.9` and SPLADE `0.0`.
+6. [14.04.2026] Because the current dense-selected IDs are also the SPLADE scoring set, every final Retrieval candidate is expected to have both dense and SPLADE score metadata available for GUI/debug display.
+7. Reconstruct the real chunk text from `data/doc_raw/<project>` using the stored metadata (`path`, `chunk_idx`) and the same chunker. If a stale DB row points to a missing raw file, skip that row instead of failing the stage.
+8. Populate `sp.base_context_chunks` with the hydrated `Chunk` objects.
+9. Write:
+
+   * `sp.views_by_stage["retrieval"] = [(chunk_id, retrieval_score, SELECTED), ...]` in fused score order.
    * `sp.final_selection_ids = [chunk_id_1, chunk_id_2, ...]` in the same order for the current GUI / intermediate stage view.
    * `sp.stage = "retrieval"` and append to history.
+10. [14.04.2026] The neutral RRF merger remains branch-agnostic; retrieval-specific metadata names needed by rendering are projected in `Retriever` after fusion and before hydration/write-back.
 
-The retrieval step remains independent from ReRanker and A3.
+The Retrieval step remains independent from ReRanker and A3.
 
 ### 5.4 ReRanker
 
 Purpose
 
-* Use a bounded late-interaction reranker to refine the ranking of the top candidates from Retrieval without discarding the Retrieval backbone.
+* Use a bounded reranking stage to refine the ranking of the top candidates from Retrieval without discarding the Retrieval backbone.
 
 Nature
 
@@ -241,24 +271,26 @@ Inputs
 
 * `sp: SuperPrompt` with `stage="retrieval"`.
 * Candidate stage snapshots: first `N2_RERANK_TOP_K` items from `sp.views_by_stage["retrieval"]`.
-* ReRanker model direction: ColBERT.
-* Optional helper agent: `NLP_Splitter`.
+* Current implemented model direction: cross-encoder reranking.
+* Current implemented model: `cross-encoder/ms-marco-MiniLM-L-12-v2`.
+* [14.04.2026] Immediate next direction: ColBERT.
+* Optional helper agent: `NLP_Splitter` remains a future helper for the later ColBERT path.
 
 Behaviour
 
-1. Build the ReRanker query source from `sp.body["task"]`, `sp.body["context"]`, and `sp.body["purpose"]`.
-2. If the query is short enough for the active ColBERT configuration, use it directly.
-3. If the query is too long, call the helper agent `NLP_Splitter` to produce several meaning-based query parts under the configured token limit `N2B_SPLITTER_MAX_TOKENS`.
-4. For each query part, run ColBERT against the bounded candidate pool from Retrieval.
-5. Fuse the per-part ColBERT rankings into one ColBERT ranking.
-6. Fuse that ColBERT ranking with the previous Retrieval ranking for the same top-30 candidate pool.
-7. Write:
+1. Build one ReRanker query from `sp.body["task"]`, `sp.body["context"]`, and `sp.body["purpose"]`.
+2. Read the bounded candidate pool from `sp.views_by_stage["retrieval"]`.
+3. Dynamically clean chunk text before scoring, if needed by the current implementation.
+4. Score each `(query, chunk)` pair with the active cross-encoder model.
+5. Sort by reranker score.
+6. Write:
 
-   * `sp.views_by_stage["reranked"] = [(chunk_id, reranked_fused_score, SELECTED), ...]` in the new fused order.
-8. Update:
+   * `sp.views_by_stage["reranked"] = [(chunk_id, reranker_score, SELECTED), ...]` in the new order.
+7. Update:
 
    * `sp.final_selection_ids` to the reranked ids for the current intermediate view.
    * `sp.stage = "reranked"`; append history.
+8. [14.04.2026] The current implemented ReRanker is still the cross-encoder path. ColBERT is the agreed immediate next step, but it is not yet the active code path.
 
 ReRanker must therefore act as a bounded refinement stage, not as a blind overwrite of the Retrieval backbone.
 
@@ -476,4 +508,4 @@ The RAG pipeline is considered correctly implemented when:
    * a normalized Prompt block,
    * a condensed S_CTX block,
    * clearly fenced attachments for manual inspection.
-
+6. [14.04.2026] For the current Retrieval design, every chunk that survives into the Retrieval-stage final display is expected to carry both dense and SPLADE score metadata, because SPLADE scores the same dense-selected candidate IDs rather than an unrelated independent top-k set.

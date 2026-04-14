@@ -1,5 +1,10 @@
 # Requirements_Ingestion_Memory.md
 
+Last update: 14.04.2026
+
+Note for future maintenance:
+- When new implementation-aligned decisions or features are added here, they should be date-stamped inline so the chronology stays visible.
+
 1. Scope and Goals
 
 ---
@@ -25,7 +30,7 @@
 
 4. Design principles:
 
-   * One clear, stable pipeline: `source text → chunks → embeddings → vector store`.
+   * One clear, stable pipeline: `source text → canonical chunks → dense embeddings + sparse representations → persistent stores`.
    * Stateless ingestion runs (no hidden global state).
    * Deterministic IDs and metadata so retrieval and logs line up.
    * Durability: all state on disk (no transient-only memory).
@@ -46,7 +51,8 @@
 2. Under `ROOT/data/` the following logical domains exist:
 
    * `doc_raw/` – raw project documents (static).
-   * `chroma_db/` – vector stores for documents (static embeddings).
+   * `chroma_db/` – dense vector stores for documents (static embeddings).
+   * `splade_db/` – sparse document stores for SPLADE term-weight representations.
    * `history/` – conversation logs and history vector stores (future).
 
 2.2 Document domain
@@ -58,8 +64,13 @@
 
 2. `data/chroma_db/<project>/`:
 
-   * Chroma collection(s) backing that project’s document vectors.
-   * A file manifest storing file hashes/mtimes and ingestion state.
+   * Chroma collection(s) backing that project’s dense document vectors.
+   * The current project file manifest (`file_manifest.json`) is stored here.
+
+3. `data/splade_db/<project>/`:
+
+   * Persistent sparse store for that project’s SPLADE document representations.
+   * Uses the same chunk IDs and document metadata as the dense branch.
 
 2.3 History domain (future)
 
@@ -85,11 +96,13 @@
 
    * Scan a given `doc_raw/<project>` folder.
    * Detect new/changed/deleted files via a file manifest.
-   * Load, chunk, embed, and upsert only changed content into the Chroma DB.
-   * Optionally delete stale embeddings for removed or changed files.
-   * Leave a durable manifest and vector store for retrieval.
+   * Load, chunk, encode, and upsert only changed content into the dense and sparse document stores.
+   * Optionally delete stale dense/sparse representations for removed or changed files.
+   * Leave a durable manifest and aligned persistent stores for retrieval.
 
-2. For the **intermediate GUI phase**, document ingestion is considered **complete** and stable; further changes must be minor and backward compatible.
+2. [14.04.2026] The current implemented document-ingestion direction is parallel dense + SPLADE ingestion with one canonical chunking pass and one shared chunk-id scheme.
+
+3. For the **intermediate GUI phase**, document ingestion is considered **complete** and stable; further changes must be minor and backward compatible.
 
 3.2 Components
 
@@ -101,7 +114,8 @@
      * `project_name` (subfolder under `doc_root`)
    * Outputs:
 
-     * `(abs_path, rel_path, text)` for each discovered file eligible for ingestion.
+     * `(abs_path, text)` for each discovered file eligible for ingestion.
+     * Relative path is derived later by `IngestionManager` from `doc_root`.
 
 2. `Chunker` (`ingestion/chunker.py`):
 
@@ -111,7 +125,8 @@
      * Chunking config (max tokens or characters, overlap).
    * Outputs:
 
-     * List of `Chunk` objects with `chunk_idx` and `chunk_text`.
+     * Deterministically ordered text chunks, currently returned as `(file_path, chunk_text)` pairs.
+     * `chunk_idx` is assigned by enumeration order inside `IngestionManager`.
 
 3. `Embedder` (`ingestion/embedder.py`):
 
@@ -120,9 +135,18 @@
      * List of `chunk_text` strings.
    * Outputs:
 
-     * List of embedding vectors (e.g. Python lists/floats) aligned to the same order.
+     * List of dense embedding vectors aligned to the same order.
 
-4. `VectorStoreChroma` (`ingestion/vector_store_chroma.py` + `ingestion/chroma_vector_store_base.py`):
+4. `SpladeEmbedder` (`ingestion/splade_embedder.py`):
+
+   * Inputs:
+
+     * List of `chunk_text` strings.
+   * Outputs:
+
+     * List of sparse SPLADE representations aligned to the same order.
+
+5. `VectorStoreChroma` (`ingestion/vector_store_chroma.py` + `ingestion/chroma_vector_store_base.py`):
 
    * Wraps a Chroma collection with a simple API:
 
@@ -134,14 +158,26 @@
 
      * `chunk_id = f"{rel_path}::{sha256}::{chunk_idx}"`.
 
-5. `IngestionManager` (`ingestion/ingestion_manager.py`):
+6. `VectorStoreSplade` (`ingestion/vector_store_splade.py` + `ingestion/splade_vector_store_base.py`):
+
+   * Wraps the local SPLADE project store with a simple API parallel to the dense branch:
+
+     * `add(ids, vectors, metadatas)`
+     * `query(query_vector, k, filters)`
+     * `delete_where(filter_dict)`
+     * `snapshot()` (optional export/backup)
+   * Uses the same deterministic IDs as the dense branch:
+
+     * `chunk_id = f"{rel_path}::{sha256}::{chunk_idx}"`.
+
+7. `IngestionManager` (`ingestion/ingestion_manager.py`):
 
    * Orchestrates the whole document pipeline for one project:
 
      * loads the previous file manifest (if any),
      * computes current file metadata (path, sha256, size, mtime),
      * diffs old vs new,
-     * runs loader → chunker → embedder → vector store for changed files,
+     * runs loader → chunker → dense embedder / SPLADE embedder → dense/sparse stores for changed files,
      * applies optional deletion policies for old/tombstoned content,
      * writes a new manifest atomically.
 
@@ -166,9 +202,9 @@
 
 3. Behavior:
 
-   * Only `updated` (and new) files are re-chunked and re-embedded.
-   * Optionally, for each `updated` file, the old embeddings are deleted (see 3.4).
-   * Optionally, tombstoned files may have their embeddings deleted (if configured).
+   * Only `updated` (and new) files are re-chunked and re-encoded.
+   * Optionally, for each `updated` file, the old dense/sparse representations are deleted (see 3.4).
+   * Optionally, tombstoned files may have their dense/sparse representations deleted (if configured).
    * A new manifest is written only after successful ingestion; use atomic write to avoid partial manifests.
 
 3.4 Embedding and vector store policies
@@ -179,23 +215,25 @@
 
    * Chunk into `Chunk` objects (`chunk_idx = 0..N-1`).
 
-   * Embed all chunk texts with the configured embedding model.
+   * Build one canonical chunk list and one canonical metadata list.
 
    * Build `chunk_id` and metadata:
 
      * `id = f"{rel_path}::{sha256}::{chunk_idx}"`
      * `metadata = { "path": rel_path, "sha256": sha256, "chunk_idx": chunk_idx, "mtime": mtime }`
 
-   * Call `VectorStoreChroma.add(ids, embeddings, metadatas)`.
+   * Call `Embedder.embed(chunk_texts)` and `VectorStoreChroma.add(ids, embeddings, metadatas)`.
+
+   * [14.04.2026] If the sparse branch is enabled for the run, call `SpladeEmbedder.embed(chunk_texts)` and `VectorStoreSplade.add(ids, sparse_vectors, metadatas)` using the same `ids` and the same `metadatas`.
 
 2. Optional deletion:
 
    * For changed files:
 
-     * Delete rows where `path == rel_path` and `sha256 == old_sha256`.
+     * Delete rows where `path == rel_path` and `sha256 == old_sha256` from the dense store and, if present, from the sparse store.
    * For tombstones:
 
-     * Delete rows where `path == rel_path` and `sha256 == old_sha256` from the store.
+     * Delete rows where `path == rel_path` and `sha256 == old_sha256` from every active document store used by ingestion.
 
 3. IDs and metadata are **invariants**:
 
@@ -204,21 +242,24 @@
 
 3.5 API contract for document ingestion
 
-1. `IngestionManager.run(project_name, config)`:
+1. `IngestionManager.run(subfolder, ...)`:
 
    * Inputs:
 
-     * `project_name` (maps to `doc_raw/<project_name>`, `chroma_db/<project_name>`).
-     * `config` (chunking parameters, embedder config, deletion settings).
+     * `subfolder` / project name (maps to `doc_raw/<project_name>`, `chroma_db/<project_name>`, `splade_db/<project_name>`).
+     * Dense store, chunker, dense embedder, manifest path.
+     * Optional sparse store and sparse embedder.
+     * Chunking and deletion settings.
 
    * Outputs:
 
-     * `IngestionStats` (number of files scanned, updated, skipped, deleted; number of chunks embedded).
+     * `IngestionStats` (number of files scanned, updated, skipped, deleted; number of chunks added; aggregate and per-branch embedding/upsert counters).
 
    * Side effects:
 
-     * Chroma DB under `chroma_db/<project_name>` updated.
-     * `file_manifest.json` updated atomically.
+     * Dense store under `chroma_db/<project_name>` updated.
+     * Sparse store under `splade_db/<project_name>` updated when the sparse branch is active.
+     * `file_manifest.json` updated atomically in `chroma_db/<project_name>`.
 
 2. The controller and GUI:
 
@@ -465,7 +506,7 @@
 
 * Document ingestion is **implemented and stable**:
 
-  * `doc_raw/<project>` → loader → chunker → embedder → `chroma_db/<project>`, with manifest-driven incremental updates and deterministic IDs.
+  * `doc_raw/<project>` → loader → chunker → dense embedder + sparse embedder → `chroma_db/<project>` + `splade_db/<project>`, with manifest-driven incremental updates and deterministic IDs.
 
 * Conversation history ingestion is **planned**:
 

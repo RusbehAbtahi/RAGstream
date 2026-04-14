@@ -1,35 +1,39 @@
 # RAGstream_Implementation_Status.md
 
-Last update: 07.04.2026
+Last update: 14.04.2026
 
 Purpose:
 - This file is a compact implementation status snapshot.
 - It records what is already working now.
 - It also records the currently agreed next implementation direction.
 - It is not a requirement file and not a final roadmap.
+- For future updates, newly added decisions and implementation changes should be date-stamped inside the relevant section so chronological evolution remains visible.
 
 ---
 
 ## 1. High-level picture
 
-RAGstream already has a stable foundation in four major layers:
+RAGstream already has a stable foundation in five major layers:
 
 1. foundational prompt processing and GUI/controller structure,
 2. JSON-based agent architecture with a working A2 PromptShaper stage,
-3. project-based Chroma ingestion with manifest-based file tracking,
-4. a working AWS Phase-1 deployment with persistent runtime data outside the image.
+3. project-based document ingestion with manifest-based file tracking,
+4. hybrid document retrieval with dense first-pass selection + SPLADE scoring on the same candidate IDs + weighted RRF,
+5. a working AWS Phase-1 deployment with persistent runtime data outside the image.
 
-The pipeline now reaches from prompt input and A2 shaping to project-aware chunk selection from the active document database, and it also includes a deterministic ReRanker stage.
+The pipeline now reaches from prompt input and A2 shaping to project-aware hybrid chunk selection from the active document database, and it also includes a deterministic ReRanker stage.
 
 Current practical truth:
 - Retrieval is implemented and working.
+- Retrieval is no longer dense-only; it now includes a real SPLADE scoring branch and weighted RRF fusion.
 - ReRanker is implemented and working in code.
 - However, the current BERT-style reranker direction is not accepted as the long-term solution, because in practical tests it often worsened ranking quality instead of improving it.
 
-The currently agreed next implementation direction is no longer "implement ReRanker from zero", but rather:
+The currently agreed next implementation direction is:
 - keep the existing Retrieval / ReRanker stage structure,
+- keep the new hybrid Retrieval backbone,
 - replace the current reranking strategy with a stronger future direction,
-- and upgrade Retrieval itself into a hybrid retrieval stage.
+- immediate next step: ColBERT.
 
 ---
 
@@ -93,35 +97,38 @@ The currently agreed next implementation direction is no longer "implement ReRan
 - The project-specific storage model is implemented:
   - `data/doc_raw/<project>`
   - `data/chroma_db/<project>`
-  - `file_manifest.json` belongs to the matching project DB folder.
+  - `data/splade_db/<project>`
+  - `file_manifest.json` belongs to the matching Chroma DB project folder.
 - The embedded-files list for the active project is visible in the GUI through the manifest/controller path.
 
-### 2.6 Chroma-based document ingestion backend
+### 2.6 Parallel dense + SPLADE document ingestion backend
 
-- Chroma-based ingestion is implemented.
+- Parallel dense + SPLADE ingestion is implemented.
   - Loader exists.
   - Chunker exists.
-  - Embedder exists.
+  - Dense Embedder exists.
+  - SPLADE Embedder exists.
   - Chroma vector store exists.
+  - SPLADE vector store exists.
   - `IngestionManager` exists.
   - manifest-based diff/hash logic exists.
   - deterministic stable chunk IDs exist.
-- This layer is already aligned with the Chroma-based architecture and is no longer in the earlier NumPy-store phase.
+- The ingestion model now uses one canonical chunking pass and writes the same chunk IDs and metadata into both branches:
+  - dense branch → `data/chroma_db/<project>`
+  - sparse branch → `data/splade_db/<project>`
+- This means ingestion is no longer conceptually dense-only.
 
-### 2.7 Retrieval is implemented
+### 2.7 Retrieval is implemented as a hybrid stage
 
-- Retrieval is implemented as a deterministic, project-aware stage.
-- The implemented Retrieval stage is deterministic and project-aware.
-- Its logic is:
+- Retrieval is implemented as a deterministic, project-aware hybrid stage.
+- Its logic now is:
   - read retrieval query text from the current `SuperPrompt`,
   - use `task`, `purpose`, and `context` as the retrieval source,
   - split the retrieval query into overlapping pieces,
-  - read the active project's Chroma document store,
-  - compare each stored chunk embedding against all query-piece embeddings,
-  - aggregate scores with p-norm averaging,
-  - current runtime constant:
-    - `p = 10`
-  - keep the top-k chunks,
+  - run the dense embedding branch on the active project's Chroma document store,
+  - select the dense top-k candidate IDs,
+  - run the SPLADE sparse branch on the active project's SPLADE store for exactly those same dense-selected candidate IDs,
+  - fuse both ranked lists with weighted RRF,
   - reconstruct the real chunk text from `doc_raw/<project>` using the same chunking logic as ingestion,
   - write the result back into `SuperPrompt`.
 - Retrieval ranks chunks, reconstructs their text from `doc_raw/<project>`, and writes the selected chunks into `base_context_chunks`.
@@ -133,6 +140,7 @@ The currently agreed next implementation direction is no longer "implement ReRan
 - Snapshot keys such as `sp_pre`, `sp_a2`, `sp_rtv`, and `sp_rrk` exist so that stage-specific prompt states can be preserved as snapshots rather than overwritten mentally.
 - Retrieval is already a live button path after PreProcessing and A2.
 - ReRanker is also already wired as a live stage after Retrieval.
+- The current Super-Prompt rendering path can now show Retrieval-related score information in the GUI.
 
 ### 2.9 ReRanker is implemented
 
@@ -190,7 +198,8 @@ The currently agreed next implementation direction is no longer "implement ReRan
 - The logical structure stays the same locally and on AWS:
   - `data/doc_raw/<project>`
   - `data/chroma_db/<project>`
-- This means project raw files and Chroma databases are persistent and survive container replacement.
+  - `data/splade_db/<project>`
+- This means project raw files, Chroma databases, and SPLADE stores are persistent and survive container replacement.
 
 ---
 
@@ -214,6 +223,7 @@ The currently agreed next implementation direction is no longer "implement ReRan
 
 - Some older requirement/UML concepts still exist in documents at a higher level than the current code.
 - This is especially relevant where older wording still reflects:
+  - earlier ingestion assumptions,
   - earlier retrieval scoring wording,
   - older reranker assumptions,
   - earlier rendering ownership assumptions,
@@ -241,21 +251,36 @@ This section records the Retrieval stage more precisely because it is already im
 
 - Retrieval query splitting reuses the same deterministic chunking culture as ingestion.
 - Current values:
-  - `chunk_size = 500`
-  - `overlap = 100`
+  - `chunk_size = 1200`
+  - `overlap = 120`
 - Important:
   - in the current codebase, this chunking is character-based, not token-based
-- Embedding model:
+- Dense embedding model:
   - `text-embedding-3-large`
+- SPLADE branch:
+  - active and implemented
 
 ### 4.3 Retrieval scoring
 
-- Similarity is computed between each stored chunk embedding and all query-piece embeddings.
-- Aggregation is not a simple max.
-- Current implemented retrieval score:
-  - p-norm averaging
-  - `p = 10`
-- Retrieval remains deterministic and separate from ReRanker.
+- Retrieval is no longer dense-only.
+- Current implemented Retrieval structure:
+  - dense ranking branch
+  - SPLADE rescoring branch over the dense-selected candidate IDs
+  - weighted RRF fusion
+- Dense branch scoring:
+  - similarity is computed between each stored chunk embedding and all query-piece embeddings
+  - aggregation is not a simple max
+  - current implemented dense retrieval score:
+    - p-norm averaging
+    - `p = 10`
+- SPLADE branch scoring:
+  - SPLADE computes its score only on the same top-k candidate IDs already selected by the dense branch
+  - it does not run an independent competing top-k selection anymore in the current code path
+- Final fused Retrieval score:
+  - weighted reciprocal-rank fusion
+  - current weighting:
+    - dense branch weight = `5.9`
+    - SPLADE branch weight = `0.0`
 
 ### 4.4 Retrieval output and write-back
 
@@ -264,6 +289,8 @@ This section records the Retrieval stage more precisely because it is already im
 - The currently selected order is written into `final_selection_ids`.
 - `stage` and `history_of_stages` are updated.
 - The GUI-visible Super-Prompt then shows a `## Related Context` section built from the selected chunks.
+- Retrieval-specific metadata needed by the projector is currently mapped in `Retriever` after neutral RRF merge and before hydration/write-back.
+- Because SPLADE now scores the same dense-selected candidate IDs, the intended GUI/debug behavior is that each final Retrieval chunk can carry both dense and SPLADE score fields.
 
 ### 4.5 Retrieval robustness
 
@@ -318,40 +345,96 @@ This section records the ReRanker stage more precisely because it is already imp
 
 ---
 
-## 6. Current agreed next implementation direction
+## 6. Session decisions added on 14.04.2026
+
+### 6.1 Ingestion direction finalized on 14.04.2026
+
+- Parallel dense + SPLADE ingestion is now part of the real implementation direction, not only a future idea.
+- The current agreed structural rule is:
+  - one canonical chunking pass,
+  - one canonical chunk ID scheme,
+  - same chunk IDs and metadata in both dense and sparse stores.
+- The SPLADE store is persisted separately under:
+  - `data/splade_db/<project>`
+
+### 6.2 Retrieval fusion decision on 14.04.2026
+
+- Weighted RRF was accepted as the current Retrieval fusion strategy.
+- Current decision:
+  - dense branch weight = `0.75`
+  - SPLADE branch weight = `0.25`
+- Current practical conclusion:
+  - results look acceptable enough to keep this weighting for now.
+
+### 6.3 Architectural separation decision on 14.04.2026
+
+- The neutral merger principle was clarified.
+- Current agreed separation:
+  - `rrf_merger.py` stays neutral and branch-agnostic,
+  - `retriever.py` is the higher-level place that knows:
+    - branch A = dense
+    - branch B = SPLADE
+  - retrieval-specific metadata names needed by rendering are created in `Retriever`, not inside the neutral merger.
+
+### 6.4 Immediate next step decided on 14.04.2026
+
+- Immediate next step:
+  - ColBERT
+- The next phase is therefore not another large Retrieval redesign from zero.
+- The next phase is:
+  - keep the current hybrid Retrieval backbone,
+  - move the reranking direction toward ColBERT.
+
+### 6.5 Candidate-set alignment decision on 14.04.2026
+
+- Retrieval candidate-set alignment was clarified.
+- The current agreed rule is:
+  - dense Retrieval selects the active top-k candidate IDs first,
+  - SPLADE must then score exactly those same candidate IDs,
+  - SPLADE must not run an independent top-k search for different chunk IDs inside the Retrieval stage.
+- Practical consequence:
+  - the Retrieval-stage final display can now be expected to carry both dense and SPLADE score information for the same chunk set.
+
+### 6.6 Current code-path weighting on 14.04.2026
+
+- The current code-path weighting is now:
+  - dense branch weight = `5.9`
+  - SPLADE branch weight = `0.0`
+- Practical consequence:
+  - the final Retrieval order currently follows the dense ranking order,
+  - while SPLADE scores can still be attached to the same candidate IDs for inspection/debugging.
+
+---
+
+## 7. Current agreed next implementation direction
 
 The next implementation direction is no longer "implement ReRanker from zero".
 The next implementation direction is to improve the current Retrieval / ReRanker design.
 
-### 6.1 Retrieval direction to change
+### 7.1 Retrieval direction
 
-- Retrieval should move from:
-  - dense Retrieval only
-- toward:
+- Keep the new hybrid Retrieval backbone:
   - dense Retrieval
-  - plus SPLADE sparse retrieval
-  - plus RRF fusion
-- The future Retrieval stage should use a smaller result band:
-  - target direction:
-    - maximum 50 chunks
+  - SPLADE scoring on the same dense-selected candidate IDs
+  - weighted RRF fusion
+- Keep the current weighting unless later practical evaluation shows a better weighting.
 
-### 6.2 ReRanker direction to change
+### 7.2 ReRanker direction
 
 - The current BERT-style cross-encoder reranker should not remain the main long-term strategy.
 - The agreed future direction is:
   - ColBERT instead of the current BERT-style reranker
-- ReRanking should operate only on a bounded candidate pool:
-  - target direction:
-    - top 30 Retrieval chunks
 
-### 6.3 Query splitting helper direction
+### 7.3 Query splitting helper direction
 
-- A new helper or agent direction is agreed for the future ReRanker path:
-  - split long prompts into smaller meaning-based query parts under an upper token limit
-- This helper is intended for the future ColBERT path.
-- Detailed design belongs in the requirement files, not here.
+- The current `smart_query_splitter.py` still uses deterministic linear windowing.
+- A future smart splitter direction remains open.
+- A likely next refinement later is:
+  - meaning-based splitting under a bounded size limit
+- But this is not the immediate next step.
+- Immediate next step remains ColBERT.
 
-### 6.4 A3 direction to change
+### 7.4 A3 direction
 
 - A3 should become a selection stage after ReRanking.
 - A3 should classify chunks with labels such as:
@@ -364,11 +447,11 @@ The next implementation direction is to improve the current Retrieval / ReRanker
 
 ---
 
-## 7. Current AWS compute decision for the next phase
+## 8. Current AWS compute decision for the next phase
 
 The current AWS deployment stays in place structurally.
 
-### 7.1 What remains unchanged
+### 8.1 What remains unchanged
 
 - ECR workflow remains unchanged.
 - Docker deployment model remains unchanged.
@@ -379,14 +462,14 @@ The current AWS deployment stays in place structurally.
 - EBS-backed runtime data remains unchanged.
 - The persistent runtime path model remains unchanged.
 
-### 7.2 What is planned to change
+### 8.2 What is planned to change
 
 - The current EC2 instance type is planned to be upgraded.
 - Direction:
   - from `t3.small`
   - to `m7i-flex.xlarge`
 
-### 7.3 Why this change is planned
+### 8.3 Why this change is planned
 
 - Retrieval is already working on the current deployment model.
 - ReRanking experiments and future ColBERT-related work will be more CPU/RAM-demanding than Retrieval alone.
@@ -395,7 +478,7 @@ The current AWS deployment stays in place structurally.
 
 ---
 
-## 8. What this means operationally now
+## 9. What this means operationally now
 
 RAGstream now includes working prompt processing, ingestion, retrieval, reranking, and AWS deployment layers.
 
@@ -403,24 +486,25 @@ The system now has:
 - a working prompt entry path,
 - a working A2 shaping path,
 - a working project-based ingestion path,
-- a working Chroma document store,
+- a working dense + SPLADE document persistence path,
 - a working active-project GUI path,
 - a working AWS public deployment,
-- a working Retrieval stage,
+- a working hybrid Retrieval stage,
 - and a working ReRanker stage.
 
 The project now includes controller-driven prompt processing, ingestion, retrieval, and reranking in code.
 The system now has context retrieval and reranking stages in code.
 
 The immediate development focus is now clear:
-- stabilize the Retrieval / ReRanker direction,
+- keep the current hybrid Retrieval backbone,
 - replace the current unsatisfactory reranking direction,
+- move toward ColBERT,
 - then continue with A3 / A4 / A5 / Prompt Builder,
 - while keeping the AWS deployment architecture stable and only increasing compute capacity where needed.
 
 ---
 
-## 9. Important note
+## 10. Important note
 
 - This file is an implementation status snapshot.
 - It records the current working system and the currently agreed next direction.

@@ -6,31 +6,28 @@ retriever.py
 Purpose:
     Deterministic Retrieval stage orchestrator for RAGstream.
 
-Stage-1 refactor design:
+Design:
     - Keep Retriever as the top-level stage class used by the controller.
-    - Move query-building / query-splitting support logic outside this file.
-    - Move the current embedding-based ranking core into RetrieverEmb.
-    - Keep hydration and SuperPrompt write-back in this file for now.
-    - Preserve the current external Retriever.run(...) contract and current
-      retrieval behavior as closely as possible.
+    - Keep query-building / query-splitting support logic outside this file.
+    - Keep the dense retrieval backend in RetrieverEmb.
+    - Add a parallel SPLADE retrieval backend in RetrieverSplade.
+    - Merge both branches with deterministic RRF.
+    - Keep hydration and SuperPrompt write-back in this file.
+    - Preserve the current external Retriever.run(...) contract.
 
-Current Stage-1 flow inside Retriever.run(...):
+Current flow inside Retriever.run(...):
     1) PreProcessing
        - build retrieval query text from SuperPrompt
        - split the query into overlapping query pieces
     2) Retriever_EMB
-       - run the current embedding-based retrieval backend
+       - run the dense embedding-based retrieval backend
     3) Retriever_SPLADE
-       - reserved for the later stage (commented placeholder only)
-    4) PostProcessing
+       - score exactly the dense-selected candidate IDs
+    4) RRF_Merger
+       - fuse both ranked lists deterministically
+    5) PostProcessing
        - hydrate ranked rows into real Chunk objects
        - write the retrieval result into SuperPrompt
-
-Non-goals of this Stage-1 refactor:
-    - No SPLADE implementation yet
-    - No RRF implementation yet
-    - No reranking changes yet
-    - No controller / GUI / SuperPrompt contract changes
 """
 
 from __future__ import annotations
@@ -40,27 +37,30 @@ from typing import Any, Dict, List, Tuple
 
 from ragstream.ingestion.chunker import Chunker
 from ragstream.ingestion.embedder import Embedder
+from ragstream.ingestion.splade_embedder import SpladeEmbedder
 from ragstream.orchestration.super_prompt import A3ChunkStatus, SuperPrompt
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.retrieval.chunk import Chunk
 from ragstream.retrieval.doc_score import DocScore  # compatibility re-export
 from ragstream.retrieval.retriever_emb import RetrieverEmb
-from ragstream.retrieval.smart_query_splitter import  split_query_into_pieces
-from ragstream.orchestration.superprompt_projector import SuperPromptProjector
+from ragstream.retrieval.retriever_splade import RetrieverSplade
+from ragstream.retrieval.rrf_merger import rrf_merge
+from ragstream.retrieval.smart_query_splitter import split_query_into_pieces
 
 
 # Keep old import compatibility:
 # from ragstream.retrieval.retriever import DocScore
 DocScore = DocScore
 
-# Ranked row returned by RetrieverEmb:
+# Ranked row returned by RetrieverEmb / RetrieverSplade / RRF merger:
 # (chunk_id, retrieval_score, metadata)
 RankedRow = Tuple[str, float, Dict[str, Any]]
 
 # Retrieval query splitting defaults.
-# These MUST stay aligned with the current behavior during Stage 1 so that
-# the refactor preserves the same practical output as before.
-DEFAULT_QUERY_CHUNK_SIZE = 500
-DEFAULT_QUERY_OVERLAP = 100
+# These MUST stay aligned with the current behavior so that the refactor
+# preserves the same practical output as before.
+DEFAULT_QUERY_CHUNK_SIZE = 1200
+DEFAULT_QUERY_OVERLAP = 120
 
 
 class Retriever:
@@ -70,7 +70,7 @@ class Retriever:
     Design:
     - Keep this class focused on stage orchestration.
     - Keep low-level retrieval engine logic outside this file.
-    - Keep hydration + SuperPrompt write-back here for now.
+    - Keep hydration + SuperPrompt write-back here.
     - The evolving pipeline state still lives in SuperPrompt.
     """
 
@@ -98,20 +98,24 @@ class Retriever:
         self.doc_root = Path(doc_root).resolve()
         self.chroma_root = Path(chroma_root).resolve()
 
+        # SPLADE DB is kept parallel to chroma_db under the same data root.
+        self.splade_root = self.chroma_root.parent / "splade_db"
+
         self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-large")
         self.chunker = chunker if chunker is not None else Chunker()
 
         # Keep the chunk class explicit so hydration remains readable and testable.
         self.chunk_cls = Chunk
 
-        # Stage-1 backend: current embedding-based retriever moved out.
+        # Dense backend remains unchanged and independent.
         self.retriever_emb = RetrieverEmb(
             chroma_root=str(self.chroma_root),
             embedder=self.embedder,
         )
 
-        # Future Stage-2 placeholder:
-        # self.retriever_splade = RetrieverSplade(...)
+        # Lazy init for SPLADE so app startup does not immediately load the sparse model.
+        self._splade_embedder: SpladeEmbedder | None = None
+        self._retriever_splade: RetrieverSplade | None = None
 
     # -----------------------------------------------------------------
     # Public API
@@ -121,14 +125,12 @@ class Retriever:
         """
         Execute the Retrieval stage and update the same SuperPrompt in place.
 
-        Stage-1 refactor goal:
-        keep run(...) visually simple and orchestration-oriented.
-
-        Current visible flow:
+        Visible flow:
             1) PreProcessing
             2) Retriever_EMB
-            3) Retriever_SPLADE (reserved for later)
-            4) PostProcessing
+            3) Retriever_SPLADE
+            4) RRF_Merger
+            5) PostProcessing
 
         Returns:
             The same SuperPrompt instance, mutated in place.
@@ -141,20 +143,28 @@ class Retriever:
             top_k=top_k,
         )
 
-        # Future Stage-2 placeholder:
-        # ranked_rows_splade = self.retriever_splade.run(
-        #     project_name=project_name,
-        #     query_pieces=query_pieces,
-        #     top_k=top_k,
-        # )
-        #
-        # Future Stage-2 placeholder:
-        # ranked_rows = rrf_merge(ranked_rows_emb, ranked_rows_splade)
-        #
-        # Stage-1 refactor:
-        # only the embedding-based branch exists, so it is the final retrieval
-        # result for now.
-        ranked_rows = ranked_rows_emb
+        candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
+
+        try:
+            ranked_rows_splade = self._get_retriever_splade().run(
+                project_name=project_name,
+                query_pieces=query_pieces,
+                top_k=top_k,
+                candidate_ids=candidate_ids,
+            )
+        except FileNotFoundError:
+            # Keep Retrieval usable even if an older project has no SPLADE store yet.
+            ranked_rows_splade = []
+
+        ranked_rows = rrf_merge(
+            ranked_rows_emb,
+            ranked_rows_splade,
+            top_k=top_k,
+            weight_a=0.75,
+            weight_b=0.25,
+        )
+
+        ranked_rows = self._project_rrf_metadata_to_retrieval_contract(ranked_rows)
 
         sp = self._postprocess(sp, ranked_rows)
         return sp
@@ -168,10 +178,8 @@ class Retriever:
         Build the retrieval query text from SuperPrompt and split it into
         overlapping query pieces.
 
-        Stage-1 refactor note:
-        - The actual query-building and query-splitting support logic lives
-          outside this file.
-        - Retriever keeps only the stage-level orchestration.
+        Query-building and query-splitting support logic lives outside this file.
+        Retriever keeps only the stage-level orchestration.
         """
         query_text = SuperPromptProjector.build_query_text(sp)
 
@@ -186,22 +194,80 @@ class Retriever:
 
     def _postprocess(self, sp: SuperPrompt, ranked_rows: List[RankedRow]) -> SuperPrompt:
         """
-        Complete the Retrieval stage after the backend retriever has finished.
+        Complete the Retrieval stage after the backend retrievers have finished.
 
-        Current Stage-1 responsibilities:
+        Responsibilities:
         - hydrate ranked rows into real Chunk objects
-        - write the retrieval result into SuperPrompt
-
-        Future Stage-2 location:
-        - RRF fusion can also live in this post-processing layer before hydration
+        - write the fused retrieval result into SuperPrompt
         """
         valid_ranked_rows, hydrated_chunks = self._hydrate_ranked_chunks(ranked_rows)
         self._write_stage_to_superprompt(sp, valid_ranked_rows, hydrated_chunks)
         return sp
 
+    def _get_retriever_splade(self) -> RetrieverSplade:
+        """
+        Lazily initialize the SPLADE backend on first retrieval use.
+        """
+        if self._retriever_splade is None:
+            if self._splade_embedder is None:
+                self._splade_embedder = SpladeEmbedder(device="cpu")
+
+            self._retriever_splade = RetrieverSplade(
+                splade_root=str(self.splade_root),
+                splade_embedder=self._splade_embedder,
+            )
+
+        return self._retriever_splade
+
     # -----------------------------------------------------------------
-    # Internal helpers kept in retriever.py for Stage 1
+    # Internal helpers kept in retriever.py
     # -----------------------------------------------------------------
+
+    def _project_rrf_metadata_to_retrieval_contract(
+        self,
+        ranked_rows: List[RankedRow],
+    ) -> List[RankedRow]:
+        """
+        Translate neutral RRF merger metadata into retrieval-specific metadata.
+
+        Why this exists:
+        - rrf_merger.py is intentionally neutral and uses generic names:
+            score_a, score_b, rank_a, rank_b
+        - Retriever is the correct higher-level place that knows:
+            a = dense embedding branch
+            b = SPLADE branch
+        - SuperPrompt projector and other retrieval-facing code can therefore
+          keep reading the retrieval-specific names:
+            emb_score, splade_score, emb_rank, splade_rank, rrf_score
+
+        Design rule:
+        - Preserve the neutral keys if they already exist.
+        - Add the retrieval-specific aliases here.
+        """
+        projected_rows: List[RankedRow] = []
+
+        for chunk_id, fused_score, meta in ranked_rows:
+            meta_in = dict(meta or {})
+            meta_out = dict(meta_in)
+
+            if "score_a" in meta_in and "emb_score" not in meta_out:
+                meta_out["emb_score"] = float(meta_in["score_a"])
+
+            if "score_b" in meta_in and "splade_score" not in meta_out:
+                meta_out["splade_score"] = float(meta_in["score_b"])
+
+            if "rank_a" in meta_in and "emb_rank" not in meta_out:
+                meta_out["emb_rank"] = int(meta_in["rank_a"])
+
+            if "rank_b" in meta_in and "splade_rank" not in meta_out:
+                meta_out["splade_rank"] = int(meta_in["rank_b"])
+
+            if "rrf_score" not in meta_out:
+                meta_out["rrf_score"] = float(fused_score)
+
+            projected_rows.append((str(chunk_id), float(fused_score), meta_out))
+
+        return projected_rows
 
     def _hydrate_ranked_chunks(
         self,
@@ -211,7 +277,7 @@ class Retriever:
         Reconstruct real Chunk objects for the selected ranked rows.
 
         Why reconstruction is needed:
-        - Chroma stores embeddings + metadata only.
+        - Vector stores keep vectors + metadata only.
         - The actual chunk text must therefore be rebuilt from doc_raw
           using the same chunker and the stored chunk_idx.
 
@@ -303,6 +369,7 @@ class Retriever:
             the hydrated Chunk objects in retrieval order
         - views_by_stage["retrieval"]:
             ordered triples (chunk_id, retrieval_score, SELECTED)
+            where retrieval_score is now the final fused RRF score
         - final_selection_ids:
             ordered chunk IDs from the current retrieval result
         - stage/history:

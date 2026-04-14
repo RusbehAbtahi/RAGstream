@@ -3,15 +3,10 @@
 ```
 /home/rusbeh_ab/project/RAGstream
 ├── Run.txt
-├── Test.py
 ├── __init__.py
-├── diag_chroma_test.py
 ├── diag_chroma_wo_ort.txt
-├── ragstream_all_py.txt
 ├── requirements-dev.txt
 ├── requirements.txt
-├── requirements_large_20251205.txt
-├── test_openai_hello.py
 ├── ragstream
 │   ├── __init__.py
 │   ├── __pycache__
@@ -23,6 +18,9 @@
 │   │   ├── a3_nli_gate.py
 │   │   └── a4_condenser.py
 │   ├── app
+│   │   ├── Hook_ChatGTP.py
+│   │   ├── Hook_ChatGTP2.py
+│   │   ├── Hook_ChatGTP_TO_DO.txt
 │   │   ├── __init__.py
 │   │   ├── __pycache__
 │   │   ├── agents.py
@@ -43,7 +41,10 @@
 │   │   ├── file_manifest.py
 │   │   ├── ingestion_manager.py
 │   │   ├── loader.py
-│   │   └── vector_store_chroma.py
+│   │   ├── splade_embedder.py
+│   │   ├── splade_vector_store_base.py
+│   │   ├── vector_store_chroma.py
+│   │   └── vector_store_splade.py
 │   ├── memory
 │   │   ├── __init__.py
 │   │   └── conversation_memory.py
@@ -62,7 +63,8 @@
 │   │   │   └── schema_map.py
 │   │   ├── llm_client.py
 │   │   ├── prompt_builder.py
-│   │   └── super_prompt.py
+│   │   ├── super_prompt.py
+│   │   └── superprompt_projector.py
 │   ├── preprocessing
 │   │   ├── __pycache__
 │   │   ├── name_matcher.py
@@ -76,7 +78,10 @@
 │   │   ├── doc_score.py
 │   │   ├── reranker.py
 │   │   ├── retriever.py
-│   │   └── retriever_old.py
+│   │   ├── retriever_emb.py
+│   │   ├── retriever_splade.py
+│   │   ├── rrf_merger.py
+│   │   └── smart_query_splitter.py
 │   └── utils
 │       ├── __init__.py
 │       ├── __pycache__
@@ -93,14 +98,14 @@
     │       ├── 001.json
     │       └── 002.json
     ├── chroma_db
-    │   ├── project1
-    │   │   ├── 2d71b43d-3226-411e-8ff2-2cede3dcb9a0
-    │   └── project2
-    │       ├── 526ca8ff-c00e-4657-b10c-94f6a376684e
+    │   └── TEST1
+    │       ├── 7d1b9acf-cab6-4940-a157-075a9750a3b6
     │       └── file_manifest.json
     ├── doc_raw
-    │   └── project2
+    │   └── TEST1
     ├── np_store
     │   └── project1
-    └── project1
+    ├── project1
+    └── splade_db
+        └── TEST1
 ```

@@ -61,11 +61,15 @@ from ragstream.agents.a2_promptshaper import A2PromptShaper
 
 # Added on 10.03.2026:
 # Project-based document ingestion is wired here only at controller level.
-# The existing ingestion backend remains unchanged.
 from ragstream.ingestion.chunker import Chunker
 from ragstream.ingestion.embedder import Embedder
 from ragstream.ingestion.ingestion_manager import IngestionManager
 from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
+
+# Added on 13.04.2026:
+# Parallel SPLADE ingestion branch.
+from ragstream.ingestion.splade_embedder import SpladeEmbedder
+from ragstream.ingestion.vector_store_splade import VectorStoreSplade
 
 # Added on 15.03.2026:
 # Deterministic Retrieval stage.
@@ -106,8 +110,10 @@ class AppController:
         self.data_root = self.project_root / "data"
         self.doc_root = self.data_root / "doc_raw"
         self.chroma_root = self.data_root / "chroma_db"
+        self.splade_root = self.data_root / "splade_db"
         self.doc_root.mkdir(parents=True, exist_ok=True)
         self.chroma_root.mkdir(parents=True, exist_ok=True)
+        self.splade_root.mkdir(parents=True, exist_ok=True)
 
         # Added on 15.03.2026:
         # Retrieval is initialized once and re-used. It reads the active project
@@ -251,21 +257,25 @@ class AppController:
     def list_projects(self) -> list[str]:
         doc_projects = {p.name for p in self.doc_root.iterdir() if p.is_dir()}
         chroma_projects = {p.name for p in self.chroma_root.iterdir() if p.is_dir()}
-        return sorted(doc_projects | chroma_projects)
+        splade_projects = {p.name for p in self.splade_root.iterdir() if p.is_dir()}
+        return sorted(doc_projects | chroma_projects | splade_projects)
 
     def create_project(self, project_name: str) -> dict[str, Any]:
         project_name = self._normalize_project_name(project_name)
         raw_dir = self.doc_root / project_name
         chroma_dir = self.chroma_root / project_name
+        splade_dir = self.splade_root / project_name
 
         raw_dir.mkdir(parents=True, exist_ok=True)
         chroma_dir.mkdir(parents=True, exist_ok=True)
+        splade_dir.mkdir(parents=True, exist_ok=True)
 
         return {
             "success": True,
             "project_name": project_name,
             "raw_dir": str(raw_dir),
             "chroma_dir": str(chroma_dir),
+            "splade_dir": str(splade_dir),
             "manifest_path": str(chroma_dir / "file_manifest.json"),
         }
 
@@ -280,14 +290,18 @@ class AppController:
 
         manager = IngestionManager(doc_root=str(self.doc_root))
         store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
+        sparse_store = VectorStoreSplade(persist_dir=str(self.splade_root / project_name))
         chunker = Chunker()
         embedder = Embedder(model="text-embedding-3-large")
+        sparse_embedder = SpladeEmbedder(device="cpu")
 
         stats = manager.run(
             subfolder=project_name,
             store=store,
             chunker=chunker,
             embedder=embedder,
+            sparse_store=sparse_store,
+            sparse_embedder=sparse_embedder,
             manifest_path=str(manifest_path),
         )
 
@@ -298,6 +312,7 @@ class AppController:
                 "project_name": project_name,
                 "raw_dir": str(self.doc_root / project_name),
                 "chroma_dir": str(self.chroma_root / project_name),
+                "splade_dir": str(self.splade_root / project_name),
                 "manifest_path": str(manifest_path),
             }
         )
@@ -488,6 +503,503 @@ class AppController:
         return self.llm_client.complete(prompt)
 ```
 
+### ~\ragstream\app\Hook_ChatGTP.py
+```python
+# Hook_ChatGTP.py
+# Logic:
+# - attach to an already running Chrome/Chromium via CDP
+# - identify the active ChatGPT tab
+# - optionally write a message into the composer
+# - optionally send it
+# - read the latest assistant message from the page
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+import sys
+
+from playwright.sync_api import sync_playwright, Page, Locator
+
+
+CDP_URL = "http://127.0.0.1:9222"
+MESSAGE_TEXT = "hello, how are you"
+
+
+@dataclass
+class TabInfo:
+    page: Page
+    url: str
+    title: str
+    has_focus: bool
+    visibility_state: str
+
+
+def _safe_title(page: Page) -> str:
+    try:
+        return page.title()
+    except Exception:
+        return ""
+
+
+def _safe_has_focus(page: Page) -> bool:
+    try:
+        return bool(page.evaluate("document.hasFocus()"))
+    except Exception:
+        return False
+
+
+def _safe_visibility(page: Page) -> str:
+    try:
+        value = page.evaluate("document.visibilityState")
+        return str(value) if value is not None else ""
+    except Exception:
+        return ""
+
+
+def _is_chatgpt_tab(page: Page) -> bool:
+    url = (page.url or "").lower()
+    return ("chatgpt.com" in url) or ("chat.openai.com" in url)
+
+
+def _score_tab(info: TabInfo) -> int:
+    score = 0
+
+    if info.has_focus:
+        score += 100
+    if info.visibility_state == "visible":
+        score += 50
+
+    url_lower = info.url.lower()
+    title_lower = info.title.lower()
+
+    if "/c/" in url_lower:
+        score += 20
+    if "chatgpt" in title_lower or "rag" in title_lower:
+        score += 10
+
+    return score
+
+
+def _find_active_chatgpt_tab(browser) -> Optional[TabInfo]:
+    candidates: list[TabInfo] = []
+
+    for context in browser.contexts:
+        for page in context.pages:
+            if not _is_chatgpt_tab(page):
+                continue
+
+            info = TabInfo(
+                page=page,
+                url=page.url or "",
+                title=_safe_title(page),
+                has_focus=_safe_has_focus(page),
+                visibility_state=_safe_visibility(page),
+            )
+            candidates.append(info)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=_score_tab, reverse=True)
+    return candidates[0]
+
+
+def _first_working_locator(page: Page) -> Optional[Locator]:
+    candidates = [
+        page.get_by_role("textbox").last,
+        page.locator("textarea").last,
+        page.locator('[contenteditable="true"]').last,
+    ]
+
+    for locator in candidates:
+        try:
+            locator.wait_for(state="visible", timeout=1500)
+            if locator.is_visible(timeout=1500):
+                return locator
+        except Exception:
+            pass
+
+    return None
+
+
+def _last_visible_assistant_message(page: Page) -> Optional[Locator]:
+    selectors = [
+        'div[data-message-author-role="assistant"]',
+        'article [data-message-author-role="assistant"]',
+        '[data-message-author-role="assistant"]',
+    ]
+
+    for selector in selectors:
+        locator = page.locator(selector)
+
+        try:
+            count = locator.count()
+        except Exception:
+            count = 0
+
+        if count == 0:
+            continue
+
+        for i in range(count - 1, -1, -1):
+            item = locator.nth(i)
+            try:
+                if item.is_visible(timeout=1000):
+                    return item
+            except Exception:
+                pass
+
+    return None
+
+
+def get_last_assistant_message(page: Page) -> Optional[str]:
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=3000)
+    except Exception:
+        pass
+
+    try:
+        page.wait_for_timeout(700)
+    except Exception:
+        pass
+
+    message = _last_visible_assistant_message(page)
+    if message is None:
+        return None
+
+    try:
+        text = message.inner_text(timeout=2000).strip()
+        return text if text else None
+    except Exception:
+        return None
+
+
+def _write_into_composer(page: Page, text: str, submit: bool = False) -> bool:
+    locator = _first_working_locator(page)
+    if locator is None:
+        return False
+
+    try:
+        locator.click(timeout=3000)
+
+        try:
+            locator.fill("")
+        except Exception:
+            try:
+                locator.press("Control+A")
+                locator.press("Backspace")
+            except Exception:
+                pass
+
+        try:
+            locator.fill(text, timeout=3000)
+        except Exception:
+            locator.press_sequentially(text, delay=20)
+
+        if submit:
+            locator.press("Enter")
+
+        return True
+
+    except Exception:
+        return False
+
+def wait_for_last_assistant_message_ready(
+    page: Page,
+    timeout_ms: int = 120000,
+    poll_ms: int = 400,
+    stable_rounds: int = 4,
+) -> Optional[str]:
+    start = page.evaluate("Date.now()")
+    last_text = None
+    stable_count = 0
+
+    while True:
+        now = page.evaluate("Date.now()")
+        if now - start > timeout_ms:
+            return last_text.strip() if last_text and last_text.strip() else None
+
+        message = _last_visible_assistant_message(page)
+        if message is None:
+            page.wait_for_timeout(poll_ms)
+            continue
+
+        try:
+            current_text = message.inner_text(timeout=1500).strip()
+        except Exception:
+            current_text = ""
+
+        if current_text and current_text == last_text:
+            stable_count += 1
+        else:
+            stable_count = 0
+            last_text = current_text
+
+        if current_text and stable_count >= stable_rounds:
+            return current_text
+
+        page.wait_for_timeout(poll_ms)
+
+
+def run() -> None:
+    text_to_send: Optional[str] = None
+    if len(sys.argv) >= 2:
+        text_to_send = " ".join(sys.argv[1:]).strip()
+        if not text_to_send:
+            print("Text argument was provided but is empty.")
+            sys.exit(1)
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(CDP_URL)
+        try:
+            tab = _find_active_chatgpt_tab(browser)
+
+            if tab is None:
+                print("No ChatGPT tab was found through CDP.")
+                print("Most likely reason: the special Chrome window is not open.")
+                sys.exit(2)
+
+            print("FOUND ACTIVE CHATGPT TAB")
+            print(f"URL   : {tab.url}")
+            print(f"TITLE : {tab.title}")
+            print(f"FOCUS : {tab.has_focus}")
+            print(f"VIS   : {tab.visibility_state}")
+            print()
+
+            if text_to_send is not None:
+                ok = _write_into_composer(tab.page, text_to_send, submit=True)
+
+                if not ok:
+                    print("ACTIVE TAB WAS FOUND, BUT COMPOSER COULD NOT BE DETECTED")
+                    sys.exit(3)
+
+                print("TEXT WRITTEN INTO CHATGPT COMPOSER")
+                print("MESSAGE WAS SENT")
+                print()
+
+                # Small wait so the page can start updating.
+                try:
+                    tab.page.wait_for_timeout(2500)
+                except Exception:
+                    pass
+
+            last_message = wait_for_last_assistant_message_ready(tab.page)
+
+            print("LAST ASSISTANT MESSAGE:")
+            if last_message:
+                print(last_message)
+            else:
+                print("(not found)")
+
+        finally:
+            browser.close()
+
+
+if __name__ == "__main__":
+    run()
+```
+
+### ~\ragstream\app\Hook_ChatGTP2.py
+```python
+# Hook_ChatGTP.py
+# Logic:
+# - attach to an already running Chrome/Chromium via CDP
+# - identify the active ChatGPT tab
+# - locate the composer box
+# - write dynamic text into the box
+# - do NOT send anything
+
+from __future__ import annotations
+
+import sys
+
+from dataclasses import dataclass
+from typing import Optional
+
+from playwright.sync_api import sync_playwright, Page, Locator
+
+
+CDP_URL = "http://127.0.0.1:9222"
+
+
+@dataclass
+class TabInfo:
+    page: Page
+    url: str
+    title: str
+    has_focus: bool
+    visibility_state: str
+
+
+def _safe_title(page: Page) -> str:
+    try:
+        return page.title()
+    except Exception:
+        return ""
+
+
+def _safe_has_focus(page: Page) -> bool:
+    try:
+        return bool(page.evaluate("document.hasFocus()"))
+    except Exception:
+        return False
+
+
+def _safe_visibility(page: Page) -> str:
+    try:
+        value = page.evaluate("document.visibilityState")
+        return str(value) if value is not None else ""
+    except Exception:
+        return ""
+
+
+def _is_chatgpt_tab(page: Page) -> bool:
+    url = (page.url or "").lower()
+    return ("chatgpt.com" in url) or ("chat.openai.com" in url)
+
+
+def _score_tab(info: TabInfo) -> int:
+    score = 0
+
+    if info.has_focus:
+        score += 100
+    if info.visibility_state == "visible":
+        score += 50
+
+    url_lower = info.url.lower()
+    title_lower = info.title.lower()
+
+    if "/c/" in url_lower:
+        score += 20
+    if "chatgpt" in title_lower or "rag" in title_lower:
+        score += 10
+
+    return score
+
+
+def _find_active_chatgpt_tab(browser) -> Optional[TabInfo]:
+    candidates: list[TabInfo] = []
+
+    for context in browser.contexts:
+        for page in context.pages:
+            if not _is_chatgpt_tab(page):
+                continue
+
+            info = TabInfo(
+                page=page,
+                url=page.url or "",
+                title=_safe_title(page),
+                has_focus=_safe_has_focus(page),
+                visibility_state=_safe_visibility(page),
+            )
+            candidates.append(info)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=_score_tab, reverse=True)
+    return candidates[0]
+
+
+def _first_working_locator(page: Page) -> Optional[Locator]:
+    candidates = [
+        page.get_by_role("textbox").last,
+        page.locator("textarea").last,
+        page.locator('[contenteditable="true"]').last,
+    ]
+
+    for locator in candidates:
+        try:
+            locator.wait_for(state="visible", timeout=1500)
+            if locator.is_visible(timeout=1500):
+                return locator
+        except Exception:
+            pass
+
+    return None
+
+
+def _write_into_composer(page: Page, text: str, submit: bool = False) -> bool:
+    locator = _first_working_locator(page)
+    if locator is None:
+        return False
+
+    try:
+        locator.click(timeout=3000)
+
+        try:
+            locator.fill("")
+        except Exception:
+            try:
+                locator.press("Control+A")
+                locator.press("Backspace")
+            except Exception:
+                pass
+
+        try:
+            locator.fill(text, timeout=3000)
+        except Exception:
+            locator.press_sequentially(text, delay=20)
+
+        if submit:
+            locator.press("Enter")
+
+        return True
+
+    except Exception:
+        return False
+
+
+def write_text_to_active_chatgpt(text: str) -> bool:
+    if not text or not text.strip():
+        raise ValueError("Text must not be empty.")
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(CDP_URL)
+        try:
+            tab = _find_active_chatgpt_tab(browser)
+
+            if tab is None:
+                print("No ChatGPT tab was found through CDP.")
+                print("Most likely reason: the special Chrome window is not open.")
+                return False
+
+            print("FOUND ACTIVE CHATGPT TAB")
+            print(f"URL   : {tab.url}")
+            print(f"TITLE : {tab.title}")
+            print(f"FOCUS : {tab.has_focus}")
+            print(f"VIS   : {tab.visibility_state}")
+
+            ok = _write_into_composer(tab.page, text, submit=True)
+
+            if ok:
+                print("TEXT WRITTEN INTO CHATGPT COMPOSER")
+                print("MESSAGE WAS NOT SENT")
+                return True
+
+            print("ACTIVE TAB WAS FOUND, BUT COMPOSER COULD NOT BE DETECTED")
+            return False
+
+        finally:
+            browser.close()
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print('Usage: python Hook_ChatGTP.py "your text here"')
+        sys.exit(1)
+
+    text = " ".join(sys.argv[1:])
+    ok = write_text_to_active_chatgpt(text)
+
+    if not ok:
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
+```
+
 ### ~\ragstream\app\ui_streamlit.py
 ```python
 # ui_streamlit.py
@@ -608,7 +1120,7 @@ def main() -> None:
         # the widget-owned key "active_project" after that widget exists.
         st.session_state["pending_active_project"] = None
     if "retrieval_top_k" not in st.session_state:
-        st.session_state["retrieval_top_k"] = 100
+        st.session_state["retrieval_top_k"] = 50
     if "a2_memory_demo_entries" not in st.session_state:
         st.session_state["a2_memory_demo_entries"] = []
     if "a2_memory_demo_counter" not in st.session_state:
@@ -1549,7 +2061,7 @@ from typing import List, Tuple
 class Chunker:
     """Window-based text splitter."""
 
-    def split(self, file_path: str, text: str, chunk_size: int = 500, overlap: int = 100) -> List[Tuple[str, str]]:
+    def split(self, file_path: str, text: str, chunk_size: int = 1200, overlap: int = 120) -> List[Tuple[str, str]]:
         """
         Split the given text into overlapping chunks.
 
@@ -1880,36 +2392,7 @@ Scope:
     • This module focuses on the "documents" ingestion path only
       (conversation history layers are postponed as agreed).
     • Works with your existing loader, chunker, embedder, and Chroma vector store.
-
-Key responsibilities:
-    1) Build a list of current file Records by scanning a doc root/subfolder.
-    2) Load the previous manifest and compute a diff (what changed vs. last run).
-    3) For changed/new files: chunk → embed → upsert to VectorStoreChroma.
-       Optionally delete stale vectors from previous file versions.
-    4) Publish a new manifest atomically (tmp → replace) if the run succeeds.
-
-API:
-    IngestionManager(doc_root).run(
-        subfolder: str,
-        store: ChromaVectorStoreBase,
-        chunker: Chunker,
-        embedder: Embedder,
-        manifest_path: str,
-        *,
-        chunk_size: int = 500,
-        overlap: int = 100,
-        delete_old_versions: bool = True,
-        delete_tombstones: bool = False,
-    ) -> dict (stats)
-
-Data structures:
-    Record (from file_manifest.py):
-        {
-          "path":   "project1/file.md",  # relative to doc_root
-          "sha256": "<hex>",
-          "mtime":  <float>,
-          "size":   <int>
-        }
+    • Also supports an optional parallel SPLADE sparse-ingestion branch.
 
 Notes:
     • We compute file hashes from bytes on disk (compute_sha256), NOT from text.
@@ -1921,13 +2404,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
-# Local imports: your existing components
-from .loader import DocumentLoader          # returns [(abs_path, text), ...]
-from .chunker import Chunker                # split(file_path, text, chunk_size, overlap)
-from .embedder import Embedder              # embed(list[str]) -> list[list[float]]
-from .vector_store_chroma import VectorStoreChroma  # Chroma-backed store
+# Local imports: existing dense components
+from .loader import DocumentLoader
+from .chunker import Chunker
+from .embedder import Embedder
+from .vector_store_chroma import VectorStoreChroma
+
+# Added on 13.04.2026:
+# Optional sparse SPLADE ingestion components.
+from .splade_embedder import SpladeEmbedder
+from .vector_store_splade import VectorStoreSplade
 
 # Manifest utilities
 from .file_manifest import (
@@ -1935,7 +2423,7 @@ from .file_manifest import (
     load_manifest,
     diff as manifest_diff,
     publish_atomic,
-    Record,   # TypedDict
+    Record,
 )
 
 
@@ -1951,21 +2439,19 @@ class IngestionStats:
     deleted_old_versions: int
     deleted_tombstones: int
     published_manifest_path: str
-    embedded_bytes: int  # total UTF-8 bytes sent to the embedder in this run
+    embedded_bytes: int
+
+    # Added on 13.04.2026:
+    # Split counters for the parallel dense + sparse branches.
+    dense_vectors_upserted: int
+    sparse_vectors_upserted: int
+    dense_embedded_bytes: int
+    sparse_embedded_bytes: int
+
 
 class IngestionManager:
     """
     Coordinates the full ingestion pipeline for a given doc root.
-
-    Typical usage:
-        mgr = IngestionManager(doc_root="/.../data/doc_raw")
-        stats = mgr.run(
-            subfolder="project1",
-            store=VectorStoreChroma(persist_dir=".../data/chroma_db/project1"),
-            chunker=Chunker(),
-            embedder=Embedder(model="text-embedding-3-large"),
-            manifest_path="/.../data/file_manifest.json",
-        )
     """
 
     def __init__(self, doc_root: str) -> None:
@@ -1982,10 +2468,6 @@ class IngestionManager:
         # A loader is tied to a root; it returns absolute file paths + text for a subfolder
         self.loader = DocumentLoader(root=self.doc_root)
 
-    # -------------------------------------------------------------------------
-    # Public entrypoint
-    # -------------------------------------------------------------------------
-
     def run(
         self,
         subfolder: str,
@@ -1994,40 +2476,38 @@ class IngestionManager:
         embedder: Embedder,
         manifest_path: str,
         *,
-        chunk_size: int = 500,
-        overlap: int = 100,
+        sparse_store: VectorStoreSplade | None = None,
+        sparse_embedder: SpladeEmbedder | None = None,
+        chunk_size: int = 1200,
+        overlap: int = 120,
         delete_old_versions: bool = True,
         delete_tombstones: bool = False,
     ) -> IngestionStats:
         """
         Execute a full ingestion cycle for one subfolder under doc_root.
 
-        Steps:
-            1) Scan subfolder → build current Records (bytes hash, mtime, size).
-            2) Load previous manifest → diff → decide what to process.
-            3) For each changed/new file:
-                   - chunk (deterministic windows)
-                   - embed (batch)
-                   - upsert to Chroma (IDs: rel_path::sha256::idx; metadatas)
-                   - optionally delete old-version chunks (if path existed with other sha).
-            4) Optionally delete tombstone chunks (files removed from disk).
-            5) Publish new manifest atomically.
+        Dense branch is always active.
+        Sparse SPLADE branch is active only if both sparse_store and sparse_embedder are provided.
 
         Returns:
             IngestionStats with useful counters.
         """
         manifest_path = str(Path(manifest_path).resolve())
 
+        use_sparse = (sparse_store is not None) or (sparse_embedder is not None)
+        if use_sparse and (sparse_store is None or sparse_embedder is None):
+            raise ValueError(
+                "Sparse ingestion requires both sparse_store and sparse_embedder."
+            )
+
         # 1) Load documents (absolute path + raw text) from the subfolder.
-        docs = self.loader.load_documents(subfolder)  # [(abs_path, text), ...]
-        # Build a quick map from abs_path to text for later reuse.
+        docs = self.loader.load_documents(subfolder)
         text_by_abs: Dict[str, str] = {abs_path: text for abs_path, text in docs}
 
         # 2) Build current Records by hashing files on disk (bytes).
         records_now: List[Record] = []
         for abs_path, _text in docs:
             ap = Path(abs_path)
-            # relative path stored in manifest and metadata
             rel_path = ap.relative_to(self.doc_root).as_posix()
             sha = compute_sha256(abs_path)
             st = ap.stat()
@@ -2042,16 +2522,19 @@ class IngestionManager:
         manifest_prev = load_manifest(manifest_path)
         to_process, unchanged, tombstones = manifest_diff(records_now, manifest_prev)
 
-        # For old-version deletion we need a map: previous[path] -> prev_sha
         prev_by_path: Dict[str, Record] = {
             rec["path"]: rec for rec in manifest_prev.get("files", [])
         }
 
-        # 4) Process changed/new files (chunk → embed → upsert).
+        # 4) Process changed/new files (shared chunking pass → dense and optional sparse upsert).
         total_chunks = 0
-        total_upserts = 0
         total_deleted_old = 0
-        total_embedded_bytes = 0  # sum of UTF-8 bytes of all chunk_texts we embed this run
+
+        dense_upserts = 0
+        sparse_upserts = 0
+
+        dense_embedded_bytes = 0
+        sparse_embedded_bytes = 0
 
         for rec in to_process:
             rel_path = rec["path"]
@@ -2060,11 +2543,8 @@ class IngestionManager:
             abs_path = (self.doc_root / rel_path).as_posix()
             text = text_by_abs.get(abs_path)
             if text is None:
-                # Fallback: if loader skipped for some reason, read file now
-                # (should rarely happen, but keeps us robust).
                 text = Path(abs_path).read_text(encoding="utf-8", errors="ignore")
 
-            # Build chunks deterministically (same as your ad-hoc test).
             chunks = chunker.split(abs_path, text, chunk_size=chunk_size, overlap=overlap)
             chunk_texts: List[str] = []
             ids: List[str] = []
@@ -2083,28 +2563,31 @@ class IngestionManager:
                 })
 
             if not chunk_texts:
-                # Nothing to embed/store for this file—continue gracefully.
                 continue
 
-            # Optional: delete all chunks for the OLD version of this file (same path, different sha).
             if delete_old_versions and rel_path in prev_by_path:
                 sha_old = prev_by_path[rel_path]["sha256"]
                 if sha_old != sha_new:
-                    # Delete by metadata filter (explicit audit)
-                    before = self._count_ids(store, rel_path, sha_old)
-                    store.delete_where({"$and": [{"path": rel_path}, {"sha256": sha_old}]})
-                    after = self._count_ids(store, rel_path, sha_old)
-                    total_deleted_old += max(0, before - after)
+                    total_deleted_old += self._delete_file_version(store, rel_path, sha_old)
+                    if use_sparse and sparse_store is not None:
+                        total_deleted_old += self._delete_file_version(sparse_store, rel_path, sha_old)
 
-             # Count bytes that will be embedded (exact UTF-8 length of the texts we send).
             file_embedded_bytes = sum(len(s.encode("utf-8")) for s in chunk_texts)
-            total_embedded_bytes += file_embedded_bytes
-            # Embed + upsert in batches (embedder handles batching internally if needed).
-            vecs = embedder.embed(chunk_texts)
-            store.add(ids=ids, vectors=vecs, metadatas=metas)
+
+            # Dense branch
+            dense_vecs = embedder.embed(chunk_texts)
+            store.add(ids=ids, vectors=dense_vecs, metadatas=metas)
+            dense_upserts += len(ids)
+            dense_embedded_bytes += file_embedded_bytes
+
+            # Optional sparse branch
+            if use_sparse and sparse_store is not None and sparse_embedder is not None:
+                sparse_vecs = sparse_embedder.embed(chunk_texts)
+                sparse_store.add(ids=ids, vectors=sparse_vecs, metadatas=metas)
+                sparse_upserts += len(ids)
+                sparse_embedded_bytes += file_embedded_bytes
 
             total_chunks += len(chunk_texts)
-            total_upserts += len(ids)
 
         # 5) Optionally delete tombstones (files that disappeared from disk).
         total_deleted_tombs = 0
@@ -2112,15 +2595,15 @@ class IngestionManager:
             for prev_rec in tombstones:
                 rel_path = prev_rec["path"]
                 sha_prev = prev_rec["sha256"]
-                before = self._count_ids(store, rel_path, sha_prev)
-                store.delete_where({"$and": [{"path": rel_path}, {"sha256": sha_prev}]})
-                after = self._count_ids(store, rel_path, sha_prev)
-                total_deleted_tombs += max(0, before - after)
+
+                total_deleted_tombs += self._delete_file_version(store, rel_path, sha_prev)
+                if use_sparse and sparse_store is not None:
+                    total_deleted_tombs += self._delete_file_version(sparse_store, rel_path, sha_prev)
 
         # 6) Publish a fresh manifest that reflects the CURRENT disk state.
         manifest_new = {
             "version": "1",
-            "generated_at": "",   # publish_atomic will stamp UTC if empty
+            "generated_at": "",
             "files": records_now,
         }
         publish_atomic(manifest_new, manifest_path)
@@ -2131,26 +2614,57 @@ class IngestionManager:
             unchanged=len(unchanged),
             tombstones=len(tombstones),
             chunks_added=total_chunks,
-            vectors_upserted=total_upserts,
+            vectors_upserted=dense_upserts + sparse_upserts,
             deleted_old_versions=total_deleted_old,
             deleted_tombstones=total_deleted_tombs,
             published_manifest_path=manifest_path,
-            embedded_bytes=total_embedded_bytes,
+            embedded_bytes=dense_embedded_bytes + sparse_embedded_bytes,
+            dense_vectors_upserted=dense_upserts,
+            sparse_vectors_upserted=sparse_upserts,
+            dense_embedded_bytes=dense_embedded_bytes,
+            sparse_embedded_bytes=sparse_embedded_bytes,
         )
 
-    # -------------------------------------------------------------------------
-    # Small helpers
-    # -------------------------------------------------------------------------
+    @staticmethod
+    def _delete_file_version(store: Any, rel_path: str, sha256: str) -> int:
+        """
+        Remove all chunks belonging to one specific file version.
+
+        Uses the store's native delete_file_version(...) when available.
+        Falls back to metadata-filter delete_where(...) if needed.
+        """
+        if hasattr(store, "delete_file_version"):
+            return int(store.delete_file_version(rel_path, sha256))
+
+        before = IngestionManager._count_ids(store, rel_path, sha256)
+        store.delete_where({"$and": [{"path": rel_path}, {"sha256": sha256}]})
+        after = IngestionManager._count_ids(store, rel_path, sha256)
+        return max(0, before - after)
 
     @staticmethod
-    def _count_ids(store: VectorStoreChroma, rel_path: str, sha256: str) -> int:
+    def _count_ids(store: Any, rel_path: str, sha256: str) -> int:
         """
         Return how many IDs exist for a given (path, sha256) pair.
-        Used to report how many vectors were deleted during cleanup.
         """
-        res = store.collection.get(where={"$and": [{"path": rel_path}, {"sha256": sha256}]}, include=[])
-        ids = res.get("ids", []) if res else []
-        return len(ids)
+        # Dense Chroma store
+        if hasattr(store, "collection"):
+            res = store.collection.get(
+                where={"$and": [{"path": rel_path}, {"sha256": sha256}]},
+                include=[],
+            )
+            ids = res.get("ids", []) if res else []
+            return len(ids)
+
+        # Local sparse SPLADE store
+        meta_store = getattr(store, "_meta_store", None)
+        if isinstance(meta_store, dict):
+            return sum(
+                1
+                for meta in meta_store.values()
+                if meta.get("path") == rel_path and meta.get("sha256") == sha256
+            )
+
+        return 0
 ```
 
 ### ~\ragstream\ingestion\loader.py
@@ -2197,6 +2711,533 @@ class DocumentLoader:
                 docs.append((str(file_path.resolve()), text))
 
         return docs
+```
+
+### ~\ragstream\ingestion\splade_embedder.py
+```python
+# -*- coding: utf-8 -*-
+"""
+splade_embedder.py
+
+Purpose:
+    SPLADE-side counterpart of embedder.py for RAGstream ingestion.
+
+Role in architecture:
+    - Dense side:
+        Embedder.embed(texts) -> List[List[float]]
+    - Sparse SPLADE side:
+        SpladeEmbedder.embed(texts) -> List[Dict[str, float]]
+
+Design goals:
+    - Keep the public ingestion-facing API parallel to Embedder:
+        embed(texts) -> one sparse representation per text
+    - Add query-specific helpers for the later retrieval phase:
+        embed_queries(...)
+        embed_query(...)
+    - Persist nothing here; this module is encoder-only.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Sequence
+
+try:
+    import torch
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "splade_embedder.py requires PyTorch. Please install torch first."
+    ) from exc
+
+try:
+    from sentence_transformers import SparseEncoder
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "splade_embedder.py requires sentence-transformers with SparseEncoder support."
+    ) from exc
+
+
+SparseVector = Dict[str, float]
+
+
+class SpladeEmbedder:
+    """
+    High-level SPLADE sparse encoder.
+
+    Public API is intentionally parallel to dense Embedder where possible:
+        - embed(texts)         : document-side sparse encoding for ingestion
+        - embed_queries(texts) : query-side sparse encoding for retrieval
+        - embed_query(text)    : single-query convenience wrapper
+
+    Internal sparse representation:
+        Dict[str, float]
+            key   = vocabulary dimension id as string
+            value = SPLADE weight for that active dimension
+    """
+
+    def __init__(
+        self,
+        model: str = "naver/splade-cocondenser-ensembledistil",
+        *,
+        device: str = "cpu",
+        backend: str = "torch",
+        batch_size: int = 16,
+        max_active_dims: int | None = 256,
+        show_progress_bar: bool = False,
+    ) -> None:
+        """
+        Args:
+            model:
+                SPLADE model name or local path.
+            device:
+                Usually "cpu" on your laptop for now.
+            backend:
+                SparseEncoder backend, e.g. "torch", "onnx", "openvino".
+            batch_size:
+                Default batch size for encoding.
+            max_active_dims:
+                Optional cap on active dimensions to keep sparse output bounded.
+            show_progress_bar:
+                Whether Sentence Transformers should show progress bars.
+        """
+        self.model = model
+        self.device = device
+        self.backend = backend
+        self.batch_size = int(batch_size)
+        self.max_active_dims = max_active_dims
+        self.show_progress_bar = bool(show_progress_bar)
+
+        self.encoder = SparseEncoder(
+            model,
+            device=device,
+            backend=backend,
+            max_active_dims=max_active_dims,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def embed(self, texts: List[str]) -> List[SparseVector]:
+        """
+        Document-side sparse encoding for ingestion.
+
+        This is the ingestion-parallel counterpart of dense Embedder.embed(...).
+
+        Args:
+            texts:
+                List of chunk texts.
+
+        Returns:
+            List[Dict[str, float]]:
+                One sparse representation per input text.
+        """
+        return self._encode_documents(texts)
+
+    def embed_queries(self, texts: List[str]) -> List[SparseVector]:
+        """
+        Query-side sparse encoding for retrieval.
+
+        Kept here already so retriever_splade.py can later use the same class.
+        """
+        if not texts:
+            return []
+
+        raw = self.encoder.encode_query(
+            texts,
+            batch_size=self.batch_size,
+            show_progress_bar=self.show_progress_bar,
+            convert_to_tensor=False,
+            convert_to_sparse_tensor=True,
+            save_to_cpu=True,
+            max_active_dims=self.max_active_dims,
+        )
+        return [self._tensor_to_sparse_dict(t) for t in self._ensure_list(raw)]
+
+    def embed_query(self, text: str) -> SparseVector:
+        """
+        Convenience wrapper for one retrieval query.
+        """
+        text = (text or "").strip()
+        if not text:
+            return {}
+        return self.embed_queries([text])[0]
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _encode_documents(self, texts: Sequence[str]) -> List[SparseVector]:
+        if not texts:
+            return []
+
+        raw = self.encoder.encode_document(
+            list(texts),
+            batch_size=self.batch_size,
+            show_progress_bar=self.show_progress_bar,
+            convert_to_tensor=False,
+            convert_to_sparse_tensor=True,
+            save_to_cpu=True,
+            max_active_dims=self.max_active_dims,
+        )
+        return [self._tensor_to_sparse_dict(t) for t in self._ensure_list(raw)]
+
+    @staticmethod
+    def _ensure_list(raw: object) -> List[torch.Tensor]:
+        """
+        Sentence Transformers may return a single tensor or a list of tensors,
+        depending on input shape and conversion settings.
+        """
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, torch.Tensor):
+            return [raw]
+        raise TypeError(f"Unsupported sparse encoder output type: {type(raw)!r}")
+
+    @staticmethod
+    def _tensor_to_sparse_dict(tensor: torch.Tensor) -> SparseVector:
+        """
+        Convert one sparse tensor into Dict[str, float].
+
+        Expected common case:
+            sparse COO tensor, shape [vocab_size]
+
+        Fallback:
+            dense tensor -> convert non-zero entries only
+        """
+        if tensor.is_sparse:
+            t = tensor.coalesce()
+            indices = t.indices()
+            values = t.values()
+
+            if indices.numel() == 0:
+                return {}
+
+            # 1D sparse vector: indices shape [1, nnz]
+            # Defensive fallback: use last row if shape differs.
+            if indices.dim() == 2:
+                dim_ids = indices[-1].tolist()
+            else:
+                dim_ids = indices.tolist()
+
+            return {
+                str(int(dim_id)): float(value)
+                for dim_id, value in zip(dim_ids, values.tolist())
+                if float(value) != 0.0
+            }
+
+        # Dense fallback
+        nonzero = torch.nonzero(tensor, as_tuple=False).flatten().tolist()
+        if not nonzero:
+            return {}
+
+        return {
+            str(int(idx)): float(tensor[idx].item())
+            for idx in nonzero
+            if float(tensor[idx].item()) != 0.0
+        }
+```
+
+### ~\ragstream\ingestion\splade_vector_store_base.py
+```python
+# -*- coding: utf-8 -*-
+"""
+splade_vector_store_base.py
+
+Shared, production-grade base class for a local SPLADE-backed sparse store.
+
+Purpose:
+    Provide the sparse-store analogue of chroma_vector_store_base.py, with the
+    same public culture wherever possible:
+
+        add(ids, vectors, metadatas) -> None
+        query(vector, k=10, where=None) -> List[str]
+        delete_where(where) -> None
+        snapshot(timestamp=None) -> Path
+
+Storage model:
+    Local filesystem persistence under one project folder.
+    The store persists:
+        - sparse vectors by id
+        - metadatas by id
+
+Why local and simple:
+    For your current architecture, SPLADE ingestion is the first step.
+    Later retrieval can rescore a bounded set of chunk_ids efficiently from this
+    store without requiring a full external search engine.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+import os
+import pickle
+import shutil
+
+
+SparseVector = Dict[str, float]
+
+
+class SpladeVectorStoreBase:
+    """
+    Base implementation of a local persistent sparse store.
+
+    Responsibilities:
+      - Own one filesystem-backed sparse index bundle.
+      - Provide deterministic add/query/delete/snapshot methods.
+      - Offer policy hooks for subclasses, matching the Chroma base style.
+    """
+
+    def __init__(self, persist_dir: str, index_name: str) -> None:
+        self.persist_path = Path(persist_dir)
+        self.persist_path.mkdir(parents=True, exist_ok=True)
+
+        self.index_name = index_name
+        self._bundle_path = self.persist_path / f"{self.index_name}.pkl"
+
+        self._index: Dict[str, SparseVector] = {}
+        self._meta_store: Dict[str, Dict[str, Any]] = {}
+
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Public API (parallel to Chroma base)
+    # ------------------------------------------------------------------
+
+    def add(
+        self,
+        ids: List[str],
+        vectors: List[SparseVector],
+        metadatas: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """
+        Upsert sparse vectors and metadatas into the local store.
+        """
+        if not ids or not vectors:
+            return
+        if len(ids) != len(vectors):
+            raise ValueError("ids and vectors length mismatch")
+        if metadatas is not None and len(metadatas) != len(ids):
+            raise ValueError("metadatas length must match ids (or be None)")
+
+        ids, vectors, metadatas = self._pre_add(ids, vectors, metadatas)
+
+        metas = metadatas or [{} for _ in ids]
+
+        for chunk_id, vector, meta in zip(ids, vectors, metas):
+            self._index[chunk_id] = self._normalize_sparse_vector(vector)
+            self._meta_store[chunk_id] = dict(meta)
+
+        self._persist()
+        self._post_add(ids, vectors, metadatas)
+
+    def query(
+        self,
+        vector: SparseVector,
+        k: int = 10,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        """
+        Query the sparse store by sparse-vector dot product.
+
+        Args:
+            vector:
+                Query sparse vector, same representation as stored doc vectors.
+            k:
+                Number of top results to return.
+            where:
+                Optional metadata filter, supporting:
+                    - {"path": "...", "sha256": "..."}
+                    - {"$and": [ ... ]}
+                    - {"$or":  [ ... ]}
+        """
+        if not isinstance(vector, dict):
+            raise ValueError("query vector must be a Dict[str, float]")
+
+        k = max(1, int(k))
+        vector, k, where = self._pre_query(vector, k, where)
+
+        scored: List[tuple[str, float]] = []
+        for chunk_id, doc_vec in self._index.items():
+            meta = self._meta_store.get(chunk_id, {})
+
+            if where and not self._metadata_matches(meta, where):
+                continue
+
+            score = self._dot_sparse(vector, doc_vec)
+            scored.append((chunk_id, score))
+
+        scored.sort(key=lambda row: (-row[1], row[0]))
+        ids = [chunk_id for chunk_id, _score in scored[:k]]
+        return self._post_query(ids, {"scored": scored})
+
+    def delete_where(self, where: Dict[str, Any]) -> None:
+        """
+        Delete records by metadata filter.
+        """
+        if not where:
+            return
+
+        ids_to_delete = [
+            chunk_id
+            for chunk_id, meta in self._meta_store.items()
+            if self._metadata_matches(meta, where)
+        ]
+        self._delete_ids(ids_to_delete)
+
+    def snapshot(self, timestamp: Optional[str] = None) -> Path:
+        """
+        Create a filesystem snapshot of the persistent sparse store directory.
+        """
+        ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshots_dir = self.persist_path.parent / "snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        dst = snapshots_dir / f"{self.persist_path.name}_{ts}"
+
+        shutil.copytree(self.persist_path, dst, dirs_exist_ok=False)
+        return dst
+
+    @property
+    def index(self) -> Dict[str, SparseVector]:
+        """
+        Expose the underlying sparse vector mapping for advanced ops/debugging.
+        """
+        return self._index
+
+    # ------------------------------------------------------------------
+    # Hook methods (parallel to Chroma base)
+    # ------------------------------------------------------------------
+
+    def _pre_add(
+        self,
+        ids: List[str],
+        vectors: List[SparseVector],
+        metadatas: Optional[List[Dict[str, Any]]],
+    ) -> tuple[List[str], List[SparseVector], Optional[List[Dict[str, Any]]]]:
+        return ids, vectors, metadatas
+
+    def _post_add(
+        self,
+        ids: List[str],
+        vectors: List[SparseVector],
+        metadatas: Optional[List[Dict[str, Any]]],
+    ) -> None:
+        return None
+
+    def _pre_query(
+        self,
+        vector: SparseVector,
+        k: int,
+        where: Optional[Dict[str, Any]],
+    ) -> tuple[SparseVector, int, Optional[Dict[str, Any]]]:
+        return vector, k, where
+
+    def _post_query(self, ids: List[str], raw_result: Dict[str, Any]) -> List[str]:
+        return ids
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load(self) -> None:
+        if not self._bundle_path.exists():
+            return
+
+        with self._bundle_path.open("rb") as f:
+            payload = pickle.load(f)
+
+        self._index = dict(payload.get("index", {}))
+        self._meta_store = dict(payload.get("metadatas", {}))
+
+    def _persist(self) -> None:
+        payload = {
+            "version": "1",
+            "index_name": self.index_name,
+            "index": self._index,
+            "metadatas": self._meta_store,
+        }
+
+        tmp_path = self._bundle_path.with_suffix(self._bundle_path.suffix + ".tmp")
+        with tmp_path.open("wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        os.replace(str(tmp_path), str(self._bundle_path))
+
+    def _delete_ids(self, ids: Iterable[str]) -> None:
+        changed = False
+        for chunk_id in ids:
+            if chunk_id in self._index:
+                del self._index[chunk_id]
+                changed = True
+            if chunk_id in self._meta_store:
+                del self._meta_store[chunk_id]
+                changed = True
+
+        if changed:
+            self._persist()
+
+    @staticmethod
+    def _normalize_sparse_vector(vector: SparseVector) -> SparseVector:
+        """
+        Remove zero entries and normalize key/value types.
+        """
+        normalized: SparseVector = {}
+        for key, value in vector.items():
+            fval = float(value)
+            if fval != 0.0:
+                normalized[str(key)] = fval
+        return normalized
+
+    @staticmethod
+    def _dot_sparse(left: SparseVector, right: SparseVector) -> float:
+        """
+        Dot product over sparse dicts.
+
+        Iterate over the smaller dict for efficiency.
+        """
+        if len(left) > len(right):
+            left, right = right, left
+
+        score = 0.0
+        for key, value in left.items():
+            score += float(value) * float(right.get(key, 0.0))
+        return score
+
+    @classmethod
+    def _metadata_matches(cls, metadata: Dict[str, Any], where: Dict[str, Any]) -> bool:
+        """
+        Minimal local filter engine compatible with the current ingestion needs.
+
+        Supported:
+            {"path": "..."}
+            {"sha256": "..."}
+            {"$and": [cond1, cond2, ...]}
+            {"$or":  [cond1, cond2, ...]}
+        """
+        if not where:
+            return True
+
+        if "$and" in where:
+            conditions = where["$and"]
+            if not isinstance(conditions, list):
+                raise ValueError("$and value must be a list")
+            return all(cls._metadata_matches(metadata, cond) for cond in conditions)
+
+        if "$or" in where:
+            conditions = where["$or"]
+            if not isinstance(conditions, list):
+                raise ValueError("$or value must be a list")
+            return any(cls._metadata_matches(metadata, cond) for cond in conditions)
+
+        for key, expected in where.items():
+            if key.startswith("$"):
+                raise ValueError(f"Unsupported filter operator: {key}")
+            if metadata.get(key) != expected:
+                return False
+
+        return True
 ```
 
 ### ~\ragstream\ingestion\vector_store_chroma.py
@@ -2315,6 +3356,88 @@ class VectorStoreChroma(ChromaVectorStoreBase):
             # Older clients may not implement .count(); fall back to get(ids=None)
             res = self.collection.get()  # may be heavy on very large stores
             return len(res.get("ids", [])) if res else 0
+```
+
+### ~\ragstream\ingestion\vector_store_splade.py
+```python
+# -*- coding: utf-8 -*-
+"""
+vector_store_splade.py
+
+Concrete sparse document store for RAGstream, backed by SpladeVectorStoreBase.
+
+This is the sparse-side counterpart of vector_store_chroma.py.
+
+Usage:
+    store = VectorStoreSplade(persist_dir=".../data/splade_db/project1")
+    store.add(ids=[...], vectors=[...], metadatas=[...])
+    top_ids = store.query(vector=q_sparse, k=5)
+    snap_dir = store.snapshot()
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List
+
+from .splade_vector_store_base import SpladeVectorStoreBase
+
+
+class VectorStoreSplade(SpladeVectorStoreBase):
+    """
+    Local persistent sparse store for document chunks.
+
+    Responsibilities:
+      - Provide a ready-to-use sparse project store (default: "docs_sparse").
+      - Reuse base add/query/snapshot/delete_where without policy overrides.
+      - Offer the same tiny convenience helpers as VectorStoreChroma wherever
+        possible, so both branches stay structurally parallel.
+    """
+
+    def __init__(self, persist_dir: str, index_name: str = "docs_sparse") -> None:
+        super().__init__(persist_dir=persist_dir, index_name=index_name)
+
+    @staticmethod
+    def make_chunk_id(rel_path: str, sha256: str, chunk_idx: int) -> str:
+        """
+        Deterministic chunk id format shared with the dense branch.
+        Example: "docs/Req.md::a1b2c3...::12"
+        """
+        return f"{rel_path}::{sha256}::{chunk_idx}"
+
+    def delete_file_version(self, rel_path: str, sha256: str) -> int:
+        """
+        Remove all chunks belonging to one specific file content version.
+
+        This mirrors VectorStoreChroma.delete_file_version(...).
+        """
+        ids = [
+            chunk_id
+            for chunk_id, meta in self._meta_store.items()
+            if meta.get("path") == rel_path and meta.get("sha256") == sha256
+        ]
+        self._delete_ids(ids)
+        return len(ids)
+
+    @property
+    def name(self) -> str:
+        """
+        Return the logical sparse index name.
+        """
+        return self.index_name
+
+    @property
+    def persist_root(self) -> Path:
+        """
+        Return the directory containing the on-disk sparse store.
+        """
+        return self.persist_path
+
+    def count(self) -> int:
+        """
+        Return total number of stored sparse vectors.
+        """
+        return len(self._index)
 ```
 
 
@@ -2899,6 +4022,7 @@ class PromptBuilder:
 
 ### ~\ragstream\orchestration\super_prompt.py
 ```python
+# super_prompt.py
 # -*- coding: utf-8 -*-
 """
 SuperPrompt (v1) — central prompt object (manual __init__, no dataclass).
@@ -2907,11 +4031,21 @@ Place at: ragstream/orchestration/super_prompt.py
 Notes (agreed pipeline choices; for reference only):
 - Retrieval aggregation: LogAvgExp (length-normalized LogSumExp) with τ = 9 over per-piece cosine sims.
 - Re-ranker: cross-encoder/ms-marco-MiniLM-L-6-v2 on (Prompt_MD, chunk_text).
+
+Stage refactor note:
+- SuperPrompt remains the authoritative shared state object.
+- Projection / render / text-extraction support logic has been moved to
+  superprompt_projector.py.
+- compose_prompt_ready() remains here as the stable public wrapper so that
+  external call sites do not need to change.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Literal
+
 from enum import Enum
+from typing import Any, Dict, List, Literal, Optional
+
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 
 # Lifecycle stages for this SuperPrompt (fixed vocabulary)
 Stage = Literal["raw", "preprocessed", "a2", "retrieval", "reranked", "a3", "a4", "a5"]
@@ -3013,64 +4147,157 @@ class SuperPrompt:
 
     def compose_prompt_ready(self) -> str:
         """
+        Stable public wrapper for the central SuperPrompt render path.
+
+        Important compatibility rule:
+        - External code may continue to call sp.compose_prompt_ready() exactly
+          as before.
+        - The real render / projection logic lives in SuperPromptProjector.
+        """
+        return SuperPromptProjector(self).compose_prompt_ready()
+
+    def __repr__(self) -> str:
+        return f"SuperPrompt(stage={self.stage!r})"
+```
+
+### ~\ragstream\orchestration\superprompt_projector.py
+```python
+# superprompt_projector.py
+# -*- coding: utf-8 -*-
+"""
+superprompt_projector.py
+
+Purpose:
+    Companion projection / render / text-extraction support for SuperPrompt.
+
+Design:
+    - SuperPrompt remains the authoritative shared state object.
+    - This module owns derived render logic and text-oriented support logic.
+    - compose_prompt_ready() remains publicly callable through the wrapper
+      method on SuperPrompt for compatibility.
+    - build_query_text(sp) also lives here, because it is a projection of
+      SuperPrompt state into a retrieval-oriented text representation.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ragstream.orchestration.super_prompt import SuperPrompt
+
+
+class SuperPromptProjector:
+    """
+    Projection / render helper around one SuperPrompt instance.
+
+    Main responsibilities:
+    - render System_MD
+    - render Prompt_MD
+    - render Related Context preview
+    - compose prompt_ready
+    - project retrieval query text from SuperPrompt
+    """
+
+    def __init__(self, sp: "SuperPrompt") -> None:
+        if sp is None:
+            raise ValueError("SuperPromptProjector.__init__: 'sp' must not be None")
+        self.sp = sp
+
+    @staticmethod
+    def build_query_text(sp: "SuperPrompt") -> str:
+        """
+        Build a retrieval-oriented query text from the structured SuperPrompt body.
+
+        Current design choice:
+        - Use only TASK / PURPOSE / CONTEXT.
+        - Keep the order explicit and stable.
+        - Skip empty fields.
+        """
+        if sp is None:
+            raise ValueError("SuperPromptProjector.build_query_text: 'sp' must not be None")
+
+        if not hasattr(sp, "body") or sp.body is None:
+            raise ValueError("SuperPromptProjector.build_query_text: SuperPrompt has no usable 'body'")
+
+        blocks: List[str] = []
+
+        task = (sp.body.get("task") or "").strip()
+        purpose = (sp.body.get("purpose") or "").strip()
+        context = (sp.body.get("context") or "").strip()
+
+        if task:
+            blocks.append("## TASK")
+            blocks.append(task)
+            blocks.append("")
+
+        if purpose:
+            blocks.append("## PURPOSE")
+            blocks.append(purpose)
+            blocks.append("")
+
+        if context:
+            blocks.append("## CONTEXT")
+            blocks.append(context)
+            blocks.append("")
+
+        query_text = "\n".join(blocks).strip()
+
+        if not query_text:
+            raise ValueError(
+                "SuperPromptProjector.build_query_text: retrieval query is empty. "
+                "At least one of TASK / PURPOSE / CONTEXT must be present."
+            )
+
+        return query_text
+
+    def compose_prompt_ready(self) -> str:
+        """
         Central render method for the current SuperPrompt.
 
         Purpose:
         - Build a single display/send-ready markdown text from the current object state.
         - Work already for PreProcessing and A2, where no chunks exist yet.
         - Also work for Retrieval and later stages, where chunk-based context may exist.
-        - Replace the stage-local external compose functions in the future, so prompt
-          rendering lives in one central place.
-
-        Current behaviour:
-        - Rebuild self.System_MD from self.body
-        - Rebuild self.Prompt_MD from self.body
-        - Keep self.S_CTX_MD and self.Attachments_MD if some later stage has already set them
-        - If no later-stage attachments exist, render a simple "Related Context" section
-          from the currently selected chunks
-        - Write the final combined markdown into self.prompt_ready
-
-        Returns:
-            The final composed markdown string.
         """
-        self.System_MD = self._render_system_md()
-        self.Prompt_MD = self._render_prompt_md()
+        self.sp.System_MD = self._render_system_md()
+        self.sp.Prompt_MD = self._render_prompt_md()
 
         parts: List[str] = []
 
-        if self.System_MD:
-            parts.append(self.System_MD)
+        if self.sp.System_MD:
+            parts.append(self.sp.System_MD)
 
-        if self.Prompt_MD:
-            parts.append(self.Prompt_MD)
+        if self.sp.Prompt_MD:
+            parts.append(self.sp.Prompt_MD)
 
-        if self.S_CTX_MD:
-            parts.append(self.S_CTX_MD)
+        if self.sp.S_CTX_MD:
+            parts.append(self.sp.S_CTX_MD)
 
-        if self.Attachments_MD:
-            parts.append(self.Attachments_MD)
+        if self.sp.Attachments_MD:
+            parts.append(self.sp.Attachments_MD)
         else:
             related_context_md = self._render_related_context_md()
             if related_context_md:
                 parts.append(related_context_md)
 
-        self.prompt_ready = "\n\n".join(parts).strip()
-        return self.prompt_ready
+        self.sp.prompt_ready = "\n\n".join(parts).strip()
+        return self.sp.prompt_ready
 
     def _render_system_md(self) -> str:
         """
-        Render the high-authority system/config part from self.body.
+        Render the high-authority system/config part from sp.body.
 
         This method is intentionally deterministic and simple.
         It does not depend on retrieval artifacts.
         """
         lines: List[str] = []
 
-        system_value = (self.body.get("system") or "").strip()
-        role_value = (self.body.get("role") or "").strip()
-        audience_value = (self.body.get("audience") or "").strip()
-        tone_value = (self.body.get("tone") or "").strip()
-        depth_value = (self.body.get("depth") or "").strip()
+        system_value = (self.sp.body.get("system") or "").strip()
+        role_value = (self.sp.body.get("role") or "").strip()
+        audience_value = (self.sp.body.get("audience") or "").strip()
+        tone_value = (self.sp.body.get("tone") or "").strip()
+        depth_value = (self.sp.body.get("depth") or "").strip()
 
         if system_value:
             lines.append("## System")
@@ -3097,7 +4324,7 @@ class SuperPrompt:
 
     def _render_prompt_md(self) -> str:
         """
-        Render the user-facing prompt part from self.body.
+        Render the user-facing prompt part from sp.body.
 
         This method is designed to cover:
         - raw / preprocessed / a2 stages without any chunk context
@@ -3105,11 +4332,11 @@ class SuperPrompt:
         """
         lines: List[str] = []
 
-        task_value = (self.body.get("task") or "").strip()
-        purpose_value = (self.body.get("purpose") or "").strip()
-        context_value = (self.body.get("context") or "").strip()
-        format_value = (self.body.get("format") or "").strip()
-        text_value = (self.body.get("text") or "").strip()
+        task_value = (self.sp.body.get("task") or "").strip()
+        purpose_value = (self.sp.body.get("purpose") or "").strip()
+        context_value = (self.sp.body.get("context") or "").strip()
+        format_value = (self.sp.body.get("format") or "").strip()
+        text_value = (self.sp.body.get("text") or "").strip()
 
         if task_value:
             lines.append("## Task")
@@ -3142,16 +4369,22 @@ class SuperPrompt:
         """
         Format numeric scores compactly for the Related Context headers.
         """
-        return f"{float(score):.4f}".rstrip("0").rstrip(".")
+        return f"{float(score):.8f}".rstrip("0").rstrip(".")
 
     def _render_related_context_md(self) -> str:
         """
-        Render a simple chunk-based context preview from the current selected chunks.
+        Render a chunk-based context preview from the current selected chunks.
 
         Design intention:
         - The GUI should show only the selected chunk texts.
-        - During Retrieval, show only Rt-Score in the chunk header.
-        - During ReRanker, show Rk-Score first and Rt-Score second.
+        - During Retrieval, show:
+            Rt     = final fused Retrieval score
+            Emb    = dense branch score
+            Splade = sparse branch score
+        - During ReRanker, show:
+            Rnk   = final fused rerank RRF score
+            RcolB = ColBERT score
+            Rt    = final fused Retrieval score from the previous stage
         - For other stages, keep the header simple.
         - Technical metadata such as ID, source, status, and span remain
           inside SuperPrompt as internal structured data and are not rendered here.
@@ -3164,12 +4397,12 @@ class SuperPrompt:
 
         retrieval_score_map: Dict[str, float] = {
             chunk_id: float(score)
-            for chunk_id, score, _status in self.views_by_stage.get("retrieval", [])
+            for chunk_id, score, _status in self.sp.views_by_stage.get("retrieval", [])
         }
 
         reranked_score_map: Dict[str, float] = {
             chunk_id: float(score)
-            for chunk_id, score, _status in self.views_by_stage.get("reranked", [])
+            for chunk_id, score, _status in self.sp.views_by_stage.get("reranked", [])
         }
 
         lines: List[str] = []
@@ -3180,23 +4413,47 @@ class SuperPrompt:
         for chunk_obj in ordered_chunks:
             header = f"### Chunk {chunk_counter}"
 
-            if self.stage == "retrieval":
+            emb_score = self._get_meta_float(chunk_obj.meta, "emb_score")
+            splade_score = self._get_meta_float(chunk_obj.meta, "splade_score")
+
+            if self.sp.stage == "retrieval":
+                score_parts: List[str] = []
+
                 rt_score = retrieval_score_map.get(chunk_obj.id)
                 if rt_score is not None:
-                    header = f"{header} [Rt-Score={self._format_score(rt_score)}]"
+                    score_parts.append(f"Rt={self._format_score(rt_score)}")
+                if emb_score is not None:
+                    score_parts.append(f"Emb={self._format_score(emb_score)}")
+                if splade_score is not None:
+                    score_parts.append(f"Splade={self._format_score(splade_score)}")
 
-            elif self.stage == "reranked":
-                rk_score = reranked_score_map.get(chunk_obj.id)
-                rt_score = retrieval_score_map.get(chunk_obj.id)
+                if score_parts:
+                    header = f"{header} [{', '.join(score_parts)}]"
 
-                if rk_score is not None and rt_score is not None:
-                    header = (
-                        f"{header} "
-                        f"[Rk-Score={self._format_score(rk_score)}, "
-                        f"Rt-Score={self._format_score(rt_score)}]"
-                    )
-                elif rk_score is not None:
-                    header = f"{header} [Rk-Score={self._format_score(rk_score)}]"
+            elif self.sp.stage == "reranked":
+                score_parts = []
+
+                rnk_score = reranked_score_map.get(chunk_obj.id)
+                if rnk_score is None:
+                    rnk_score = self._get_meta_float(chunk_obj.meta, "rerank_rrf_score")
+
+                rcolb_score = self._get_meta_float(chunk_obj.meta, "colbert_score")
+
+                rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_rrf_score")
+                if rt_score is None:
+                    rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_score")
+                if rt_score is None:
+                    rt_score = retrieval_score_map.get(chunk_obj.id)
+
+                if rnk_score is not None:
+                    score_parts.append(f"Rnk={self._format_score(rnk_score)}")
+                if rcolb_score is not None:
+                    score_parts.append(f"RcolB={self._format_score(rcolb_score)}")
+                if rt_score is not None:
+                    score_parts.append(f"Rt={self._format_score(rt_score)}")
+
+                if score_parts:
+                    header = f"{header} [{', '.join(score_parts)}]"
 
             lines.append(header)
             lines.append("")
@@ -3206,6 +4463,21 @@ class SuperPrompt:
 
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:
+        """
+        Safely read one numeric value from chunk metadata.
+        """
+        if not isinstance(meta, dict):
+            return None
+        value = meta.get(key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _get_ordered_context_chunks(self) -> List["Chunk"]:
         """
         Return the currently relevant chunks in the intended display order.
@@ -3214,40 +4486,34 @@ class SuperPrompt:
         1. If final_selection_ids exists, use that order.
         2. Otherwise, if the current stage has a view in views_by_stage, use that order.
         3. Otherwise, fall back to the raw order of base_context_chunks.
-
-        This keeps the render logic general enough for Retrieval, ReRanker, A3,
-        and future later stages.
         """
-        if not self.base_context_chunks:
+        if not self.sp.base_context_chunks:
             return []
 
         chunk_by_id: Dict[str, "Chunk"] = {}
-        for chunk_obj in self.base_context_chunks:
+        for chunk_obj in self.sp.base_context_chunks:
             chunk_by_id[chunk_obj.id] = chunk_obj
 
         ordered_chunks: List["Chunk"] = []
 
-        if self.final_selection_ids:
-            for chunk_id in self.final_selection_ids:
+        if self.sp.final_selection_ids:
+            for chunk_id in self.sp.final_selection_ids:
                 if chunk_id in chunk_by_id:
                     ordered_chunks.append(chunk_by_id[chunk_id])
             return ordered_chunks
 
-        if self.stage in self.views_by_stage:
-            stage_rows = self.views_by_stage[self.stage]
+        if self.sp.stage in self.sp.views_by_stage:
+            stage_rows = self.sp.views_by_stage[self.sp.stage]
             for row in stage_rows:
                 chunk_id = row[0]
                 if chunk_id in chunk_by_id:
                     ordered_chunks.append(chunk_by_id[chunk_id])
             return ordered_chunks
 
-        for chunk_obj in self.base_context_chunks:
+        for chunk_obj in self.sp.base_context_chunks:
             ordered_chunks.append(chunk_obj)
 
         return ordered_chunks
-
-    def __repr__(self) -> str:
-        return f"SuperPrompt(stage={self.stage!r})"
 ```
 
 ### ~\ragstream\orchestration\agent_prompt_helpers\compose_texts.py
@@ -3768,10 +5034,10 @@ Purpose:
 
 Scope of this file:
     - Read the Retrieval candidates already stored in the current SuperPrompt.
-    - Build one semantic reranking query from TASK / PURPOSE / CONTEXT.
-    - Clean chunk text dynamically before cross-encoder scoring.
-    - Score each (query, chunk_text) pair with a BERT-style cross-encoder.
-    - Sort the current candidate set by reranker score.
+    - Build reranking query pieces from TASK / PURPOSE / CONTEXT.
+    - Clean chunk text dynamically before ColBERT scoring.
+    - Score each Retrieval candidate with ColBERT over the split query pieces.
+    - Fuse Retrieval ranking and ColBERT ranking with deterministic weighted RRF.
     - Write the ReRanker stage result back into the same SuperPrompt.
 
 Non-goals:
@@ -3785,20 +5051,30 @@ Non-goals:
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
-from sentence_transformers import CrossEncoder
+from pylate import models, rank
 
+from ragstream.ingestion.chunker import Chunker
 from ragstream.orchestration.super_prompt import A3ChunkStatus, SuperPrompt
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.retrieval.chunk import Chunk
+from ragstream.retrieval.rrf_merger import rrf_merge
+from ragstream.retrieval.smart_query_splitter import split_query_into_pieces
 
+
+# ---------------------------------------------------------------------
+# Shared row contract
+# ---------------------------------------------------------------------
+
+RankedRow = Tuple[str, float, Dict[str, Any]]
 
 # ---------------------------------------------------------------------
 # Module-level reranker defaults
 # ---------------------------------------------------------------------
 
 # Agreed current reranker model direction.
-DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+DEFAULT_RERANK_MODEL = "lightonai/GTE-ModernColBERT-v1"
 
 # Conceptual cap from the current requirement set for how many Retrieval
 # candidates should be passed into ReRanker.
@@ -3806,6 +5082,14 @@ DEFAULT_RERANK_TOP_K = 50
 
 # Agreed current runtime direction: CPU-only deterministic stage.
 DEFAULT_DEVICE = "cpu"
+
+# Keep query splitting aligned with Retrieval.
+DEFAULT_QUERY_CHUNK_SIZE = 1200
+DEFAULT_QUERY_OVERLAP = 120
+
+# Equal-weight fusion between Retrieval and ColBERT.
+DEFAULT_RETRIEVAL_WEIGHT = 0.75
+DEFAULT_COLBERT_WEIGHT = 0.25
 
 
 class Reranker:
@@ -3828,20 +5112,22 @@ class Reranker:
         device: str = DEFAULT_DEVICE,
     ) -> None:
         """
-        Initialize ReRanker with the agreed cross-encoder model.
+        Initialize ReRanker with the agreed ColBERT model.
 
         Args:
             model_name:
-                Hugging Face / SentenceTransformers model id for the reranker.
+                Hugging Face / PyLate-compatible model id for the reranker.
             top_k:
                 Maximum number of Retrieval candidates to rerank.
             device:
                 Runtime device. Current agreed direction is CPU.
+                Kept as part of the stable ReRanker interface.
         """
         self._model_name = model_name
         self._top_k = int(top_k) if int(top_k) > 0 else DEFAULT_RERANK_TOP_K
         self._device = device
-        self._cross_encoder = CrossEncoder(self._model_name, device=self._device)
+        self._chunker = Chunker()
+        self._colbert_model = models.ColBERT(model_name_or_path=self._model_name)
 
     # -----------------------------------------------------------------
     # Public API
@@ -3864,9 +5150,12 @@ class Reranker:
             - Appends "reranked" to sp.history_of_stages
             - Sets sp.stage = "reranked"
         """
-        query_text, retrieval_rows, chunk_lookup = self._prepare_inputs(sp)
-        scored_rows = self._score_pairs(query_text, retrieval_rows, chunk_lookup)
-        reranked_view, reranked_ids = self._build_reranked_view(scored_rows)
+        query_pieces, retrieval_rows, chunk_lookup = self._prepare_inputs(sp)
+        colbert_rows = self._score_with_colbert(query_pieces, retrieval_rows, chunk_lookup)
+        fused_rows = self._fuse_with_retrieval(retrieval_rows, colbert_rows, chunk_lookup)
+        fused_rows = self._project_fused_metadata_to_reranker_contract(fused_rows)
+        self._write_scores_back_to_chunks(fused_rows, chunk_lookup)
+        reranked_view, reranked_ids = self._build_reranked_view(fused_rows)
 
         sp.views_by_stage["reranked"] = reranked_view
         sp.final_selection_ids = reranked_ids
@@ -3882,13 +5171,13 @@ class Reranker:
     def _prepare_inputs(
         self,
         sp: SuperPrompt,
-    ) -> tuple[str, List[tuple[str, float, A3ChunkStatus]], Dict[str, Chunk]]:
+    ) -> tuple[List[str], List[tuple[str, float, A3ChunkStatus]], Dict[str, Chunk]]:
         """
         Prepare the reranking job from the current SuperPrompt.
 
         Responsibilities grouped here on purpose:
         - validate stage and Retrieval availability,
-        - build one semantic query text from TASK / PURPOSE / CONTEXT,
+        - build reranking query pieces from TASK / PURPOSE / CONTEXT,
         - trim Retrieval rows to the active rerank cap,
         - build chunk_id -> Chunk lookup from base_context_chunks.
         """
@@ -3908,42 +5197,28 @@ class Reranker:
                 "Please run Retrieval before ReRanker."
             )
 
-        query_blocks: List[str] = []
+        query_text = SuperPromptProjector.build_query_text(sp)
 
-        task = (sp.body.get("task") or "").strip()
-        purpose = (sp.body.get("purpose") or "").strip()
-        context = (sp.body.get("context") or "").strip()
+        query_pieces = split_query_into_pieces(
+            query_text=query_text,
+            chunker=self._chunker,
+            chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
+            overlap=DEFAULT_QUERY_OVERLAP,
+        )
 
-        if task:
-            query_blocks.append("## TASK")
-            query_blocks.append(task)
-            query_blocks.append("")
-
-        if purpose:
-            query_blocks.append("## PURPOSE")
-            query_blocks.append(purpose)
-            query_blocks.append("")
-
-        if context:
-            query_blocks.append("## CONTEXT")
-            query_blocks.append(context)
-            query_blocks.append("")
-
-        query_text = "\n".join(query_blocks).strip()
-        if not query_text:
+        if not query_pieces:
             raise ValueError(
-                "Reranker.run: reranking query is empty. "
-                "At least one of TASK / PURPOSE / CONTEXT must be present."
+                "Reranker.run: no reranking query pieces could be built from SuperPrompt."
             )
 
-        candidate_rows = list(retrieval_rows)
+        candidate_rows = list(retrieval_rows)[: self._top_k]
         chunk_lookup = {chunk_obj.id: chunk_obj for chunk_obj in sp.base_context_chunks}
 
-        return query_text, candidate_rows, chunk_lookup
+        return query_pieces, candidate_rows, chunk_lookup
 
     def _clean_chunk_text(self, text: str) -> str:
         """
-        Clean one chunk dynamically before cross-encoder scoring.
+        Clean one chunk dynamically before ColBERT scoring.
 
         Design intention:
         - Remove obvious markdown / YAML / prompt-artifact rubbish.
@@ -4005,27 +5280,28 @@ class Reranker:
 
         return "\n".join(cleaned_lines).strip()
 
-    def _score_pairs(
+    def _score_with_colbert(
         self,
-        query_text: str,
+        query_pieces: List[str],
         retrieval_rows: List[tuple[str, float, A3ChunkStatus]],
         chunk_lookup: Dict[str, Chunk],
-    ) -> List[Tuple[str, float]]:
+    ) -> List[RankedRow]:
         """
-        Score all valid (query, chunk_text) pairs with the cross-encoder.
+        Score the Retrieval candidates with ColBERT over the reranking query pieces.
 
         Returns:
-            List[(chunk_id, reranker_score)]
+            List[(chunk_id, aggregated_colbert_score, metadata)]
 
-        Important robustness rule:
-        - If one Retrieval row references a chunk ID that is no longer present
-          in base_context_chunks, skip that row instead of crashing the stage.
+        Aggregation rule:
+        - Each query piece produces one ColBERT reranked list.
+        - For each chunk, aggregate piece-level scores by arithmetic mean.
+        - The final ColBERT ranked list is then sorted deterministically.
         """
         valid_ids: List[str] = []
-        pairs: List[tuple[str, str]] = []
+        cleaned_snippets: List[str] = []
 
         for row in retrieval_rows:
-            chunk_id = row[0]
+            chunk_id = str(row[0])
             chunk_obj = chunk_lookup.get(chunk_id)
             if chunk_obj is None:
                 continue
@@ -4035,114 +5311,257 @@ class Reranker:
                 continue
 
             valid_ids.append(chunk_id)
-            pairs.append((query_text, cleaned_snippet))
+            cleaned_snippets.append(cleaned_snippet)
 
-        if not pairs:
+        if not valid_ids:
             raise ValueError(
-                "Reranker.run: no valid (query, chunk) pairs could be built from Retrieval output."
+                "Reranker.run: no valid Retrieval candidates could be prepared for ColBERT."
             )
 
-        scores = self._cross_encoder.predict(pairs, convert_to_numpy=False)
-        return [(chunk_id, float(score)) for chunk_id, score in zip(valid_ids, scores)]
+        documents_per_query: List[List[str]] = [list(cleaned_snippets) for _ in query_pieces]
+        document_ids_per_query: List[List[str]] = [list(valid_ids) for _ in query_pieces]
+
+        queries_embeddings = self._colbert_model.encode(
+            query_pieces,
+            is_query=True,
+            show_progress_bar=False,
+        )
+
+        documents_embeddings = self._colbert_model.encode(
+            documents_per_query,
+            is_query=False,
+            show_progress_bar=False,
+        )
+
+        reranked_documents = rank.rerank(
+            documents_ids=document_ids_per_query,
+            queries_embeddings=queries_embeddings,
+            documents_embeddings=documents_embeddings,
+        )
+
+        score_sums: Dict[str, float] = {}
+        score_counts: Dict[str, int] = {}
+
+        for one_query_result in reranked_documents:
+            for item in one_query_result:
+                chunk_id = str(item["id"])
+                score = float(item["score"])
+                score_sums[chunk_id] = score_sums.get(chunk_id, 0.0) + score
+                score_counts[chunk_id] = score_counts.get(chunk_id, 0) + 1
+
+        scored_rows: List[RankedRow] = []
+
+        for chunk_id in valid_ids:
+            if chunk_id not in score_counts:
+                continue
+
+            mean_score = score_sums[chunk_id] / float(score_counts[chunk_id])
+            base_meta = dict((chunk_lookup.get(chunk_id).meta or {}))
+            meta_out = dict(base_meta)
+            meta_out["colbert_score"] = float(mean_score)
+
+            scored_rows.append((chunk_id, float(mean_score), meta_out))
+
+        scored_rows.sort(key=lambda row: (-row[1], row[0]))
+        return scored_rows
+
+    def _fuse_with_retrieval(
+        self,
+        retrieval_rows: List[tuple[str, float, A3ChunkStatus]],
+        colbert_rows: List[RankedRow],
+        chunk_lookup: Dict[str, Chunk],
+    ) -> List[RankedRow]:
+        """
+        Fuse Retrieval ranking and ColBERT ranking with equal-weight RRF.
+        """
+        retrieval_ranked_rows: List[RankedRow] = []
+
+        for chunk_id, retrieval_score, _status in retrieval_rows:
+            chunk_obj = chunk_lookup.get(str(chunk_id))
+            if chunk_obj is None:
+                continue
+
+            meta_out = dict(chunk_obj.meta or {})
+
+            # Preserve the old Retrieval fused score explicitly before the
+            # second RRF merge overwrites the generic key "rrf_score".
+            if "rrf_score" in meta_out and "retrieval_rrf_score" not in meta_out:
+                meta_out["retrieval_rrf_score"] = float(meta_out["rrf_score"])
+
+            retrieval_ranked_rows.append((str(chunk_id), float(retrieval_score), meta_out))
+
+        return rrf_merge(
+            retrieval_ranked_rows,
+            colbert_rows,
+            top_k=self._top_k,
+            weight_a=DEFAULT_RETRIEVAL_WEIGHT,
+            weight_b=DEFAULT_COLBERT_WEIGHT,
+        )
+
+    def _project_fused_metadata_to_reranker_contract(
+        self,
+        fused_rows: List[RankedRow],
+    ) -> List[RankedRow]:
+        """
+        Translate neutral RRF merger metadata into reranker-specific metadata.
+
+        Design rule:
+        - Preserve existing Retrieval metadata in chunk.meta.
+        - Preserve the old Retrieval fused score under:
+            retrieval_rrf_score
+        - Add reranker-specific aliases here:
+            retrieval_score
+            colbert_score
+            retrieval_rank
+            colbert_rank
+            rerank_rrf_score
+        """
+        projected_rows: List[RankedRow] = []
+
+        for chunk_id, fused_score, meta in fused_rows:
+            meta_in = dict(meta or {})
+            meta_out = dict(meta_in)
+
+            if "score_a" in meta_in and "retrieval_score" not in meta_out:
+                meta_out["retrieval_score"] = float(meta_in["score_a"])
+
+            if "score_b" in meta_in and "colbert_score" not in meta_out:
+                meta_out["colbert_score"] = float(meta_in["score_b"])
+
+            if "rank_a" in meta_in and "retrieval_rank" not in meta_out:
+                meta_out["retrieval_rank"] = int(meta_in["rank_a"])
+
+            if "rank_b" in meta_in and "colbert_rank" not in meta_out:
+                meta_out["colbert_rank"] = int(meta_in["rank_b"])
+
+            if "retrieval_rrf_score" not in meta_out and "score_a" in meta_in:
+                meta_out["retrieval_rrf_score"] = float(meta_in["score_a"])
+
+            meta_out["rerank_rrf_score"] = float(fused_score)
+
+            projected_rows.append((str(chunk_id), float(fused_score), meta_out))
+
+        return projected_rows
+
+    def _write_scores_back_to_chunks(
+        self,
+        fused_rows: List[RankedRow],
+        chunk_lookup: Dict[str, Chunk],
+    ) -> None:
+        """
+        Persist the reranker metadata into the hydrated chunk objects so that
+        SuperPromptProjector can render the score text directly from chunk.meta.
+        """
+        for chunk_id, _score, meta in fused_rows:
+            chunk_obj = chunk_lookup.get(str(chunk_id))
+            if chunk_obj is None:
+                continue
+
+            merged_meta = dict(chunk_obj.meta or {})
+            for key, value in dict(meta or {}).items():
+                merged_meta[key] = value
+
+            chunk_obj.meta = merged_meta
 
     def _build_reranked_view(
         self,
-        scored_rows: List[Tuple[str, float]],
+        fused_rows: List[RankedRow],
     ) -> tuple[List[tuple[str, float, A3ChunkStatus]], List[str]]:
         """
         Build the ordered ReRanker stage snapshot.
 
         Deterministic sort:
-        1) higher reranker score first
+        1) higher final fused rerank score first
         2) stable fallback by chunk_id
         """
-        scored_rows.sort(key=lambda row: (-row[1], row[0]))
+        fused_rows.sort(key=lambda row: (-row[1], row[0]))
 
         reranked_view: List[tuple[str, float, A3ChunkStatus]] = []
         reranked_ids: List[str] = []
 
-        for chunk_id, score in scored_rows:
-            reranked_view.append((chunk_id, score, A3ChunkStatus.SELECTED))
-            reranked_ids.append(chunk_id)
+        for chunk_id, score, _meta in fused_rows:
+            reranked_view.append((str(chunk_id), float(score), A3ChunkStatus.SELECTED))
+            reranked_ids.append(str(chunk_id))
 
         return reranked_view, reranked_ids
 ```
 
 ### ~\ragstream\retrieval\retriever.py
 ```python
+# retriever.py
 # -*- coding: utf-8 -*-
 """
 retriever.py
 
 Purpose:
-    Deterministic Retrieval stage for RAGstream.
+    Deterministic Retrieval stage orchestrator for RAGstream.
 
-Scope of this file:
-    - Read retrieval query text from the current SuperPrompt
-      (TASK / PURPOSE / CONTEXT).
-    - Split that retrieval query into overlapping query pieces.
-    - Open the active project's Chroma document store.
-    - Compare every stored chunk embedding against all query-piece embeddings.
-    - Aggregate per-chunk similarities with LogAvgExp (tau = 9).
-    - Keep the top-k chunks.
-    - Hydrate real Chunk objects from doc_raw using the same chunking logic
-      as ingestion.
-    - Write the Retrieval stage result back into the same SuperPrompt.
+Design:
+    - Keep Retriever as the top-level stage class used by the controller.
+    - Keep query-building / query-splitting support logic outside this file.
+    - Keep the dense retrieval backend in RetrieverEmb.
+    - Add a parallel SPLADE retrieval backend in RetrieverSplade.
+    - Merge both branches with deterministic RRF.
+    - Keep hydration and SuperPrompt write-back in this file.
+    - Preserve the current external Retriever.run(...) contract.
 
-Non-goals:
-    - No reranking here.
-    - No A3 filtering here.
-    - No GUI rendering here.
-    - No final prompt composition here.
+Current flow inside Retriever.run(...):
+    1) PreProcessing
+       - build retrieval query text from SuperPrompt
+       - split the query into overlapping query pieces
+    2) Retriever_EMB
+       - run the dense embedding-based retrieval backend
+    3) Retriever_SPLADE
+       - score exactly the dense-selected candidate IDs
+    4) RRF_Merger
+       - fuse both ranked lists deterministically
+    5) PostProcessing
+       - hydrate ranked rows into real Chunk objects
+       - write the retrieval result into SuperPrompt
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
-
-import numpy as np
+from typing import Any, Dict, List, Tuple
 
 from ragstream.ingestion.chunker import Chunker
 from ragstream.ingestion.embedder import Embedder
-from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
+from ragstream.ingestion.splade_embedder import SpladeEmbedder
 from ragstream.orchestration.super_prompt import A3ChunkStatus, SuperPrompt
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.retrieval.chunk import Chunk
 from ragstream.retrieval.doc_score import DocScore  # compatibility re-export
+from ragstream.retrieval.retriever_emb import RetrieverEmb
+from ragstream.retrieval.retriever_splade import RetrieverSplade
+from ragstream.retrieval.rrf_merger import rrf_merge
+from ragstream.retrieval.smart_query_splitter import split_query_into_pieces
+
 
 # Keep old import compatibility:
 # from ragstream.retrieval.retriever import DocScore
 DocScore = DocScore
 
+# Ranked row returned by RetrieverEmb / RetrieverSplade / RRF merger:
+# (chunk_id, retrieval_score, metadata)
+RankedRow = Tuple[str, float, Dict[str, Any]]
 
-# ---------------------------------------------------------------------
-# Module-level retrieval defaults
-# ---------------------------------------------------------------------
-
-# Fallback number of chunks to keep if the caller gives no valid top-k.
-DEFAULT_TOP_K = 100
-
-# Retrieval query splitting reuses the same deterministic windowing idea
-# as ingestion. These values MUST stay aligned with the active ingestion
-# chunking contract unless you intentionally change both sides together.
-DEFAULT_QUERY_CHUNK_SIZE = 500
-DEFAULT_QUERY_OVERLAP = 100
-
-# Agreed retrieval aggregation constant:
-#P value, for P Norm Averaging
-DEFAULT_P_NORM = 10
+# Retrieval query splitting defaults.
+# These MUST stay aligned with the current behavior so that the refactor
+# preserves the same practical output as before.
+DEFAULT_QUERY_CHUNK_SIZE = 1200
+DEFAULT_QUERY_OVERLAP = 120
 
 
 class Retriever:
     """
-    Deterministic Retrieval stage for document chunks.
+    Deterministic Retrieval stage orchestrator for document chunks.
 
     Design:
-    - Keep this class stateless with respect to pipeline history.
-      The evolving pipeline state lives in SuperPrompt.
-    - This class only reads the current SuperPrompt, computes retrieval,
-      and writes the retrieval result back into the same SuperPrompt.
-    - The controller decides when to call this class.
+    - Keep this class focused on stage orchestration.
+    - Keep low-level retrieval engine logic outside this file.
+    - Keep hydration + SuperPrompt write-back here.
+    - The evolving pipeline state still lives in SuperPrompt.
     """
 
     def __init__(
@@ -4159,23 +5578,34 @@ class Retriever:
         Args:
             doc_root:
                 Absolute path to the doc_raw root folder.
-                Example: .../data/doc_raw
             chroma_root:
                 Absolute path to the chroma_db root folder.
-                Example: .../data/chroma_db
             embedder:
-                Optional shared Embedder instance. If omitted, a default one is created.
+                Optional shared Embedder instance.
             chunker:
-                Optional shared Chunker instance. If omitted, a default one is created.
+                Optional shared Chunker instance.
         """
         self.doc_root = Path(doc_root).resolve()
         self.chroma_root = Path(chroma_root).resolve()
+
+        # SPLADE DB is kept parallel to chroma_db under the same data root.
+        self.splade_root = self.chroma_root.parent / "splade_db"
 
         self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-large")
         self.chunker = chunker if chunker is not None else Chunker()
 
         # Keep the chunk class explicit so hydration remains readable and testable.
         self.chunk_cls = Chunk
+
+        # Dense backend remains unchanged and independent.
+        self.retriever_emb = RetrieverEmb(
+            chroma_root=str(self.chroma_root),
+            embedder=self.embedder,
+        )
+
+        # Lazy init for SPLADE so app startup does not immediately load the sparse model.
+        self._splade_embedder: SpladeEmbedder | None = None
+        self._retriever_splade: RetrieverSplade | None = None
 
     # -----------------------------------------------------------------
     # Public API
@@ -4185,238 +5615,159 @@ class Retriever:
         """
         Execute the Retrieval stage and update the same SuperPrompt in place.
 
-        Inputs:
-            sp:
-                The current evolving SuperPrompt, typically after PreProcessing / A2.
-            project_name:
-                The active project selected in the GUI.
-            top_k:
-                Number of chunks to keep after retrieval ranking.
+        Visible flow:
+            1) PreProcessing
+            2) Retriever_EMB
+            3) Retriever_SPLADE
+            4) RRF_Merger
+            5) PostProcessing
 
         Returns:
             The same SuperPrompt instance, mutated in place.
-
-        Effects on SuperPrompt:
-            - Writes hydrated Chunk objects into sp.base_context_chunks
-            - Writes the retrieval stage snapshot into sp.views_by_stage["retrieval"]
-            - Writes ordered chunk IDs into sp.final_selection_ids
-            - Appends "retrieval" to sp.history_of_stages
-            - Sets sp.stage = "retrieval"
         """
-        if sp is None:
-            raise ValueError("Retriever.run: 'sp' must not be None")
+        query_pieces = self._preprocess(sp)
 
-        project_name = (project_name or "").strip()
-        if not project_name:
-            raise ValueError("Retriever.run: project_name must not be empty")
-
-        if not self.doc_root.exists():
-            raise FileNotFoundError(f"Retriever.run: doc_root does not exist: {self.doc_root}")
-
-        project_db_dir = self.chroma_root / project_name
-        if not project_db_dir.exists():
-            raise FileNotFoundError(
-                f"Retriever.run: active project Chroma DB does not exist: {project_db_dir}"
-            )
-
-        query_text = self._build_query_text(sp)
-        if not query_text:
-            raise ValueError(
-                "Retriever.run: retrieval query is empty. "
-                "At least one of TASK / PURPOSE / CONTEXT must be present."
-            )
-
-        query_pieces = self._split_query_into_pieces(
-            query_text=query_text,
-            chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
-            overlap=DEFAULT_QUERY_OVERLAP,
-        )
-
-        ranked_rows = self._retrieve_and_rank(
+        ranked_rows_emb = self.retriever_emb.run(
             project_name=project_name,
             query_pieces=query_pieces,
             top_k=top_k,
         )
 
-        valid_ranked_rows, hydrated_chunks = self._hydrate_ranked_chunks(ranked_rows)
-        self._write_stage_to_superprompt(sp, valid_ranked_rows, hydrated_chunks)
+        candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
 
+        try:
+            ranked_rows_splade = self._get_retriever_splade().run(
+                project_name=project_name,
+                query_pieces=query_pieces,
+                top_k=top_k,
+                candidate_ids=candidate_ids,
+            )
+        except FileNotFoundError:
+            # Keep Retrieval usable even if an older project has no SPLADE store yet.
+            ranked_rows_splade = []
+
+        ranked_rows = rrf_merge(
+            ranked_rows_emb,
+            ranked_rows_splade,
+            top_k=top_k,
+            weight_a=0.75,
+            weight_b=0.25,
+        )
+
+        ranked_rows = self._project_rrf_metadata_to_retrieval_contract(ranked_rows)
+
+        sp = self._postprocess(sp, ranked_rows)
         return sp
 
     # -----------------------------------------------------------------
-    # Internal helpers
+    # Stage-level orchestration helpers
     # -----------------------------------------------------------------
 
-    def _build_query_text(self, sp: SuperPrompt) -> str:
+    def _preprocess(self, sp: SuperPrompt) -> List[str]:
         """
-        Build the retrieval query text from the structured SuperPrompt body.
+        Build the retrieval query text from SuperPrompt and split it into
+        overlapping query pieces.
 
-        Current design choice:
-        - Use only TASK / PURPOSE / CONTEXT.
-        - Keep the order explicit and stable.
-        - Skip empty fields.
+        Query-building and query-splitting support logic lives outside this file.
+        Retriever keeps only the stage-level orchestration.
         """
-        blocks: List[str] = []
+        query_text = SuperPromptProjector.build_query_text(sp)
 
-        task = (sp.body.get("task") or "").strip()
-        purpose = (sp.body.get("purpose") or "").strip()
-        context = (sp.body.get("context") or "").strip()
-
-        if task:
-            blocks.append("## TASK")
-            blocks.append(task)
-            blocks.append("")
-
-        if purpose:
-            blocks.append("## PURPOSE")
-            blocks.append(purpose)
-            blocks.append("")
-
-        if context:
-            blocks.append("## CONTEXT")
-            blocks.append(context)
-            blocks.append("")
-
-        return "\n".join(blocks).strip()
-
-    def _split_query_into_pieces(
-        self,
-        *,
-        query_text: str,
-        chunk_size: int,
-        overlap: int,
-    ) -> List[str]:
-        """
-        Split the retrieval query into overlapping query pieces.
-
-        We intentionally reuse the same deterministic chunking idea as ingestion
-        so the prompt side and document side follow the same windowing culture.
-        """
-        query_text = (query_text or "").strip()
-        if not query_text:
-            return []
-
-        pieces = self.chunker.split(
-            file_path="__prompt__",
-            text=query_text,
-            chunk_size=chunk_size,
-            overlap=overlap,
+        query_pieces = split_query_into_pieces(
+            query_text=query_text,
+            chunker=self.chunker,
+            chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
+            overlap=DEFAULT_QUERY_OVERLAP,
         )
 
-        return [chunk_text for _fp, chunk_text in pieces if (chunk_text or "").strip()]
+        return query_pieces
 
-    def _retrieve_and_rank(
+    def _postprocess(self, sp: SuperPrompt, ranked_rows: List[RankedRow]) -> SuperPrompt:
+        """
+        Complete the Retrieval stage after the backend retrievers have finished.
+
+        Responsibilities:
+        - hydrate ranked rows into real Chunk objects
+        - write the fused retrieval result into SuperPrompt
+        """
+        valid_ranked_rows, hydrated_chunks = self._hydrate_ranked_chunks(ranked_rows)
+        self._write_stage_to_superprompt(sp, valid_ranked_rows, hydrated_chunks)
+        return sp
+
+    def _get_retriever_splade(self) -> RetrieverSplade:
+        """
+        Lazily initialize the SPLADE backend on first retrieval use.
+        """
+        if self._retriever_splade is None:
+            if self._splade_embedder is None:
+                self._splade_embedder = SpladeEmbedder(device="cpu")
+
+            self._retriever_splade = RetrieverSplade(
+                splade_root=str(self.splade_root),
+                splade_embedder=self._splade_embedder,
+            )
+
+        return self._retriever_splade
+
+    # -----------------------------------------------------------------
+    # Internal helpers kept in retriever.py
+    # -----------------------------------------------------------------
+
+    def _project_rrf_metadata_to_retrieval_contract(
         self,
-        *,
-        project_name: str,
-        query_pieces: List[str],
-        top_k: int,
-    ) -> List[Dict[str, Any]]:
+        ranked_rows: List[RankedRow],
+    ) -> List[RankedRow]:
         """
-        Read all stored chunk embeddings from the active project Chroma DB,
-        score them against all query pieces, aggregate with LogAvgExp, and keep top-k.
+        Translate neutral RRF merger metadata into retrieval-specific metadata.
 
-        Return format:
-            List of dictionaries, one per selected chunk:
-            {
-                "id": <chunk_id>,
-                "score": <retrieval_score>,
-                "status": A3ChunkStatus.SELECTED,
-                "meta": <stored metadata dict>
-            }
+        Why this exists:
+        - rrf_merger.py is intentionally neutral and uses generic names:
+            score_a, score_b, rank_a, rank_b
+        - Retriever is the correct higher-level place that knows:
+            a = dense embedding branch
+            b = SPLADE branch
+        - SuperPrompt projector and other retrieval-facing code can therefore
+          keep reading the retrieval-specific names:
+            emb_score, splade_score, emb_rank, splade_rank, rrf_score
 
-        Notes:
-        - This stage is deterministic.
-        - No reranking happens here.
-        - We read ALL stored chunk embeddings because the agreed Retrieval stage
-          should compute its own final ranking across the complete project store.
+        Design rule:
+        - Preserve the neutral keys if they already exist.
+        - Add the retrieval-specific aliases here.
         """
-        if not query_pieces:
-            return []
+        projected_rows: List[RankedRow] = []
 
-        k = int(top_k) if int(top_k) > 0 else DEFAULT_TOP_K
+        for chunk_id, fused_score, meta in ranked_rows:
+            meta_in = dict(meta or {})
+            meta_out = dict(meta_in)
 
-        store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
+            if "score_a" in meta_in and "emb_score" not in meta_out:
+                meta_out["emb_score"] = float(meta_in["score_a"])
 
-        raw = store.collection.get(include=["embeddings", "metadatas"])
-        ids: List[str] = raw.get("ids", []) if raw else []
-        metadatas: List[Dict[str, Any] | None] = raw.get("metadatas", []) if raw else []
-        embeddings = raw.get("embeddings", []) if raw else []
+            if "score_b" in meta_in and "splade_score" not in meta_out:
+                meta_out["splade_score"] = float(meta_in["score_b"])
 
-        # embeddings may come back as a NumPy array, so never test it with
-        # "if not embeddings". Use explicit length checks instead.
-        if len(ids) == 0 or len(embeddings) == 0:
-            return []
+            if "rank_a" in meta_in and "emb_rank" not in meta_out:
+                meta_out["emb_rank"] = int(meta_in["rank_a"])
 
-        if len(ids) != len(embeddings):
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: Chroma returned mismatched ids/embeddings lengths"
-            )
+            if "rank_b" in meta_in and "splade_rank" not in meta_out:
+                meta_out["splade_rank"] = int(meta_in["rank_b"])
 
-        if len(metadatas) > 0 and len(metadatas) != len(ids):
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: Chroma returned mismatched ids/metadatas lengths"
-            )
+            if "rrf_score" not in meta_out:
+                meta_out["rrf_score"] = float(fused_score)
 
-        query_vectors = self.embedder.embed(query_pieces)
+            projected_rows.append((str(chunk_id), float(fused_score), meta_out))
 
-        # query_vectors may also be array-like, so use explicit length checks.
-        if len(query_vectors) == 0:
-            return []
-
-        A = np.asarray(embeddings, dtype=np.float32)    # stored chunks: [N, D]
-        Q = np.asarray(query_vectors, dtype=np.float32) # query pieces:  [M, D]
-
-        if A.ndim != 2 or Q.ndim != 2:
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: unexpected embedding dimensions returned by Chroma/OpenAI"
-            )
-
-        if A.shape[1] != Q.shape[1]:
-            raise RuntimeError(
-                "Retriever._retrieve_and_rank: stored vectors and query vectors have different dimensions"
-            )
-
-        # Normalize rows to compute cosine similarity as a matrix product.
-        # Similarities shape: [N_chunks, M_query_pieces]
-        A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
-        Q_norm = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-12)
-        sims = A_norm @ Q_norm.T
-
-        # P-mean aggregation over the query-piece axis.
-        # Strongly favors the best match, but is still not pure max.
-        p = DEFAULT_P_NORM
-        sims_pos = np.clip(sims, 0.0, None)
-        aggregated_scores = np.power(np.mean(np.power(sims_pos, p), axis=1), 1.0 / p)
-
-        rows: List[Dict[str, Any]] = []
-        for idx, chunk_id in enumerate(ids):
-            meta = metadatas[idx] if (len(metadatas) > 0 and metadatas[idx] is not None) else {}
-            rows.append(
-                {
-                    "id": chunk_id,
-                    "score": float(aggregated_scores[idx]),
-                    "status": A3ChunkStatus.SELECTED,
-                    "meta": meta,
-                }
-            )
-
-        # Deterministic sort:
-        # 1) higher score first
-        # 2) stable fallback by chunk_id
-        rows.sort(key=lambda row: (-row["score"], row["id"]))
-
-        return rows[: min(k, len(rows))]
+        return projected_rows
 
     def _hydrate_ranked_chunks(
         self,
-        ranked_rows: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], List[Chunk]]:
+        ranked_rows: List[RankedRow],
+    ) -> tuple[List[RankedRow], List[Chunk]]:
         """
         Reconstruct real Chunk objects for the selected ranked rows.
 
         Why reconstruction is needed:
-        - Chroma stores embeddings + metadata only.
+        - Vector stores keep vectors + metadata only.
         - The actual chunk text must therefore be rebuilt from doc_raw
           using the same chunker and the stored chunk_idx.
 
@@ -4432,7 +5783,7 @@ class Retriever:
             hydrated_chunks:
                 Chunk objects aligned 1:1 with valid_ranked_rows.
         """
-        valid_ranked_rows: List[Dict[str, Any]] = []
+        valid_ranked_rows: List[RankedRow] = []
         hydrated: List[Chunk] = []
 
         # Local caches avoid re-reading and re-splitting the same source file
@@ -4442,9 +5793,8 @@ class Retriever:
 
         step = DEFAULT_QUERY_CHUNK_SIZE - DEFAULT_QUERY_OVERLAP
 
-        for row in ranked_rows:
-            chunk_id = row["id"]
-            meta = row.get("meta", {}) or {}
+        for chunk_id, score, meta in ranked_rows:
+            meta = meta or {}
 
             rel_path = str(meta.get("path") or "").strip()
             if not rel_path:
@@ -4490,7 +5840,7 @@ class Retriever:
                 meta=dict(meta),
             )
 
-            valid_ranked_rows.append(row)
+            valid_ranked_rows.append((chunk_id, float(score), dict(meta)))
             hydrated.append(chunk_obj)
 
         return valid_ranked_rows, hydrated
@@ -4498,7 +5848,7 @@ class Retriever:
     def _write_stage_to_superprompt(
         self,
         sp: SuperPrompt,
-        ranked_rows: List[Dict[str, Any]],
+        ranked_rows: List[RankedRow],
         hydrated_chunks: List[Chunk],
     ) -> None:
         """
@@ -4509,6 +5859,7 @@ class Retriever:
             the hydrated Chunk objects in retrieval order
         - views_by_stage["retrieval"]:
             ordered triples (chunk_id, retrieval_score, SELECTED)
+            where retrieval_score is now the final fused RRF score
         - final_selection_ids:
             ordered chunk IDs from the current retrieval result
         - stage/history:
@@ -4524,13 +5875,9 @@ class Retriever:
         retrieval_view: List[tuple[str, float, A3ChunkStatus]] = []
         final_ids: List[str] = []
 
-        for row in ranked_rows:
-            chunk_id = str(row["id"])
-            score = float(row["score"])
-            status = row["status"]
-
-            retrieval_view.append((chunk_id, score, status))
-            final_ids.append(chunk_id)
+        for chunk_id, score, _meta in ranked_rows:
+            retrieval_view.append((str(chunk_id), float(score), A3ChunkStatus.SELECTED))
+            final_ids.append(str(chunk_id))
 
         sp.views_by_stage["retrieval"] = retrieval_view
         sp.final_selection_ids = final_ids
@@ -4538,163 +5885,637 @@ class Retriever:
         sp.history_of_stages.append("retrieval")
 ```
 
-### ~\ragstream\retrieval\retriever_old.py
+### ~\ragstream\retrieval\retriever_emb.py
 ```python
+# retriever_emb.py
 # -*- coding: utf-8 -*-
 """
-Retriever
-=========
-Implements RET-01 (cosine top-k) and plugs optional RET-02 rerank stage.
+retriever_emb.py
 
-Pipeline: query text --(Embedder)--> vector --(VectorStoreNP.query)--> ids
-          [optional rerank] --> List[DocScore]
+Purpose:
+    Current embedding-based retrieval backend extracted out of retriever.py.
 
-Notes
------
-* Current concrete vector store is NumPy-backed `VectorStoreNP` (exact cosine).
-* The vector-store interface returns *ids*. To fulfill the requirement of
-  returning cosine scores, we compute per-id cosine scores by reading the
-  concrete store's in-memory arrays when available (VectorStoreNP exposes
-  `_emb`, `_ids`, and `_id2idx`). This avoids changing the public interface.
-  If such internals are unavailable (e.g. future Chroma backend), we still
-  return `DocScore` with a neutral score of 0.0.
+Scope of this file:
+    - Receive neutral retrieval inputs only:
+        * project_name
+        * query_pieces
+        * top_k
+    - Open the active project's Chroma document store.
+    - Compare every stored chunk embedding against all query-piece embeddings.
+    - Aggregate per-chunk similarities with p-norm averaging.
+    - Return ranked retrieval rows to the top-level Retriever stage.
+
+Important design rule:
+    - This class does NOT know SuperPrompt.
+    - This class does NOT hydrate chunk text from doc_raw.
+    - This class does NOT write anything back into the pipeline state.
+    - It only performs the current embedding-based ranking backend.
+
+Stage-1 refactor goal:
+    Preserve the current embedding-based retrieval behavior while moving the
+    backend ranking logic out of retriever.py.
 """
+
 from __future__ import annotations
 
-from typing import List, Optional, Sequence
-import math
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-from ragstream.retrieval.doc_score import DocScore  # re-exported via this module
-# Re-export so existing imports `from ragstream.retrieval.retriever import DocScore` keep working.
-DocScore = DocScore  # noqa: F401  (module-level alias for compatibility)
-
 from ragstream.ingestion.embedder import Embedder
-from ragstream.ingestion.vector_store_np import VectorStoreNP
+from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
 
-from ragstream.retrieval.reranker import Reranker
-from ragstream.utils.paths import PATHS
+# Ranked row returned to Retriever:
+# (chunk_id, retrieval_score, metadata)
+RankedRow = Tuple[str, float, Dict[str, Any]]
+
+# Fallback number of chunks to keep if the caller gives no valid top-k.
+DEFAULT_TOP_K = 100
+
+# Agreed retrieval aggregation constant:
+# p-value for p-norm averaging across query pieces.
+DEFAULT_P_NORM = 10
 
 
-class Retriever:
+class RetrieverEmb:
     """
-    High-level retrieval orchestrator.
+    Current embedding-based retrieval backend.
 
-    Parameters
-    ----------
-    persist_dir : Optional[str]
-        Directory for the NumPy vector store snapshots. Defaults to PATHS['vector_pkls'].
-    embedder : Optional[Embedder]
-        Custom embedder instance. If None, a default Embedder() is created.
-    store : Optional[VectorStoreNP]
-        Custom VectorStoreNP instance. If None, a default store is opened at `persist_dir`.
-    reranker : Optional[Reranker]
-        Optional cross-encoder reranker; if None, rerank step is skipped.
+    Design:
+    - Receive neutral retrieval inputs only.
+    - Perform current dense retrieval ranking.
+    - Return ranked rows to the top-level Retriever.
     """
 
-    def __init__(
+    def __init__(self, *, chroma_root: str, embedder: Embedder) -> None:
+        """
+        Initialize the embedding-based retrieval backend.
+
+        Args:
+            chroma_root:
+                Absolute path to the chroma_db root folder.
+            embedder:
+                Shared Embedder instance used to embed the query pieces.
+        """
+        self.chroma_root = Path(chroma_root).resolve()
+        self.embedder = embedder
+
+    def run(self, *, project_name: str, query_pieces: List[str], top_k: int) -> List[RankedRow]:
+        """
+        Execute the current embedding-based retrieval backend.
+
+        Inputs:
+            project_name:
+                Active project selected in the GUI.
+            query_pieces:
+                Pre-split retrieval query pieces.
+            top_k:
+                Number of chunks to keep after ranking.
+
+        Returns:
+            Ranked retrieval rows in this format:
+                [
+                    (chunk_id, retrieval_score, metadata),
+                    ...
+                ]
+
+        Error-handling rule:
+        - Local validation belongs here, at the lower level.
+        - The top-level Retriever.run(...) stays visually simple.
+        """
+        project_name = (project_name or "").strip()
+        if not project_name:
+            raise ValueError("RetrieverEmb.run: project_name must not be empty")
+
+        if not self.chroma_root.exists():
+            raise FileNotFoundError(
+                f"RetrieverEmb.run: chroma_root does not exist: {self.chroma_root}"
+            )
+
+        project_db_dir = self.chroma_root / project_name
+        if not project_db_dir.exists():
+            raise FileNotFoundError(
+                f"RetrieverEmb.run: active project Chroma DB does not exist: {project_db_dir}"
+            )
+
+        if not query_pieces:
+            return []
+
+        k = int(top_k) if int(top_k) > 0 else DEFAULT_TOP_K
+
+        store = VectorStoreChroma(persist_dir=str(project_db_dir))
+        raw = store.collection.get(include=["embeddings", "metadatas"])
+
+        ids: List[str] = raw.get("ids", []) if raw else []
+        metadatas: List[Dict[str, Any] | None] = raw.get("metadatas", []) if raw else []
+        embeddings = raw.get("embeddings", []) if raw else []
+
+        # embeddings may come back as a NumPy array, so never test it with
+        # "if not embeddings". Use explicit length checks instead.
+        if len(ids) == 0 or len(embeddings) == 0:
+            return []
+
+        if len(ids) != len(embeddings):
+            raise RuntimeError(
+                "RetrieverEmb.run: Chroma returned mismatched ids/embeddings lengths"
+            )
+
+        if len(metadatas) > 0 and len(metadatas) != len(ids):
+            raise RuntimeError(
+                "RetrieverEmb.run: Chroma returned mismatched ids/metadatas lengths"
+            )
+
+        query_vectors = self.embedder.embed(query_pieces)
+
+        if len(query_vectors) == 0:
+            return []
+
+        A = np.asarray(embeddings, dtype=np.float32)    # stored chunks: [N, D]
+        Q = np.asarray(query_vectors, dtype=np.float32) # query pieces:  [M, D]
+
+        if A.ndim != 2 or Q.ndim != 2:
+            raise RuntimeError(
+                "RetrieverEmb.run: unexpected embedding dimensions returned by Chroma/OpenAI"
+            )
+
+        if A.shape[1] != Q.shape[1]:
+            raise RuntimeError(
+                "RetrieverEmb.run: stored vectors and query vectors have different dimensions"
+            )
+
+        # Normalize rows to compute cosine similarity as a matrix product.
+        # Similarities shape: [N_chunks, M_query_pieces]
+        A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+        Q_norm = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-12)
+        sims = A_norm @ Q_norm.T
+
+        # p-mean aggregation over the query-piece axis.
+        # Strongly favors the best match, but is still not pure max.
+        p = DEFAULT_P_NORM
+        sims_pos = np.clip(sims, 0.0, None)
+        aggregated_scores = np.power(np.mean(np.power(sims_pos, p), axis=1), 1.0 / p)
+
+        rows: List[RankedRow] = []
+        for idx, chunk_id in enumerate(ids):
+            meta = metadatas[idx] if (len(metadatas) > 0 and metadatas[idx] is not None) else {}
+            rows.append(
+                (
+                    str(chunk_id),
+                    float(aggregated_scores[idx]),
+                    dict(meta),
+                )
+            )
+
+        # Deterministic sort:
+        # 1) higher score first
+        # 2) stable fallback by chunk_id
+        rows.sort(key=lambda row: (-row[1], row[0]))
+
+        return rows[: min(k, len(rows))]
+```
+
+### ~\ragstream\retrieval\retriever_splade.py
+```python
+# retriever_splade.py
+# -*- coding: utf-8 -*-
+"""
+retriever_splade.py
+
+Purpose:
+    SPLADE-based retrieval backend extracted out of retriever.py.
+
+Scope of this file:
+    - Receive neutral retrieval inputs only:
+        * project_name
+        * query_pieces
+        * top_k
+        * optional candidate_ids
+    - Open the active project's SPLADE document store.
+    - Compare stored sparse chunk representations against all query-piece
+      sparse representations.
+    - Aggregate per-chunk similarities with p-norm averaging.
+    - Return ranked retrieval rows to the top-level Retriever stage.
+
+Important design rule:
+    - This class does NOT know SuperPrompt.
+    - This class does NOT hydrate chunk text from doc_raw.
+    - This class does NOT write anything back into the pipeline state.
+    - It only performs the SPLADE-based ranking backend.
+
+Design goal:
+    Keep the same programming culture and return contract as RetrieverEmb
+    wherever possible.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+from ragstream.ingestion.splade_embedder import SpladeEmbedder
+from ragstream.ingestion.vector_store_splade import VectorStoreSplade
+
+# Ranked row returned to Retriever:
+# (chunk_id, retrieval_score, metadata)
+RankedRow = Tuple[str, float, Dict[str, Any]]
+
+# Fallback number of chunks to keep if the caller gives no valid top-k.
+DEFAULT_TOP_K = 100
+
+# Agreed retrieval aggregation constant:
+# p-value for p-norm averaging across query pieces.
+DEFAULT_P_NORM = 10
+
+
+class RetrieverSplade:
+    """
+    SPLADE-based retrieval backend.
+
+    Design:
+    - Receive neutral retrieval inputs only.
+    - Perform sparse retrieval ranking.
+    - Return ranked rows to the top-level Retriever.
+    """
+
+    def __init__(self, *, splade_root: str, splade_embedder: SpladeEmbedder) -> None:
+        """
+        Initialize the SPLADE retrieval backend.
+
+        Args:
+            splade_root:
+                Absolute path to the splade_db root folder.
+            splade_embedder:
+                Shared SpladeEmbedder instance used to encode the query pieces.
+        """
+        self.splade_root = Path(splade_root).resolve()
+        self.splade_embedder = splade_embedder
+
+    def run(
         self,
-        persist_dir: Optional[str] = None,
-        embedder: Optional[Embedder] = None,
-        store: Optional[VectorStoreNP] = None,
-        reranker: Optional[Reranker] = None,
-    ) -> None:
-        self._persist_dir = persist_dir or str(PATHS["vector_pkls"])
-        self._emb = embedder or Embedder()
-        self._vs = store or VectorStoreNP(self._persist_dir)
-        self._reranker = reranker or Reranker()
-
-    # ---- public API ----
-    def retrieve(self, query: str, k: int = 10, do_rerank: bool = True) -> List[DocScore]:
+        *,
+        project_name: str,
+        query_pieces: List[str],
+        top_k: int,
+        candidate_ids: List[str] | None = None,
+    ) -> List[RankedRow]:
         """
-        Retrieve top-k candidates for a query as `DocScore(id, score)`.
+        Execute the SPLADE-based retrieval backend.
 
-        Steps:
-        1) Embed the query.
-        2) Ask the vector store for candidate ids (k).
-        3) Compute cosine scores for these ids (when store internals available).
-        4) Optional rerank (order only), preserving computed scores.
-        5) Return `DocScore` list (length ≤ k).
+        Args:
+            project_name:
+                Active project name selected in the GUI.
+            query_pieces:
+                Overlapping retrieval query pieces prepared by the top-level Retriever.
+            top_k:
+                Number of rows to keep after ranking when running in global-search mode.
+            candidate_ids:
+                Optional fixed candidate set. When provided, SPLADE scores exactly
+                these IDs and does not perform its own independent top-k search.
 
-        Notes:
-        - If no vectors are present, returns [].
-        - If reranker is a no-op (current placeholder), order remains unchanged.
+        Returns:
+            Ranked retrieval rows in this format:
+                [
+                    (chunk_id, retrieval_score, metadata),
+                    ...
+                ]
+
+        Error-handling rule:
+        - Local validation belongs here, at the lower level.
+        - The top-level Retriever.run(...) stays visually simple.
         """
-        if not query or not isinstance(query, str):
+        project_name = (project_name or "").strip()
+        if not project_name:
+            raise ValueError("RetrieverSplade.run: project_name must not be empty")
+
+        if not self.splade_root.exists():
+            raise FileNotFoundError(
+                f"RetrieverSplade.run: splade_root does not exist: {self.splade_root}"
+            )
+
+        project_db_dir = self.splade_root / project_name
+        if not project_db_dir.exists():
+            raise FileNotFoundError(
+                f"RetrieverSplade.run: active project SPLADE DB does not exist: {project_db_dir}"
+            )
+
+        if not query_pieces:
             return []
 
-        vecs = self._emb.embed([query])
-        if not vecs:
-            return []
-        q = np.asarray(vecs[0], dtype=np.float32)
-        if q.ndim != 1:
-            q = q.reshape(-1)
+        k = int(top_k) if int(top_k) > 0 else DEFAULT_TOP_K
 
-        # Ask store for candidate ids (VectorStoreNP performs exact-cosine top-k by ids)
-        ids: List[str] = self._vs.query(q.tolist(), k=k)  # type: ignore[arg-type]
+        store = VectorStoreSplade(persist_dir=str(project_db_dir))
 
-        if not ids:
+        doc_vectors: Dict[str, Dict[str, float]] = store.index
+        meta_store: Dict[str, Dict[str, Any]] = getattr(store, "_meta_store", {})
+
+        if len(doc_vectors) == 0:
             return []
 
-        # Compute cosine scores for the candidate ids when VectorStoreNP internals are available.
-        scores = self._compute_cosine_scores(ids, q)
+        query_vectors = self.splade_embedder.embed_queries(query_pieces)
+        if len(query_vectors) == 0:
+            return []
 
-        # Optional rerank (RET-02). Current Reranker returns ids order; we preserve the computed scores.
-        if do_rerank and self._reranker is not None:
-            try:
-                reranked_ids = self._reranker.rerank(ids, query)
-                # Keep only ids we have scores for, preserve reranked order.
-                ordered = [(i, scores.get(i, 0.0)) for i in reranked_ids if i in scores]
-            except Exception:
-                # Fail-safe: skip rerank on any error.
-                ordered = [(i, scores.get(i, 0.0)) for i in ids]
+        target_ids: List[str]
+        use_fixed_candidates = candidate_ids is not None
+
+        if use_fixed_candidates:
+            seen: set[str] = set()
+            target_ids = []
+
+            for chunk_id in candidate_ids or []:
+                cid = str(chunk_id).strip()
+                if not cid:
+                    continue
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                target_ids.append(cid)
+
+            if len(target_ids) == 0:
+                return []
+
+            missing_ids = [cid for cid in target_ids if cid not in doc_vectors]
+            if missing_ids:
+                preview = ", ".join(missing_ids[:10])
+                suffix = " ..." if len(missing_ids) > 10 else ""
+                raise RuntimeError(
+                    "RetrieverSplade.run: candidate_ids are missing in the active SPLADE store. "
+                    f"Missing {len(missing_ids)} id(s): {preview}{suffix}"
+                )
         else:
-            ordered = [(i, scores.get(i, 0.0)) for i in ids]
+            target_ids = list(doc_vectors.keys())
 
-        # Truncate to k and wrap as DocScore
-        ordered = ordered[: max(0, int(k))]
-        return [DocScore(id=doc_id, score=float(sc)) for doc_id, sc in ordered]
+        rows: List[RankedRow] = []
 
-    # ---- helpers ----
-    def _compute_cosine_scores(self, ids: Sequence[str], q: np.ndarray) -> dict[str, float]:
+        p = DEFAULT_P_NORM
+
+        for chunk_id in target_ids:
+            doc_vec = doc_vectors[chunk_id]
+            per_piece_scores: List[float] = []
+
+            for query_vec in query_vectors:
+                sim = self._dot_sparse(doc_vec, query_vec)
+                per_piece_scores.append(float(sim))
+
+            if len(per_piece_scores) == 0:
+                aggregated_score = 0.0
+            else:
+                sims_pos = [max(0.0, float(s)) for s in per_piece_scores]
+                aggregated_score = (
+                    sum(pow(s, p) for s in sims_pos) / float(len(sims_pos))
+                ) ** (1.0 / p)
+
+            meta = meta_store.get(chunk_id, {})
+            rows.append(
+                (
+                    str(chunk_id),
+                    float(aggregated_score),
+                    dict(meta),
+                )
+            )
+
+        # Deterministic sort:
+        # 1) higher score first
+        # 2) stable fallback by chunk_id
+        rows.sort(key=lambda row: (-row[1], row[0]))
+
+        if use_fixed_candidates:
+            return rows
+
+        return rows[: min(k, len(rows))]
+
+    @staticmethod
+    def _dot_sparse(left: Dict[str, float], right: Dict[str, float]) -> float:
         """
-        Compute cosine similarity for a set of ids against query vector q using
-        VectorStoreNP internal arrays when available. Falls back to 0.0 if not.
+        Dot product over sparse dicts.
+
+        Iterate over the smaller dict for efficiency.
         """
-        scores: dict[str, float] = {}
-        # Use VectorStoreNP internals if present.
-        emb = getattr(self._vs, "_emb", None)
-        id2idx = getattr(self._vs, "_id2idx", None)
-        if emb is None or id2idx is None:
-            # No access to raw vectors (e.g., future Chroma backend).
-            for _id in ids:
-                scores[_id] = 0.0
-            return scores
+        if len(left) > len(right):
+            left, right = right, left
 
-        A = np.asarray(emb, dtype=np.float32)  # (N, D)
-        if A.ndim != 2 or A.size == 0:
-            for _id in ids:
-                scores[_id] = 0.0
-            return scores
+        score = 0.0
+        for key, value in left.items():
+            score += float(value) * float(right.get(key, 0.0))
+        return score
+```
 
-        qn = float(np.linalg.norm(q) + 1e-12)
-        # Compute per-id cosine using the stored row corresponding to id.
-        for _id in ids:
-            idx = id2idx.get(_id, None)
-            if idx is None:
-                scores[_id] = 0.0
-                continue
-            v = A[idx]
-            vn = float(np.linalg.norm(v) + 1e-12)
-            sim = float(np.dot(v, q) / (vn * qn))
-            # Clip to [-1, 1] to avoid tiny numerical overshoots.
-            if sim > 1.0:
-                sim = 1.0
-            elif sim < -1.0:
-                sim = -1.0
-            scores[_id] = sim
-        return scores
+### ~\ragstream\retrieval\rrf_merger.py
+```python
+# rrf_merger.py
+# -*- coding: utf-8 -*-
+"""
+rrf_merger.py
+
+Purpose:
+    Deterministic weighted Reciprocal Rank Fusion (RRF) helper.
+
+Role:
+    - Merge two ranked result lists in a neutral way.
+    - Produce one fused ranked list.
+    - Preserve metadata and attach neutral rank/score fields.
+
+Important design rule:
+    - This module is purely deterministic.
+    - It does not know SuperPrompt.
+    - It does not know dense / SPLADE semantics.
+    - It does not hydrate chunk text.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+
+# Ranked row contract shared with retriever.py / retriever_emb.py / retriever_splade.py
+RankedRow = Tuple[str, float, Dict[str, Any]]
+
+# Common practical default for RRF.
+DEFAULT_RRF_K = 60
+
+
+def rrf_merge(
+    rows_a: List[RankedRow],
+    rows_b: List[RankedRow],
+    *,
+    top_k: int | None = None,
+    rrf_k: int = DEFAULT_RRF_K,
+    weight_a: float = 1.0,
+    weight_b: float = 1.0,
+) -> List[RankedRow]:
+    """
+    Merge two ranked lists with weighted Reciprocal Rank Fusion.
+
+    Args:
+        rows_a:
+            First ranked row list.
+        rows_b:
+            Second ranked row list.
+        top_k:
+            Optional final cutoff.
+        rrf_k:
+            RRF constant. Larger values flatten rank differences more.
+        weight_a:
+            Weight for the first ranked list.
+        weight_b:
+            Weight for the second ranked list.
+
+    Returns:
+        One fused ranked row list:
+            [
+                (chunk_id, fused_rrf_score, metadata_with_neutral_scores),
+                ...
+            ]
+    """
+    by_id: Dict[str, Dict[str, Any]] = {}
+
+    for rank, (chunk_id, score, meta) in enumerate(rows_a, start=1):
+        row = by_id.setdefault(str(chunk_id), {})
+        row["meta"] = _merge_meta(row.get("meta"), meta)
+        row["rank_a"] = int(rank)
+        row["score_a"] = float(score)
+
+    for rank, (chunk_id, score, meta) in enumerate(rows_b, start=1):
+        row = by_id.setdefault(str(chunk_id), {})
+        row["meta"] = _merge_meta(row.get("meta"), meta)
+        row["rank_b"] = int(rank)
+        row["score_b"] = float(score)
+
+    fused_rows: List[RankedRow] = []
+
+    for chunk_id, row in by_id.items():
+        rank_a = row.get("rank_a")
+        rank_b = row.get("rank_b")
+
+        fused_score = 0.0
+        if rank_a is not None:
+            fused_score += float(weight_a) / float(rrf_k + int(rank_a))
+        if rank_b is not None:
+            fused_score += float(weight_b) / float(rrf_k + int(rank_b))
+
+        meta = dict(row.get("meta") or {})
+
+        if row.get("score_a") is not None:
+            meta["score_a"] = float(row["score_a"])
+        if row.get("score_b") is not None:
+            meta["score_b"] = float(row["score_b"])
+
+        if rank_a is not None:
+            meta["rank_a"] = int(rank_a)
+        if rank_b is not None:
+            meta["rank_b"] = int(rank_b)
+
+        meta["rrf_score"] = float(fused_score)
+
+        fused_rows.append((str(chunk_id), float(fused_score), meta))
+
+    # Deterministic sort:
+    # 1) higher fused score first
+    # 2) stable fallback by chunk_id
+    fused_rows.sort(key=lambda row: (-row[1], row[0]))
+
+    if top_k is None:
+        return fused_rows
+
+    k = int(top_k)
+    if k <= 0:
+        return fused_rows
+
+    return fused_rows[: min(k, len(fused_rows))]
+
+
+def _merge_meta(
+    base_meta: Dict[str, Any] | None,
+    new_meta: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """
+    Merge metadata conservatively.
+
+    Rule:
+    - keep existing keys
+    - add missing keys from the new metadata
+    - do not silently overwrite existing values
+    """
+    merged = dict(base_meta or {})
+    for key, value in dict(new_meta or {}).items():
+        if key not in merged:
+            merged[key] = value
+    return merged
+```
+
+### ~\ragstream\retrieval\smart_query_splitter.py
+```python
+# smart_query_splitter.py
+# -*- coding: utf-8 -*-
+"""
+smart_query_splitter.py
+
+Purpose:
+    External query-splitting support functions for Retrieval.
+
+Stage-1 refactor scope:
+    - Keep the current linear overlapping query-splitting logic outside retriever.py.
+    - Preserve the current behavior exactly as closely as possible.
+
+Important note:
+    The current splitting logic is still the existing deterministic linear
+    windowing logic. Later, this file can be upgraded internally to a smarter
+    query-splitting implementation (for example wtpsplit) without changing the
+    top-level Retriever stage contract.
+"""
+
+from __future__ import annotations
+
+from typing import List
+
+from ragstream.ingestion.chunker import Chunker
+
+
+def split_query_into_pieces(
+    *,
+    query_text: str,
+    chunker: Chunker,
+    chunk_size: int,
+    overlap: int,
+) -> List[str]:
+    """
+    Split the retrieval query into overlapping query pieces.
+
+    Current Stage-1 behavior:
+    - Reuse the same deterministic chunking idea as ingestion.
+    - Preserve the current retrieval splitter behavior.
+    - Return only the text pieces.
+
+    Later upgrade path:
+    - This function body can be replaced by a smarter splitter implementation
+      without changing the top-level Retriever stage contract.
+    """
+    query_text = (query_text or "").strip()
+    if not query_text:
+        return []
+
+    if chunker is None:
+        raise ValueError("split_query_into_pieces: 'chunker' must not be None")
+
+    if chunk_size <= 0:
+        raise ValueError("split_query_into_pieces: chunk_size must be positive")
+
+    if overlap < 0:
+        raise ValueError("split_query_into_pieces: overlap must be non-negative")
+
+    if overlap >= chunk_size:
+        raise ValueError(
+            "split_query_into_pieces: overlap must be smaller than chunk_size"
+        )
+
+    pieces = chunker.split(
+        file_path="__prompt__",
+        text=query_text,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
+
+    return [chunk_text for _fp, chunk_text in pieces if (chunk_text or "").strip()]
 ```
 
 

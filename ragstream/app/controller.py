@@ -18,11 +18,15 @@ from ragstream.agents.a2_promptshaper import A2PromptShaper
 
 # Added on 10.03.2026:
 # Project-based document ingestion is wired here only at controller level.
-# The existing ingestion backend remains unchanged.
 from ragstream.ingestion.chunker import Chunker
 from ragstream.ingestion.embedder import Embedder
 from ragstream.ingestion.ingestion_manager import IngestionManager
 from ragstream.ingestion.vector_store_chroma import VectorStoreChroma
+
+# Added on 13.04.2026:
+# Parallel SPLADE ingestion branch.
+from ragstream.ingestion.splade_embedder import SpladeEmbedder
+from ragstream.ingestion.vector_store_splade import VectorStoreSplade
 
 # Added on 15.03.2026:
 # Deterministic Retrieval stage.
@@ -63,8 +67,10 @@ class AppController:
         self.data_root = self.project_root / "data"
         self.doc_root = self.data_root / "doc_raw"
         self.chroma_root = self.data_root / "chroma_db"
+        self.splade_root = self.data_root / "splade_db"
         self.doc_root.mkdir(parents=True, exist_ok=True)
         self.chroma_root.mkdir(parents=True, exist_ok=True)
+        self.splade_root.mkdir(parents=True, exist_ok=True)
 
         # Added on 15.03.2026:
         # Retrieval is initialized once and re-used. It reads the active project
@@ -208,21 +214,25 @@ class AppController:
     def list_projects(self) -> list[str]:
         doc_projects = {p.name for p in self.doc_root.iterdir() if p.is_dir()}
         chroma_projects = {p.name for p in self.chroma_root.iterdir() if p.is_dir()}
-        return sorted(doc_projects | chroma_projects)
+        splade_projects = {p.name for p in self.splade_root.iterdir() if p.is_dir()}
+        return sorted(doc_projects | chroma_projects | splade_projects)
 
     def create_project(self, project_name: str) -> dict[str, Any]:
         project_name = self._normalize_project_name(project_name)
         raw_dir = self.doc_root / project_name
         chroma_dir = self.chroma_root / project_name
+        splade_dir = self.splade_root / project_name
 
         raw_dir.mkdir(parents=True, exist_ok=True)
         chroma_dir.mkdir(parents=True, exist_ok=True)
+        splade_dir.mkdir(parents=True, exist_ok=True)
 
         return {
             "success": True,
             "project_name": project_name,
             "raw_dir": str(raw_dir),
             "chroma_dir": str(chroma_dir),
+            "splade_dir": str(splade_dir),
             "manifest_path": str(chroma_dir / "file_manifest.json"),
         }
 
@@ -237,14 +247,18 @@ class AppController:
 
         manager = IngestionManager(doc_root=str(self.doc_root))
         store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
+        sparse_store = VectorStoreSplade(persist_dir=str(self.splade_root / project_name))
         chunker = Chunker()
         embedder = Embedder(model="text-embedding-3-large")
+        sparse_embedder = SpladeEmbedder(device="cpu")
 
         stats = manager.run(
             subfolder=project_name,
             store=store,
             chunker=chunker,
             embedder=embedder,
+            sparse_store=sparse_store,
+            sparse_embedder=sparse_embedder,
             manifest_path=str(manifest_path),
         )
 
@@ -255,6 +269,7 @@ class AppController:
                 "project_name": project_name,
                 "raw_dir": str(self.doc_root / project_name),
                 "chroma_dir": str(self.chroma_root / project_name),
+                "splade_dir": str(self.splade_root / project_name),
                 "manifest_path": str(manifest_path),
             }
         )

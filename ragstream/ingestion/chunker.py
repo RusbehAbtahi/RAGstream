@@ -9,7 +9,7 @@ from typing import List, Tuple
 class Chunker:
     """Window-based text splitter."""
 
-    def split(self, file_path: str, text: str, chunk_size: int = 500, overlap: int = 100) -> List[Tuple[str, str]]:
+    def split(self, file_path: str, text: str, chunk_size: int = 1200, overlap: int = 120) -> List[Tuple[str, str]]:
         """
         Split the given text into overlapping chunks.
 

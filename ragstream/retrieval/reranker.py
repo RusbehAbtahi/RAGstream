@@ -7,10 +7,10 @@ Purpose:
 
 Scope of this file:
     - Read the Retrieval candidates already stored in the current SuperPrompt.
-    - Build one semantic reranking query from TASK / PURPOSE / CONTEXT.
-    - Clean chunk text dynamically before cross-encoder scoring.
-    - Score each (query, chunk_text) pair with a BERT-style cross-encoder.
-    - Sort the current candidate set by reranker score.
+    - Build reranking query pieces from TASK / PURPOSE / CONTEXT.
+    - Clean chunk text dynamically before ColBERT scoring.
+    - Score each Retrieval candidate with ColBERT over the split query pieces.
+    - Fuse Retrieval ranking and ColBERT ranking with deterministic weighted RRF.
     - Write the ReRanker stage result back into the same SuperPrompt.
 
 Non-goals:
@@ -24,20 +24,30 @@ Non-goals:
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
-from sentence_transformers import CrossEncoder
+from pylate import models, rank
 
+from ragstream.ingestion.chunker import Chunker
 from ragstream.orchestration.super_prompt import A3ChunkStatus, SuperPrompt
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.retrieval.chunk import Chunk
+from ragstream.retrieval.rrf_merger import rrf_merge
+from ragstream.retrieval.smart_query_splitter import split_query_into_pieces
 
+
+# ---------------------------------------------------------------------
+# Shared row contract
+# ---------------------------------------------------------------------
+
+RankedRow = Tuple[str, float, Dict[str, Any]]
 
 # ---------------------------------------------------------------------
 # Module-level reranker defaults
 # ---------------------------------------------------------------------
 
 # Agreed current reranker model direction.
-DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+DEFAULT_RERANK_MODEL = "lightonai/GTE-ModernColBERT-v1"
 
 # Conceptual cap from the current requirement set for how many Retrieval
 # candidates should be passed into ReRanker.
@@ -45,6 +55,14 @@ DEFAULT_RERANK_TOP_K = 50
 
 # Agreed current runtime direction: CPU-only deterministic stage.
 DEFAULT_DEVICE = "cpu"
+
+# Keep query splitting aligned with Retrieval.
+DEFAULT_QUERY_CHUNK_SIZE = 1200
+DEFAULT_QUERY_OVERLAP = 120
+
+# Equal-weight fusion between Retrieval and ColBERT.
+DEFAULT_RETRIEVAL_WEIGHT = 0.75
+DEFAULT_COLBERT_WEIGHT = 0.25
 
 
 class Reranker:
@@ -67,20 +85,22 @@ class Reranker:
         device: str = DEFAULT_DEVICE,
     ) -> None:
         """
-        Initialize ReRanker with the agreed cross-encoder model.
+        Initialize ReRanker with the agreed ColBERT model.
 
         Args:
             model_name:
-                Hugging Face / SentenceTransformers model id for the reranker.
+                Hugging Face / PyLate-compatible model id for the reranker.
             top_k:
                 Maximum number of Retrieval candidates to rerank.
             device:
                 Runtime device. Current agreed direction is CPU.
+                Kept as part of the stable ReRanker interface.
         """
         self._model_name = model_name
         self._top_k = int(top_k) if int(top_k) > 0 else DEFAULT_RERANK_TOP_K
         self._device = device
-        self._cross_encoder = CrossEncoder(self._model_name, device=self._device)
+        self._chunker = Chunker()
+        self._colbert_model = models.ColBERT(model_name_or_path=self._model_name)
 
     # -----------------------------------------------------------------
     # Public API
@@ -103,9 +123,12 @@ class Reranker:
             - Appends "reranked" to sp.history_of_stages
             - Sets sp.stage = "reranked"
         """
-        query_text, retrieval_rows, chunk_lookup = self._prepare_inputs(sp)
-        scored_rows = self._score_pairs(query_text, retrieval_rows, chunk_lookup)
-        reranked_view, reranked_ids = self._build_reranked_view(scored_rows)
+        query_pieces, retrieval_rows, chunk_lookup = self._prepare_inputs(sp)
+        colbert_rows = self._score_with_colbert(query_pieces, retrieval_rows, chunk_lookup)
+        fused_rows = self._fuse_with_retrieval(retrieval_rows, colbert_rows, chunk_lookup)
+        fused_rows = self._project_fused_metadata_to_reranker_contract(fused_rows)
+        self._write_scores_back_to_chunks(fused_rows, chunk_lookup)
+        reranked_view, reranked_ids = self._build_reranked_view(fused_rows)
 
         sp.views_by_stage["reranked"] = reranked_view
         sp.final_selection_ids = reranked_ids
@@ -121,13 +144,13 @@ class Reranker:
     def _prepare_inputs(
         self,
         sp: SuperPrompt,
-    ) -> tuple[str, List[tuple[str, float, A3ChunkStatus]], Dict[str, Chunk]]:
+    ) -> tuple[List[str], List[tuple[str, float, A3ChunkStatus]], Dict[str, Chunk]]:
         """
         Prepare the reranking job from the current SuperPrompt.
 
         Responsibilities grouped here on purpose:
         - validate stage and Retrieval availability,
-        - build one semantic query text from TASK / PURPOSE / CONTEXT,
+        - build reranking query pieces from TASK / PURPOSE / CONTEXT,
         - trim Retrieval rows to the active rerank cap,
         - build chunk_id -> Chunk lookup from base_context_chunks.
         """
@@ -147,42 +170,28 @@ class Reranker:
                 "Please run Retrieval before ReRanker."
             )
 
-        query_blocks: List[str] = []
+        query_text = SuperPromptProjector.build_query_text(sp)
 
-        task = (sp.body.get("task") or "").strip()
-        purpose = (sp.body.get("purpose") or "").strip()
-        context = (sp.body.get("context") or "").strip()
+        query_pieces = split_query_into_pieces(
+            query_text=query_text,
+            chunker=self._chunker,
+            chunk_size=DEFAULT_QUERY_CHUNK_SIZE,
+            overlap=DEFAULT_QUERY_OVERLAP,
+        )
 
-        if task:
-            query_blocks.append("## TASK")
-            query_blocks.append(task)
-            query_blocks.append("")
-
-        if purpose:
-            query_blocks.append("## PURPOSE")
-            query_blocks.append(purpose)
-            query_blocks.append("")
-
-        if context:
-            query_blocks.append("## CONTEXT")
-            query_blocks.append(context)
-            query_blocks.append("")
-
-        query_text = "\n".join(query_blocks).strip()
-        if not query_text:
+        if not query_pieces:
             raise ValueError(
-                "Reranker.run: reranking query is empty. "
-                "At least one of TASK / PURPOSE / CONTEXT must be present."
+                "Reranker.run: no reranking query pieces could be built from SuperPrompt."
             )
 
-        candidate_rows = list(retrieval_rows)
+        candidate_rows = list(retrieval_rows)[: self._top_k]
         chunk_lookup = {chunk_obj.id: chunk_obj for chunk_obj in sp.base_context_chunks}
 
-        return query_text, candidate_rows, chunk_lookup
+        return query_pieces, candidate_rows, chunk_lookup
 
     def _clean_chunk_text(self, text: str) -> str:
         """
-        Clean one chunk dynamically before cross-encoder scoring.
+        Clean one chunk dynamically before ColBERT scoring.
 
         Design intention:
         - Remove obvious markdown / YAML / prompt-artifact rubbish.
@@ -244,27 +253,28 @@ class Reranker:
 
         return "\n".join(cleaned_lines).strip()
 
-    def _score_pairs(
+    def _score_with_colbert(
         self,
-        query_text: str,
+        query_pieces: List[str],
         retrieval_rows: List[tuple[str, float, A3ChunkStatus]],
         chunk_lookup: Dict[str, Chunk],
-    ) -> List[Tuple[str, float]]:
+    ) -> List[RankedRow]:
         """
-        Score all valid (query, chunk_text) pairs with the cross-encoder.
+        Score the Retrieval candidates with ColBERT over the reranking query pieces.
 
         Returns:
-            List[(chunk_id, reranker_score)]
+            List[(chunk_id, aggregated_colbert_score, metadata)]
 
-        Important robustness rule:
-        - If one Retrieval row references a chunk ID that is no longer present
-          in base_context_chunks, skip that row instead of crashing the stage.
+        Aggregation rule:
+        - Each query piece produces one ColBERT reranked list.
+        - For each chunk, aggregate piece-level scores by arithmetic mean.
+        - The final ColBERT ranked list is then sorted deterministically.
         """
         valid_ids: List[str] = []
-        pairs: List[tuple[str, str]] = []
+        cleaned_snippets: List[str] = []
 
         for row in retrieval_rows:
-            chunk_id = row[0]
+            chunk_id = str(row[0])
             chunk_obj = chunk_lookup.get(chunk_id)
             if chunk_obj is None:
                 continue
@@ -274,34 +284,176 @@ class Reranker:
                 continue
 
             valid_ids.append(chunk_id)
-            pairs.append((query_text, cleaned_snippet))
+            cleaned_snippets.append(cleaned_snippet)
 
-        if not pairs:
+        if not valid_ids:
             raise ValueError(
-                "Reranker.run: no valid (query, chunk) pairs could be built from Retrieval output."
+                "Reranker.run: no valid Retrieval candidates could be prepared for ColBERT."
             )
 
-        scores = self._cross_encoder.predict(pairs, convert_to_numpy=False)
-        return [(chunk_id, float(score)) for chunk_id, score in zip(valid_ids, scores)]
+        documents_per_query: List[List[str]] = [list(cleaned_snippets) for _ in query_pieces]
+        document_ids_per_query: List[List[str]] = [list(valid_ids) for _ in query_pieces]
+
+        queries_embeddings = self._colbert_model.encode(
+            query_pieces,
+            is_query=True,
+            show_progress_bar=False,
+        )
+
+        documents_embeddings = self._colbert_model.encode(
+            documents_per_query,
+            is_query=False,
+            show_progress_bar=False,
+        )
+
+        reranked_documents = rank.rerank(
+            documents_ids=document_ids_per_query,
+            queries_embeddings=queries_embeddings,
+            documents_embeddings=documents_embeddings,
+        )
+
+        score_sums: Dict[str, float] = {}
+        score_counts: Dict[str, int] = {}
+
+        for one_query_result in reranked_documents:
+            for item in one_query_result:
+                chunk_id = str(item["id"])
+                score = float(item["score"])
+                score_sums[chunk_id] = score_sums.get(chunk_id, 0.0) + score
+                score_counts[chunk_id] = score_counts.get(chunk_id, 0) + 1
+
+        scored_rows: List[RankedRow] = []
+
+        for chunk_id in valid_ids:
+            if chunk_id not in score_counts:
+                continue
+
+            mean_score = score_sums[chunk_id] / float(score_counts[chunk_id])
+            base_meta = dict((chunk_lookup.get(chunk_id).meta or {}))
+            meta_out = dict(base_meta)
+            meta_out["colbert_score"] = float(mean_score)
+
+            scored_rows.append((chunk_id, float(mean_score), meta_out))
+
+        scored_rows.sort(key=lambda row: (-row[1], row[0]))
+        return scored_rows
+
+    def _fuse_with_retrieval(
+        self,
+        retrieval_rows: List[tuple[str, float, A3ChunkStatus]],
+        colbert_rows: List[RankedRow],
+        chunk_lookup: Dict[str, Chunk],
+    ) -> List[RankedRow]:
+        """
+        Fuse Retrieval ranking and ColBERT ranking with equal-weight RRF.
+        """
+        retrieval_ranked_rows: List[RankedRow] = []
+
+        for chunk_id, retrieval_score, _status in retrieval_rows:
+            chunk_obj = chunk_lookup.get(str(chunk_id))
+            if chunk_obj is None:
+                continue
+
+            meta_out = dict(chunk_obj.meta or {})
+
+            # Preserve the old Retrieval fused score explicitly before the
+            # second RRF merge overwrites the generic key "rrf_score".
+            if "rrf_score" in meta_out and "retrieval_rrf_score" not in meta_out:
+                meta_out["retrieval_rrf_score"] = float(meta_out["rrf_score"])
+
+            retrieval_ranked_rows.append((str(chunk_id), float(retrieval_score), meta_out))
+
+        return rrf_merge(
+            retrieval_ranked_rows,
+            colbert_rows,
+            top_k=self._top_k,
+            weight_a=DEFAULT_RETRIEVAL_WEIGHT,
+            weight_b=DEFAULT_COLBERT_WEIGHT,
+        )
+
+    def _project_fused_metadata_to_reranker_contract(
+        self,
+        fused_rows: List[RankedRow],
+    ) -> List[RankedRow]:
+        """
+        Translate neutral RRF merger metadata into reranker-specific metadata.
+
+        Design rule:
+        - Preserve existing Retrieval metadata in chunk.meta.
+        - Preserve the old Retrieval fused score under:
+            retrieval_rrf_score
+        - Add reranker-specific aliases here:
+            retrieval_score
+            colbert_score
+            retrieval_rank
+            colbert_rank
+            rerank_rrf_score
+        """
+        projected_rows: List[RankedRow] = []
+
+        for chunk_id, fused_score, meta in fused_rows:
+            meta_in = dict(meta or {})
+            meta_out = dict(meta_in)
+
+            if "score_a" in meta_in and "retrieval_score" not in meta_out:
+                meta_out["retrieval_score"] = float(meta_in["score_a"])
+
+            if "score_b" in meta_in and "colbert_score" not in meta_out:
+                meta_out["colbert_score"] = float(meta_in["score_b"])
+
+            if "rank_a" in meta_in and "retrieval_rank" not in meta_out:
+                meta_out["retrieval_rank"] = int(meta_in["rank_a"])
+
+            if "rank_b" in meta_in and "colbert_rank" not in meta_out:
+                meta_out["colbert_rank"] = int(meta_in["rank_b"])
+
+            if "retrieval_rrf_score" not in meta_out and "score_a" in meta_in:
+                meta_out["retrieval_rrf_score"] = float(meta_in["score_a"])
+
+            meta_out["rerank_rrf_score"] = float(fused_score)
+
+            projected_rows.append((str(chunk_id), float(fused_score), meta_out))
+
+        return projected_rows
+
+    def _write_scores_back_to_chunks(
+        self,
+        fused_rows: List[RankedRow],
+        chunk_lookup: Dict[str, Chunk],
+    ) -> None:
+        """
+        Persist the reranker metadata into the hydrated chunk objects so that
+        SuperPromptProjector can render the score text directly from chunk.meta.
+        """
+        for chunk_id, _score, meta in fused_rows:
+            chunk_obj = chunk_lookup.get(str(chunk_id))
+            if chunk_obj is None:
+                continue
+
+            merged_meta = dict(chunk_obj.meta or {})
+            for key, value in dict(meta or {}).items():
+                merged_meta[key] = value
+
+            chunk_obj.meta = merged_meta
 
     def _build_reranked_view(
         self,
-        scored_rows: List[Tuple[str, float]],
+        fused_rows: List[RankedRow],
     ) -> tuple[List[tuple[str, float, A3ChunkStatus]], List[str]]:
         """
         Build the ordered ReRanker stage snapshot.
 
         Deterministic sort:
-        1) higher reranker score first
+        1) higher final fused rerank score first
         2) stable fallback by chunk_id
         """
-        scored_rows.sort(key=lambda row: (-row[1], row[0]))
+        fused_rows.sort(key=lambda row: (-row[1], row[0]))
 
         reranked_view: List[tuple[str, float, A3ChunkStatus]] = []
         reranked_ids: List[str] = []
 
-        for chunk_id, score in scored_rows:
-            reranked_view.append((chunk_id, score, A3ChunkStatus.SELECTED))
-            reranked_ids.append(chunk_id)
+        for chunk_id, score, _meta in fused_rows:
+            reranked_view.append((str(chunk_id), float(score), A3ChunkStatus.SELECTED))
+            reranked_ids.append(str(chunk_id))
 
         return reranked_view, reranked_ids

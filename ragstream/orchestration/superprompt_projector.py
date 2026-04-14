@@ -205,16 +205,22 @@ class SuperPromptProjector:
         """
         Format numeric scores compactly for the Related Context headers.
         """
-        return f"{float(score):.4f}".rstrip("0").rstrip(".")
+        return f"{float(score):.8f}".rstrip("0").rstrip(".")
 
     def _render_related_context_md(self) -> str:
         """
-        Render a simple chunk-based context preview from the current selected chunks.
+        Render a chunk-based context preview from the current selected chunks.
 
         Design intention:
         - The GUI should show only the selected chunk texts.
-        - During Retrieval, show only Rt-Score in the chunk header.
-        - During ReRanker, show Rk-Score first and Rt-Score second.
+        - During Retrieval, show:
+            Rt     = final fused Retrieval score
+            Emb    = dense branch score
+            Splade = sparse branch score
+        - During ReRanker, show:
+            Rnk   = final fused rerank RRF score
+            RcolB = ColBERT score
+            Rt    = final fused Retrieval score from the previous stage
         - For other stages, keep the header simple.
         - Technical metadata such as ID, source, status, and span remain
           inside SuperPrompt as internal structured data and are not rendered here.
@@ -243,23 +249,47 @@ class SuperPromptProjector:
         for chunk_obj in ordered_chunks:
             header = f"### Chunk {chunk_counter}"
 
+            emb_score = self._get_meta_float(chunk_obj.meta, "emb_score")
+            splade_score = self._get_meta_float(chunk_obj.meta, "splade_score")
+
             if self.sp.stage == "retrieval":
+                score_parts: List[str] = []
+
                 rt_score = retrieval_score_map.get(chunk_obj.id)
                 if rt_score is not None:
-                    header = f"{header} [Rt-Score={self._format_score(rt_score)}]"
+                    score_parts.append(f"Rt={self._format_score(rt_score)}")
+                if emb_score is not None:
+                    score_parts.append(f"Emb={self._format_score(emb_score)}")
+                if splade_score is not None:
+                    score_parts.append(f"Splade={self._format_score(splade_score)}")
+
+                if score_parts:
+                    header = f"{header} [{', '.join(score_parts)}]"
 
             elif self.sp.stage == "reranked":
-                rk_score = reranked_score_map.get(chunk_obj.id)
-                rt_score = retrieval_score_map.get(chunk_obj.id)
+                score_parts = []
 
-                if rk_score is not None and rt_score is not None:
-                    header = (
-                        f"{header} "
-                        f"[Rk-Score={self._format_score(rk_score)}, "
-                        f"Rt-Score={self._format_score(rt_score)}]"
-                    )
-                elif rk_score is not None:
-                    header = f"{header} [Rk-Score={self._format_score(rk_score)}]"
+                rnk_score = reranked_score_map.get(chunk_obj.id)
+                if rnk_score is None:
+                    rnk_score = self._get_meta_float(chunk_obj.meta, "rerank_rrf_score")
+
+                rcolb_score = self._get_meta_float(chunk_obj.meta, "colbert_score")
+
+                rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_rrf_score")
+                if rt_score is None:
+                    rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_score")
+                if rt_score is None:
+                    rt_score = retrieval_score_map.get(chunk_obj.id)
+
+                if rnk_score is not None:
+                    score_parts.append(f"Rnk={self._format_score(rnk_score)}")
+                if rcolb_score is not None:
+                    score_parts.append(f"RcolB={self._format_score(rcolb_score)}")
+                if rt_score is not None:
+                    score_parts.append(f"Rt={self._format_score(rt_score)}")
+
+                if score_parts:
+                    header = f"{header} [{', '.join(score_parts)}]"
 
             lines.append(header)
             lines.append("")
@@ -268,6 +298,21 @@ class SuperPromptProjector:
             chunk_counter += 1
 
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:
+        """
+        Safely read one numeric value from chunk metadata.
+        """
+        if not isinstance(meta, dict):
+            return None
+        value = meta.get(key)
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _get_ordered_context_chunks(self) -> List["Chunk"]:
         """

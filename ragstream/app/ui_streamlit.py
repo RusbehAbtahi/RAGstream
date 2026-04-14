@@ -116,7 +116,7 @@ def main() -> None:
         # the widget-owned key "active_project" after that widget exists.
         st.session_state["pending_active_project"] = None
     if "retrieval_top_k" not in st.session_state:
-        st.session_state["retrieval_top_k"] = 100
+        st.session_state["retrieval_top_k"] = 50
     if "a2_memory_demo_entries" not in st.session_state:
         st.session_state["a2_memory_demo_entries"] = []
     if "a2_memory_demo_counter" not in st.session_state:

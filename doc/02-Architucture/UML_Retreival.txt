@@ -19,8 +19,18 @@ package "Ingestion / External" {
         - model : str
     }
 
+    class SpladeEmbedder {
+        + embed(...) : List[Dict[str,float]]
+        + embed_queries(...) : List[Dict[str,float]]
+    }
+
     class VectorStoreChroma {
         + collection : Any
+        + add(...) : None
+    }
+
+    class VectorStoreSplade {
+        + index : Dict[str, Dict[str,float]]
         + add(...) : None
     }
 }
@@ -60,23 +70,26 @@ package "Retrieval Stage" {
         DUPLICATED
     }
 
-    class SPLADERetriever {
-        + rank(...) : List[Dict[str, Any]]
+    class RetrieverEmb {
+        + run(...) : List[tuple[str, float, Dict[str, Any]]]
+    }
+
+    class RetrieverSplade {
+        + run(...) : List[tuple[str, float, Dict[str, Any]]]
     }
 
     class RRFMerger {
-        + fuse(...) : List[Dict[str, Any]]
+        + rrf_merge(...) : List[tuple[str, float, Dict[str, Any]]]
     }
 
     class Retriever {
         + run(...) : SuperPrompt
-        - _build_query(...) : str
-        - _split_query(...) : List[str]
-        - _dense_rank(...) : List[Dict[str, Any]]
-        - _sparse_rank(...) : List[Dict[str, Any]]
-        - _fuse_rows(...) : List[Dict[str, Any]]
-        - _hydrate(...) : tuple[List[Dict[str, Any]], List[Chunk]]
-        - _write_stage(...) : None
+        - _preprocess(...) : List[str]
+        - _postprocess(...) : SuperPrompt
+        - _get_retriever_splade(...) : RetrieverSplade
+        - _project_rrf_metadata_to_retrieval_contract(...) : List[tuple[str, float, Dict[str, Any]]]
+        - _hydrate_ranked_chunks(...) : tuple[List[tuple[str, float, Dict[str, Any]]], List[Chunk]]
+        - _write_stage_to_superprompt(...) : None
     }
 
     class NLP_Splitter {
@@ -111,6 +124,11 @@ package "SuperPrompt & Orchestration" {
         + compose_prompt_ready() : str
     }
 
+    class SuperPromptProjector {
+        + build_query_text(...) : str
+        + compose_prompt_ready(...) : str
+    }
+
     class PromptBuilder {
         + build_from_superprompt(...) : str
     }
@@ -125,15 +143,18 @@ AppController --> Reranker
 AppController --> SuperPrompt
 
 Retriever --> Embedder
+Retriever --> SpladeEmbedder
 Retriever --> Chunker
-Retriever --> SPLADERetriever
+Retriever --> RetrieverEmb
+Retriever --> RetrieverSplade
 Retriever --> RRFMerger
-Retriever --> VectorStoreChroma
 Retriever --> SuperPrompt
+Retriever --> SuperPromptProjector
 Retriever .> Chunk
 Retriever .> A3ChunkStatus
 
-SPLADERetriever --> VectorStoreChroma
+RetrieverEmb --> VectorStoreChroma
+RetrieverSplade --> VectorStoreSplade
 
 Reranker --> NLP_Splitter
 Reranker --> RRFMerger
@@ -148,11 +169,12 @@ note right of Retriever
   Retrieval design:
   - reads TASK / PURPOSE / CONTEXT
   - splits query into pieces
-  - dense OpenAI branch
+  - dense embedding branch
   - SPLADE branch
-  - RRF merge
+  - weighted RRF merge
+  - Retriever maps neutral RRF metadata
+    into retrieval-specific names
   - writes fused Retrieval order
-  - Retrieval band capped at 50
 end note
 
 note right of Reranker

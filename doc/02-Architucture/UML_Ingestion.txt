@@ -1,8 +1,9 @@
-@startuml RAGstream2_Ingestion
+@startuml RAGstream_Ingestion
 '──────────────────────────────────────────────────────────────
 '  INGESTION / MEMORY – DOCUMENT PIPELINE (DETAILED VIEW)
+'  Updated for parallel Dense + SPLADE ingestion
 '──────────────────────────────────────────────────────────────
-left to right direction
+top to bottom direction
 skinparam linetype ortho
 skinparam classAttributeIconSize 0
 skinparam packageStyle rectangle
@@ -10,19 +11,17 @@ hide empty members
 
 package "Ingestion / Memory" {
 
+    '──────────────────────────────────────────────────────────
+    '  COMMON / SHARED PART
+    '──────────────────────────────────────────────────────────
+
     class DocumentLoader {
         + load_documents(subfolder:str) : List[Tuple[str,str]]
         - root : Path
     }
 
     class Chunker {
-        + split(file_path:str, text:str, chunk_size:int=500, overlap:int=100) : List[Tuple[str,str]]
-    }
-
-    class Embedder {
-        + embed(texts:List[str]) : List[List[float]]
-        - model : str
-        - client : OpenAI
+        + split(file_path:str, text:str, chunk_size:int=1200, overlap:int=120) : List[Tuple[str,str]]
     }
 
     class FileManifest {
@@ -43,16 +42,25 @@ package "Ingestion / Memory" {
     end note
 
     class IngestionStats {
-        + files_scanned        : int
-        + to_process           : int
-        + unchanged            : int
-        + tombstones           : int
-        + chunks_added         : int
-        + vectors_upserted     : int
-        + deleted_old_versions : int
-        + deleted_tombstones   : int
-        + published_manifest_path : str
-        + embedded_bytes       : int
+        + files_scanned             : int
+        + to_process                : int
+        + unchanged                 : int
+        + tombstones                : int
+
+        + chunks_added              : int
+        + vectors_upserted          : int
+
+        + dense_vectors_upserted    : int
+        + sparse_vectors_upserted   : int
+
+        + deleted_old_versions      : int
+        + deleted_tombstones        : int
+
+        + embedded_bytes            : int
+        + dense_embedded_bytes      : int
+        + sparse_embedded_bytes     : int
+
+        + published_manifest_path   : str
     }
 
     class IngestionManager {
@@ -62,13 +70,40 @@ package "Ingestion / Memory" {
             chunker:Chunker,
             embedder:Embedder,
             manifest_path:str,
-            chunk_size:int=500,
-            overlap:int=100,
+            sparse_store:VectorStoreSplade=None,
+            sparse_embedder:SpladeEmbedder=None,
+            chunk_size:int=1200,
+            overlap:int=120,
             delete_old_versions:bool=True,
             delete_tombstones:bool=False
           ) : IngestionStats
+
         - doc_root : Path
         - loader   : DocumentLoader
+
+        - _delete_file_version(...) : int
+        - _count_ids(...) : int
+    }
+
+    note bottom of IngestionManager
+      ONE canonical chunking pass:
+      - loader reads source files
+      - chunker builds canonical chunks once
+      - chunk_id = rel_path::sha256::chunk_idx
+      - SAME ids + SAME metadata go to BOTH branches
+
+      Dense and SPLADE are parallel representations
+      of the SAME chunk universe.
+    end note
+
+    '──────────────────────────────────────────────────────────
+    '  DENSE PIPELINE (CURRENT / CHROMA)
+    '──────────────────────────────────────────────────────────
+
+    class Embedder {
+        + embed(texts:List[str]) : List[List[float]]
+        - model  : str
+        - client : OpenAI
     }
 
     class ChromaVectorStoreBase {
@@ -77,32 +112,106 @@ package "Ingestion / Memory" {
         + delete_where(where:Dict) : None
         + snapshot(timestamp:str=None) : Path
         + collection() : Any
+
         - persist_path    : Path
         - collection_name : str
-        - _client : chromadb.PersistentClient
-        - _col    : chromadb.Collection
-        - _pre_add(.) : tuple
-        - _post_add(.) : None
+        - _client         : chromadb.PersistentClient
+        - _col            : chromadb.Collection
+
+        - _pre_add(.)   : tuple
+        - _post_add(.)  : None
         - _pre_query(.) : tuple
         - _post_query(ids:List[str], raw_result:Dict) : List[str]
     }
 
     class VectorStoreChroma extends ChromaVectorStoreBase {
         + make_chunk_id(rel_path:str, sha256:str, chunk_idx:int) : str
+        + delete_file_version(rel_path:str, sha256:str) : int
         + name() : str
         + persist_root() : Path
         + count() : int
     }
 
-    '── Ingestion flow (documents only)
+    note bottom of VectorStoreChroma
+      Dense document store:
+      - physical root: data/chroma_db/<project>
+      - logical collection: docs
+      - stores dense embedding vectors + metadata
+    end note
+
+    '──────────────────────────────────────────────────────────
+    '  SPARSE PIPELINE (NEW / SPLADE)
+    '──────────────────────────────────────────────────────────
+
+    class SpladeEmbedder {
+        + embed(texts:List[str]) : List[Dict[str,float]]
+
+        - model      : str
+        - device     : str
+        - tokenizer  : Any
+        - encoder    : Any
+        - max_terms  : int
+    }
+
+    class SpladeVectorStoreBase {
+        + add(ids:List[str], vectors:List[Dict[str,float]], metadatas:List[Dict]=None) : None
+        + query(vector:Dict[str,float], k:int=10, where:Dict=None) : List[str]
+        + delete_where(where:Dict) : None
+        + snapshot(timestamp:str=None) : Path
+        + index() : Any
+
+        - persist_path : Path
+        - index_name   : str
+        - _index       : Any
+        - _meta_store  : Any
+
+        - _pre_add(.)   : tuple
+        - _post_add(.)  : None
+        - _pre_query(.) : tuple
+        - _post_query(ids:List[str], raw_result:Dict) : List[str]
+    }
+
+    class VectorStoreSplade extends SpladeVectorStoreBase {
+        + make_chunk_id(rel_path:str, sha256:str, chunk_idx:int) : str
+        + delete_file_version(rel_path:str, sha256:str) : int
+        + name() : str
+        + persist_root() : Path
+        + count() : int
+    }
+
+    note bottom of VectorStoreSplade
+      Sparse document store:
+      - physical root: data/splade_db/<project>
+      - logical index: docs_sparse
+      - stores SPLADE sparse term-weight vectors + metadata
+
+      IMPORTANT:
+      chunk IDs are NOT backend-owned.
+      They are provided by RAGstream and must stay
+      identical to the dense branch.
+    end note
+
+    '──────────────────────────────────────────────────────────
+    '  FLOWS
+    '──────────────────────────────────────────────────────────
+
     DocumentLoader --> Chunker : raw text
-    Chunker --> Embedder       : chunks
+
+    Chunker --> Embedder       : canonical chunks
+    Chunker --> SpladeEmbedder : canonical chunks
+
+    Embedder --> VectorStoreChroma           : dense vectors + metadata
+    SpladeEmbedder --> VectorStoreSplade     : sparse vectors + metadata
 
     IngestionManager --> DocumentLoader
     IngestionManager --> Chunker
+    IngestionManager --> FileManifest
+
     IngestionManager --> Embedder
     IngestionManager --> VectorStoreChroma
-    IngestionManager --> FileManifest
+
+    IngestionManager --> SpladeEmbedder
+    IngestionManager --> VectorStoreSplade
 }
 
 '──────────────────────────────────────────────────────────────
@@ -116,7 +225,18 @@ package "Config (external)" {
 }
 
 Paths .> ChromaVectorStoreBase : uses PATHS.chroma_db
-Paths .> IngestionManager      : provides doc_root/manifest_path
+Paths .> SpladeVectorStoreBase : uses PATHS.splade_db
+Paths .> IngestionManager      : provides doc_root / manifest_path
+
+'──────────────────────────────────────────────────────────────
+'  GLOBAL NOTES FOR PDF READABILITY
+'──────────────────────────────────────────────────────────────
+
+note "Design rule:\nLoader + Chunker + FileManifest remain shared and backend-agnostic.\nOnly the representation/store branches differ.\nWhenever possible, dense and SPLADE keep the same public method names." as N1
+
+note "Parallel analogy:\nEmbedder <-> SpladeEmbedder\nChromaVectorStoreBase <-> SpladeVectorStoreBase\nVectorStoreChroma <-> VectorStoreSplade" as N2
+
+N1 .. IngestionManager
+N2 .. VectorStoreSplade
 
 @enduml
-

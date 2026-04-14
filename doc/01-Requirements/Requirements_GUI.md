@@ -1,6 +1,9 @@
-Below is the complete updated version of Requirements_GUI.md with only additions and no revisions to existing text. 
+# Requirements_GUI.md
 
-Requirements_GUI.md
+Last update: 14.04.2026
+
+Note for future maintenance:
+- When new implementation-aligned GUI features or behavior changes are added here, they should be date-stamped inline so the chronology stays visible.
 
 1. Scope and assumptions
 
@@ -63,7 +66,7 @@ Requirements_GUI.md
    * type or paste a raw prompt (plain text or markdown with `##` headers),
    * manually run each of the 8 pipeline stages in order,
    * inspect how `SuperPrompt` changes after each stage,
-   * run ingestion and choose the active Chroma DB.
+   * run ingestion and choose the active project / DB pair.
 
 2. This GUI is primarily for development and debugging, not for end users:
 
@@ -121,7 +124,8 @@ The intermediate GUI must provide at least the following UI elements:
 
      * It must take a folder path under `data/doc_raw` (e.g. `myroot/data/doc_raw/Project1`),
      * run the ingestion pipeline on all text/markdown files in that folder,
-     * create/update the corresponding Chroma DB in `data/chroma_db/Project1`.
+     * create/update the corresponding dense store in `data/chroma_db/Project1`,
+     * and create/update the corresponding sparse store in `data/splade_db/Project1`.
    * A small status area shows:
 
      * success message (number of files, project name),
@@ -130,13 +134,13 @@ The intermediate GUI must provide at least the following UI elements:
 5. Active DB selection
 
    * A dropdown or radio button group labeled “Active DB / Project”.
-   * Options correspond to directories under `data/chroma_db` (e.g. `Project1`, `Project2`, …).
-   * The currently selected project name is passed to Retrieval/ReRanker so they know which DB to query.
+   * Options correspond to project names known to the controller. In the current implementation this may be derived from the project folders under `data/doc_raw`, `data/chroma_db`, and `data/splade_db`.
+   * The currently selected project name is passed to Retrieval/ReRanker so they know which dense/sparse stores to query.
 
 6. Retrieval / ReRanker score display
 
    * The intermediate GUI must support score-aware inspection for Retrieval and ReRanker.
-   * After Retrieval, the GUI should be able to show the fused Retrieval order together with the component Retrieval signals used for that order.
+   * [14.04.2026] After Retrieval, the GUI should be able to show the fused Retrieval order together with the component Retrieval signals used for that order. In the current implementation this includes the fused retrieval score and the dense/SPLADE component signals.
    * After ReRanker, the GUI should be able to show the final reranked order together with the previous Retrieval ranking and the ReRanker-related score or rank data used for the fused final order.
 
 7. Minimal debug/status info
@@ -158,6 +162,7 @@ The intermediate GUI must provide at least the following UI elements:
 
      * `data/doc_raw/<project_name>`
      * `data/chroma_db/<project_name>`
+     * `data/splade_db/<project_name>`
 
 3. Button: “Add Files”
 
@@ -181,9 +186,10 @@ The intermediate GUI must provide at least the following UI elements:
 
 6. Chroma update behavior
 
-   * The automatic ingestion step must create or update the matching Chroma DB under:
+   * The automatic ingestion step must create or update the matching dense/sparse project stores under:
 
      * `data/chroma_db/<project_name>`
+     * `data/splade_db/<project_name>`
 
 7. Status behavior for the new buttons
 
@@ -237,7 +243,7 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
    * In addition to the prompt text, the resulting `prompt_ready` should include a simple textual list of all retrieved raw chunks (RAG context) at the bottom or in a clearly separated block.
 
    * The displayed order must reflect the final Retrieval ranking used by the stage.
-   * If the Retrieval stage uses more than one retrieval signal, the GUI may additionally show those component scores or ranks for debugging.
+   * [14.04.2026] In the current implementation, the GUI-compatible projection may show component Retrieval values such as fused Retrieval score, dense branch score, and SPLADE branch score for debugging.
 
    * For the intermediate GUI, this can be a minimal debug list, e.g.:
 
@@ -262,7 +268,7 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
      ```
 
    * The displayed order must reflect the final fused ReRanker result used by the stage.
-   * If the ReRanker stage uses more than one ranking signal, the GUI may additionally show those component scores or ranks for debugging.
+   * [14.04.2026] In the current implementation, the GUI-compatible projection may show ReRanker score together with the previous fused Retrieval score and the dense/SPLADE component signals for debugging.
 
 5. After “A3 – NLI Gate”
 
@@ -305,13 +311,19 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
    * copying the selected files into `data/doc_raw/<project_name>`,
    * and calling the existing ingestion pipeline for that same project.
 
-4. The hash/manifest file used by ingestion for a given project must be saved inside the matching Chroma DB project folder and use one standard filename (file_manifest.json)for all projects.
+4. [14.04.2026] In the current implementation, project creation creates all three aligned project folders:
 
-5. Therefore, the hash/manifest path must be project-scoped and aligned with the matching Chroma DB project path, i.e. it belongs inside:
+   * `data/doc_raw/<project_name>`
+   * `data/chroma_db/<project_name>`
+   * `data/splade_db/<project_name>`
+
+5. The hash/manifest file used by ingestion for a given project must be saved inside the matching Chroma DB project folder and use one standard filename (`file_manifest.json`) for all projects.
+
+6. Therefore, the hash/manifest path must be project-scoped and aligned with the matching Chroma DB project path, i.e. it belongs inside:
 
    * `data/chroma_db/<project_name>`
 
-6. This GUI requirement does not require changes to the internal ingestion backend; it only requires correct GUI/controller wiring for project-based ingestion.
+7. This GUI requirement does not require changes to the internal ingestion backend; it only requires correct GUI/controller wiring for project-based ingestion.
 
 3.3.4 Retrieval / ReRanker evolution compatibility
 
@@ -547,4 +559,4 @@ The following ideas are examples; they may change:
 
 1. Generation 3 is visionary only in this document.
 2. No layout, technology, or fixed feature set is decided yet.
-3. When Generation 2 is stable and in real use, selected ideas from Generation 3 can be promoted into their own detailed 
+3. When Generation 2 is stable and in real use, selected ideas from Generation 3 can be promoted into their own detailed requirement documents.

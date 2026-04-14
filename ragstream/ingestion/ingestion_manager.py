@@ -10,36 +10,7 @@ Scope:
     • This module focuses on the "documents" ingestion path only
       (conversation history layers are postponed as agreed).
     • Works with your existing loader, chunker, embedder, and Chroma vector store.
-
-Key responsibilities:
-    1) Build a list of current file Records by scanning a doc root/subfolder.
-    2) Load the previous manifest and compute a diff (what changed vs. last run).
-    3) For changed/new files: chunk → embed → upsert to VectorStoreChroma.
-       Optionally delete stale vectors from previous file versions.
-    4) Publish a new manifest atomically (tmp → replace) if the run succeeds.
-
-API:
-    IngestionManager(doc_root).run(
-        subfolder: str,
-        store: ChromaVectorStoreBase,
-        chunker: Chunker,
-        embedder: Embedder,
-        manifest_path: str,
-        *,
-        chunk_size: int = 500,
-        overlap: int = 100,
-        delete_old_versions: bool = True,
-        delete_tombstones: bool = False,
-    ) -> dict (stats)
-
-Data structures:
-    Record (from file_manifest.py):
-        {
-          "path":   "project1/file.md",  # relative to doc_root
-          "sha256": "<hex>",
-          "mtime":  <float>,
-          "size":   <int>
-        }
+    • Also supports an optional parallel SPLADE sparse-ingestion branch.
 
 Notes:
     • We compute file hashes from bytes on disk (compute_sha256), NOT from text.
@@ -51,13 +22,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
-# Local imports: your existing components
-from .loader import DocumentLoader          # returns [(abs_path, text), ...]
-from .chunker import Chunker                # split(file_path, text, chunk_size, overlap)
-from .embedder import Embedder              # embed(list[str]) -> list[list[float]]
-from .vector_store_chroma import VectorStoreChroma  # Chroma-backed store
+# Local imports: existing dense components
+from .loader import DocumentLoader
+from .chunker import Chunker
+from .embedder import Embedder
+from .vector_store_chroma import VectorStoreChroma
+
+# Added on 13.04.2026:
+# Optional sparse SPLADE ingestion components.
+from .splade_embedder import SpladeEmbedder
+from .vector_store_splade import VectorStoreSplade
 
 # Manifest utilities
 from .file_manifest import (
@@ -65,7 +41,7 @@ from .file_manifest import (
     load_manifest,
     diff as manifest_diff,
     publish_atomic,
-    Record,   # TypedDict
+    Record,
 )
 
 
@@ -81,21 +57,19 @@ class IngestionStats:
     deleted_old_versions: int
     deleted_tombstones: int
     published_manifest_path: str
-    embedded_bytes: int  # total UTF-8 bytes sent to the embedder in this run
+    embedded_bytes: int
+
+    # Added on 13.04.2026:
+    # Split counters for the parallel dense + sparse branches.
+    dense_vectors_upserted: int
+    sparse_vectors_upserted: int
+    dense_embedded_bytes: int
+    sparse_embedded_bytes: int
+
 
 class IngestionManager:
     """
     Coordinates the full ingestion pipeline for a given doc root.
-
-    Typical usage:
-        mgr = IngestionManager(doc_root="/.../data/doc_raw")
-        stats = mgr.run(
-            subfolder="project1",
-            store=VectorStoreChroma(persist_dir=".../data/chroma_db/project1"),
-            chunker=Chunker(),
-            embedder=Embedder(model="text-embedding-3-large"),
-            manifest_path="/.../data/file_manifest.json",
-        )
     """
 
     def __init__(self, doc_root: str) -> None:
@@ -112,10 +86,6 @@ class IngestionManager:
         # A loader is tied to a root; it returns absolute file paths + text for a subfolder
         self.loader = DocumentLoader(root=self.doc_root)
 
-    # -------------------------------------------------------------------------
-    # Public entrypoint
-    # -------------------------------------------------------------------------
-
     def run(
         self,
         subfolder: str,
@@ -124,40 +94,38 @@ class IngestionManager:
         embedder: Embedder,
         manifest_path: str,
         *,
-        chunk_size: int = 500,
-        overlap: int = 100,
+        sparse_store: VectorStoreSplade | None = None,
+        sparse_embedder: SpladeEmbedder | None = None,
+        chunk_size: int = 1200,
+        overlap: int = 120,
         delete_old_versions: bool = True,
         delete_tombstones: bool = False,
     ) -> IngestionStats:
         """
         Execute a full ingestion cycle for one subfolder under doc_root.
 
-        Steps:
-            1) Scan subfolder → build current Records (bytes hash, mtime, size).
-            2) Load previous manifest → diff → decide what to process.
-            3) For each changed/new file:
-                   - chunk (deterministic windows)
-                   - embed (batch)
-                   - upsert to Chroma (IDs: rel_path::sha256::idx; metadatas)
-                   - optionally delete old-version chunks (if path existed with other sha).
-            4) Optionally delete tombstone chunks (files removed from disk).
-            5) Publish new manifest atomically.
+        Dense branch is always active.
+        Sparse SPLADE branch is active only if both sparse_store and sparse_embedder are provided.
 
         Returns:
             IngestionStats with useful counters.
         """
         manifest_path = str(Path(manifest_path).resolve())
 
+        use_sparse = (sparse_store is not None) or (sparse_embedder is not None)
+        if use_sparse and (sparse_store is None or sparse_embedder is None):
+            raise ValueError(
+                "Sparse ingestion requires both sparse_store and sparse_embedder."
+            )
+
         # 1) Load documents (absolute path + raw text) from the subfolder.
-        docs = self.loader.load_documents(subfolder)  # [(abs_path, text), ...]
-        # Build a quick map from abs_path to text for later reuse.
+        docs = self.loader.load_documents(subfolder)
         text_by_abs: Dict[str, str] = {abs_path: text for abs_path, text in docs}
 
         # 2) Build current Records by hashing files on disk (bytes).
         records_now: List[Record] = []
         for abs_path, _text in docs:
             ap = Path(abs_path)
-            # relative path stored in manifest and metadata
             rel_path = ap.relative_to(self.doc_root).as_posix()
             sha = compute_sha256(abs_path)
             st = ap.stat()
@@ -172,16 +140,19 @@ class IngestionManager:
         manifest_prev = load_manifest(manifest_path)
         to_process, unchanged, tombstones = manifest_diff(records_now, manifest_prev)
 
-        # For old-version deletion we need a map: previous[path] -> prev_sha
         prev_by_path: Dict[str, Record] = {
             rec["path"]: rec for rec in manifest_prev.get("files", [])
         }
 
-        # 4) Process changed/new files (chunk → embed → upsert).
+        # 4) Process changed/new files (shared chunking pass → dense and optional sparse upsert).
         total_chunks = 0
-        total_upserts = 0
         total_deleted_old = 0
-        total_embedded_bytes = 0  # sum of UTF-8 bytes of all chunk_texts we embed this run
+
+        dense_upserts = 0
+        sparse_upserts = 0
+
+        dense_embedded_bytes = 0
+        sparse_embedded_bytes = 0
 
         for rec in to_process:
             rel_path = rec["path"]
@@ -190,11 +161,8 @@ class IngestionManager:
             abs_path = (self.doc_root / rel_path).as_posix()
             text = text_by_abs.get(abs_path)
             if text is None:
-                # Fallback: if loader skipped for some reason, read file now
-                # (should rarely happen, but keeps us robust).
                 text = Path(abs_path).read_text(encoding="utf-8", errors="ignore")
 
-            # Build chunks deterministically (same as your ad-hoc test).
             chunks = chunker.split(abs_path, text, chunk_size=chunk_size, overlap=overlap)
             chunk_texts: List[str] = []
             ids: List[str] = []
@@ -213,28 +181,31 @@ class IngestionManager:
                 })
 
             if not chunk_texts:
-                # Nothing to embed/store for this file—continue gracefully.
                 continue
 
-            # Optional: delete all chunks for the OLD version of this file (same path, different sha).
             if delete_old_versions and rel_path in prev_by_path:
                 sha_old = prev_by_path[rel_path]["sha256"]
                 if sha_old != sha_new:
-                    # Delete by metadata filter (explicit audit)
-                    before = self._count_ids(store, rel_path, sha_old)
-                    store.delete_where({"$and": [{"path": rel_path}, {"sha256": sha_old}]})
-                    after = self._count_ids(store, rel_path, sha_old)
-                    total_deleted_old += max(0, before - after)
+                    total_deleted_old += self._delete_file_version(store, rel_path, sha_old)
+                    if use_sparse and sparse_store is not None:
+                        total_deleted_old += self._delete_file_version(sparse_store, rel_path, sha_old)
 
-             # Count bytes that will be embedded (exact UTF-8 length of the texts we send).
             file_embedded_bytes = sum(len(s.encode("utf-8")) for s in chunk_texts)
-            total_embedded_bytes += file_embedded_bytes
-            # Embed + upsert in batches (embedder handles batching internally if needed).
-            vecs = embedder.embed(chunk_texts)
-            store.add(ids=ids, vectors=vecs, metadatas=metas)
+
+            # Dense branch
+            dense_vecs = embedder.embed(chunk_texts)
+            store.add(ids=ids, vectors=dense_vecs, metadatas=metas)
+            dense_upserts += len(ids)
+            dense_embedded_bytes += file_embedded_bytes
+
+            # Optional sparse branch
+            if use_sparse and sparse_store is not None and sparse_embedder is not None:
+                sparse_vecs = sparse_embedder.embed(chunk_texts)
+                sparse_store.add(ids=ids, vectors=sparse_vecs, metadatas=metas)
+                sparse_upserts += len(ids)
+                sparse_embedded_bytes += file_embedded_bytes
 
             total_chunks += len(chunk_texts)
-            total_upserts += len(ids)
 
         # 5) Optionally delete tombstones (files that disappeared from disk).
         total_deleted_tombs = 0
@@ -242,15 +213,15 @@ class IngestionManager:
             for prev_rec in tombstones:
                 rel_path = prev_rec["path"]
                 sha_prev = prev_rec["sha256"]
-                before = self._count_ids(store, rel_path, sha_prev)
-                store.delete_where({"$and": [{"path": rel_path}, {"sha256": sha_prev}]})
-                after = self._count_ids(store, rel_path, sha_prev)
-                total_deleted_tombs += max(0, before - after)
+
+                total_deleted_tombs += self._delete_file_version(store, rel_path, sha_prev)
+                if use_sparse and sparse_store is not None:
+                    total_deleted_tombs += self._delete_file_version(sparse_store, rel_path, sha_prev)
 
         # 6) Publish a fresh manifest that reflects the CURRENT disk state.
         manifest_new = {
             "version": "1",
-            "generated_at": "",   # publish_atomic will stamp UTC if empty
+            "generated_at": "",
             "files": records_now,
         }
         publish_atomic(manifest_new, manifest_path)
@@ -261,23 +232,54 @@ class IngestionManager:
             unchanged=len(unchanged),
             tombstones=len(tombstones),
             chunks_added=total_chunks,
-            vectors_upserted=total_upserts,
+            vectors_upserted=dense_upserts + sparse_upserts,
             deleted_old_versions=total_deleted_old,
             deleted_tombstones=total_deleted_tombs,
             published_manifest_path=manifest_path,
-            embedded_bytes=total_embedded_bytes,
+            embedded_bytes=dense_embedded_bytes + sparse_embedded_bytes,
+            dense_vectors_upserted=dense_upserts,
+            sparse_vectors_upserted=sparse_upserts,
+            dense_embedded_bytes=dense_embedded_bytes,
+            sparse_embedded_bytes=sparse_embedded_bytes,
         )
 
-    # -------------------------------------------------------------------------
-    # Small helpers
-    # -------------------------------------------------------------------------
+    @staticmethod
+    def _delete_file_version(store: Any, rel_path: str, sha256: str) -> int:
+        """
+        Remove all chunks belonging to one specific file version.
+
+        Uses the store's native delete_file_version(...) when available.
+        Falls back to metadata-filter delete_where(...) if needed.
+        """
+        if hasattr(store, "delete_file_version"):
+            return int(store.delete_file_version(rel_path, sha256))
+
+        before = IngestionManager._count_ids(store, rel_path, sha256)
+        store.delete_where({"$and": [{"path": rel_path}, {"sha256": sha256}]})
+        after = IngestionManager._count_ids(store, rel_path, sha256)
+        return max(0, before - after)
 
     @staticmethod
-    def _count_ids(store: VectorStoreChroma, rel_path: str, sha256: str) -> int:
+    def _count_ids(store: Any, rel_path: str, sha256: str) -> int:
         """
         Return how many IDs exist for a given (path, sha256) pair.
-        Used to report how many vectors were deleted during cleanup.
         """
-        res = store.collection.get(where={"$and": [{"path": rel_path}, {"sha256": sha256}]}, include=[])
-        ids = res.get("ids", []) if res else []
-        return len(ids)
+        # Dense Chroma store
+        if hasattr(store, "collection"):
+            res = store.collection.get(
+                where={"$and": [{"path": rel_path}, {"sha256": sha256}]},
+                include=[],
+            )
+            ids = res.get("ids", []) if res else []
+            return len(ids)
+
+        # Local sparse SPLADE store
+        meta_store = getattr(store, "_meta_store", None)
+        if isinstance(meta_store, dict):
+            return sum(
+                1
+                for meta in meta_store.values()
+                if meta.get("path") == rel_path and meta.get("sha256") == sha256
+            )
+
+        return 0

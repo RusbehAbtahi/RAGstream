@@ -11,3 +11,8 @@ powershell -ExecutionPolicy Bypass -File "C:\Users\roosb\Start-RAG.ps1"
 
 
 
+
+
+pkill -f "streamlit run"
+
+pkill -f "python -m streamlit"

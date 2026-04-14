@@ -224,6 +224,8 @@ training/slm_a2/runs/**
 .cache/
 
 
+MD_Gen/*
+doc/99-General_Local/*
 data/*
 !data/agents/
 !data/agents/**
