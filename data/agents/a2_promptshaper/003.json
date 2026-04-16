@@ -1,0 +1,113 @@
+{
+  "agent_meta": {
+    "agent_id": "a2_promptshaper",
+    "version": "003",
+    "agent_type": "Selector",
+    "name": "A2 PromptShaper – Meta Selector",
+    "description": "Chooses system, audience, tone, depth and confidence for downstream agents based on the current SuperPrompt.",
+    "tags": [
+      "prompt_shaping",
+      "meta_config",
+      "selector",
+      "ragstream"
+    ],
+    "enabled": true
+  },
+
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-4.1-mini",
+    "temperature": 0.0,
+    "max_tokens": 256,
+    "response_format": "json"
+  },
+
+  "static_prompt": {
+    "preamble": "You are a configuration assistant.\nYou never answer the user's question directly.",
+    "Agent Purpose": "Given the prompt under evaluation, choose suitable meta-settings so that the downstream agent can answer in a way that matches the user's goals and the RAGstream architecture.",
+    "Task": "Choose values for system, audience, tone, depth, and confidence.\nUse only the declared option ids.\nReturn only the required JSON object.",
+    "Hard Rules": "- Do not answer the original user request.\n- Use only allowed option ids from the declared decision targets.\n- Use only the declared output keys.\n- Do not return prose, comments, explanations, or extra keys.\n- Prefer roles aligned with RAG / agent-based workflows, Python tooling, AWS and cloud-native patterns, documentation-quality answers, and careful architectural thinking.\n- Prefer roles that reflect the user's strengths in embedded systems, Python, AWS, RAG, agents, requirements, and architectural design."
+  },
+
+  "dynamic_bindings": [
+    {
+      "id": "prompt_under_evaluation",
+      "prompt_text": "## Prompt Under Evaluation",
+      "bind_from": "A2.prompt_under_evaluation",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "decision_targets",
+      "prompt_text": "## Decision Targets",
+      "bind_from": "A2.decision_targets",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "required_output",
+      "prompt_text": "## Required Output",
+      "bind_from": "A2.required_output",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    }
+  ],
+
+  "decision_targets": [
+    {
+      "id": "system",
+      "label": "System roles for downstream agent",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 3,
+      "options": "a2_catalogs/003_option_catalogs_system.json"
+    },
+    {
+      "id": "audience",
+      "label": "Intended audience",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "options": "a2_catalogs/003_option_catalogs_rest.json"
+    },
+    {
+      "id": "tone",
+      "label": "Tone of downstream agent",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "options": "a2_catalogs/003_option_catalogs_rest.json"
+    },
+    {
+      "id": "depth",
+      "label": "Response depth",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "options": "a2_catalogs/003_option_catalogs_rest.json"
+    },
+    {
+      "id": "confidence",
+      "label": "Configuration confidence",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "options": "a2_catalogs/003_option_catalogs_rest.json"
+    }
+  ],
+
+  "output_schema": {
+    "format": "json",
+    "type": "object",
+    "fields": [
+      { "field_id": "system", "result_key": "system" },
+      { "field_id": "audience", "result_key": "audience" },
+      { "field_id": "tone", "result_key": "tone" },
+      { "field_id": "depth", "result_key": "depth" },
+      { "field_id": "confidence", "result_key": "confidence" }
+    ]
+  }
+}

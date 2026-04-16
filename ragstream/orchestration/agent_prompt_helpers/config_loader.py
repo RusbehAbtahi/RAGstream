@@ -4,17 +4,22 @@ config_loader
 =============
 
 Why this helper exists:
-- Agent JSON configs contain a 'fields' list with enums, defaults and cardinality.
-- Converting this list into clean Python dictionaries is generic logic and should
+- Agent JSON configs define decision targets with enums, defaults and selection counts.
+- Converting these targets into clean Python dictionaries is generic logic and should
   not clutter AgentPrompt.
 
 What it does:
 - Provides a single function `extract_field_config(fields_cfg)` that returns:
-  - enums[field_id] = list of allowed option ids.
-  - defaults[field_id] = default value from config (may be str or list).
-  - cardinality[field_id] = "one" or "many".
-  - option_labels[field_id][opt_id] = human-readable label (optional).
-  - option_descriptions[field_id][opt_id] = human-readable description (optional).
+  - enums[field_id] = list of allowed option ids
+  - defaults[field_id] = default value from config (may be str or list)
+  - cardinality[field_id] = "one" or "many"
+  - option_labels[field_id][opt_id] = human-readable label (optional)
+  - option_descriptions[field_id][opt_id] = human-readable description (optional)
+
+Compatibility:
+- Works with the new `decision_targets` structure.
+- Also tolerates older inline `fields` configs, as long as they use the same
+  basic keys (`id`, `type`, `options`, `default`, `cardinality`).
 """
 
 from __future__ import annotations
@@ -32,8 +37,7 @@ def extract_field_config(
     Dict[str, Dict[str, str]],
 ]:
     """
-    Convert the JSON 'fields' list into enums/defaults/cardinality/option_descriptions/option_labels.
-
+    Convert decision targets / fields into:
     - enums[field_id] = ["opt1", "opt2", ...]
     - defaults[field_id] = default value from config (may be str or list)
     - cardinality[field_id] = "one" | "many"
@@ -53,20 +57,27 @@ def extract_field_config(
 
         field_type = field.get("type", "enum")
         if field_type != "enum":
-            # For v1, AgentPrompt only supports enum-based Chooser behaviour.
-            # Writer / Extractor / Scorer can be handled later.
+            # For v1 implementation, AgentPrompt only supports enum-based Selector behaviour.
             continue
 
         options = field.get("options", []) or []
+        if not isinstance(options, list):
+            options = []
+
         allowed_ids: List[str] = []
         descs: Dict[str, str] = {}
         labels: Dict[str, str] = {}
 
         for opt in options:
+            if not isinstance(opt, dict):
+                continue
+
             opt_id = opt.get("id")
             if not opt_id:
                 continue
+
             allowed_ids.append(opt_id)
+
             if "label" in opt:
                 labels[opt_id] = opt["label"]
             if "description" in opt:
@@ -80,6 +91,14 @@ def extract_field_config(
                 option_descriptions[field_id] = descs
 
         defaults[field_id] = field.get("default")
-        cardinality[field_id] = field.get("cardinality", "one")
+
+        if "cardinality" in field:
+            cardinality[field_id] = field.get("cardinality", "one")
+        else:
+            try:
+                max_selected = int(field.get("max_selected", 1))
+            except Exception:
+                max_selected = 1
+            cardinality[field_id] = "many" if max_selected > 1 else "one"
 
     return enums, defaults, cardinality, option_descriptions, option_labels

@@ -226,6 +226,7 @@ training/slm_a2/runs/**
 
 MD_Gen/*
 doc/99-General_Local/*
+doc/03-Projekt_Status/AI_Reports/*
 data/*
 !data/agents/
 !data/agents/**

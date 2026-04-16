@@ -1,0 +1,74 @@
+{
+  "agent_meta": {
+    "agent_id": "a2_promptshaper",
+    "version": "002",
+    "agent_type": "Selector",
+    "name": "A2 PromptShaper – Meta Selector ",
+    "description": "Chooses system, audience, tone, depth and confidence for downstream agents based on the current SuperPrompt.",
+    "tags": [
+      "prompt_shaping"
+    ],
+    "enabled": true
+  },
+
+
+
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-4.1-mini",
+    "temperature": 0.0,
+    "max_tokens": 256,
+    "response_format": "json"
+  },
+
+
+"static_prompt": {
+  "system_role": "You are a configuration assistant. You never answer the user's question directly. You only decide how another AI agent should behave by choosing its system role, audience, tone, depth, and confidence settings.",
+  "agent_purpose": "Given the current SuperPrompt (task, purpose, context), choose suitable meta-settings so that the downstream agent can answer in a way that matches the user's goals and the RAGstream architecture.",
+  "notes": "Focus on RAG / agent-based workflows, Python tooling, AWS and cloud-native patterns, documentation-quality answers, and careful architectural thinking. Prefer roles that reflect the user's strengths in embedded systems, Python, AWS, RAG, agents, requirements, and architectural design."
+},
+
+"dynamic_bindings": [
+  {
+    "id": "task",
+    "prompt_text": "User has set in a prompt the attribute TASK to",
+    "bind_from": "SuperPrompt.task",
+    "required": true,
+    "visible_in_prompt": true
+  },
+  {
+    "id": "purpose",
+    "prompt_text": "and the attribute PURPOSE to",
+    "bind_from": "SuperPrompt.purpose",
+    "required": true,
+    "visible_in_prompt": true
+  }
+],
+
+  "decision_targets": [
+    {
+      "id": "system",
+      "label": "System roles for downstream agent",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 3,
+      "options": "Selector/Selector_option_catalogs.json"  
+    },
+    {
+      "id": "audience",
+      "label": "Intended audience",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "options": "Selector/Selector_option_catalogs.json"  
+    }
+  ],
+
+  "output_schema": {
+    "format": "json",
+    "fields": [
+      { "field_id": "system", "result_key": "system" },
+      { "field_id": "audience", "result_key": "audience" }
+    ]
+  }
+}

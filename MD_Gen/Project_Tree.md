@@ -94,9 +94,20 @@
     │   ├── conversations.json
     │   └── file_manifest.json
     ├── agents
-    │   └── a2_promptshaper
+    │   ├── Template
+    │   │   └── Selector.json
+    │   ├── a2_promptshaper
+    │   │   ├── 003.json
+    │   │   ├── Old_Versions
+    │   │   │   ├── 001.json
+    │   │   │   └── 002.json
+    │   │   └── a2_catalogs
+    │   │       ├── 003_option_catalogs_rest.json
+    │   │       └── 003_option_catalogs_system.json
+    │   └── a3_nli_gate
     │       ├── 001.json
-    │       └── 002.json
+    │       └── a3_catalogs
+    │           └── 001_option_catalogs_labels.json
     ├── chroma_db
     │   └── TEST1
     │       ├── 7d1b9acf-cab6-4940-a157-075a9750a3b6

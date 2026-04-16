@@ -26,13 +26,6 @@ if TYPE_CHECKING:
 class SuperPromptProjector:
     """
     Projection / render helper around one SuperPrompt instance.
-
-    Main responsibilities:
-    - render System_MD
-    - render Prompt_MD
-    - render Related Context preview
-    - compose prompt_ready
-    - project retrieval query text from SuperPrompt
     """
 
     def __init__(self, sp: "SuperPrompt") -> None:
@@ -42,14 +35,6 @@ class SuperPromptProjector:
 
     @staticmethod
     def build_query_text(sp: "SuperPrompt") -> str:
-        """
-        Build a retrieval-oriented query text from the structured SuperPrompt body.
-
-        Current design choice:
-        - Use only TASK / PURPOSE / CONTEXT.
-        - Keep the order explicit and stable.
-        - Skip empty fields.
-        """
         if sp is None:
             raise ValueError("SuperPromptProjector.build_query_text: 'sp' must not be None")
 
@@ -88,14 +73,6 @@ class SuperPromptProjector:
         return query_text
 
     def compose_prompt_ready(self) -> str:
-        """
-        Central render method for the current SuperPrompt.
-
-        Purpose:
-        - Build a single display/send-ready markdown text from the current object state.
-        - Work already for PreProcessing and A2, where no chunks exist yet.
-        - Also work for Retrieval and later stages, where chunk-based context may exist.
-        """
         self.sp.System_MD = self._render_system_md()
         self.sp.Prompt_MD = self._render_prompt_md()
 
@@ -121,12 +98,6 @@ class SuperPromptProjector:
         return self.sp.prompt_ready
 
     def _render_system_md(self) -> str:
-        """
-        Render the high-authority system/config part from sp.body.
-
-        This method is intentionally deterministic and simple.
-        It does not depend on retrieval artifacts.
-        """
         lines: List[str] = []
 
         system_value = (self.sp.body.get("system") or "").strip()
@@ -159,13 +130,6 @@ class SuperPromptProjector:
         return "\n".join(lines).strip()
 
     def _render_prompt_md(self) -> str:
-        """
-        Render the user-facing prompt part from sp.body.
-
-        This method is designed to cover:
-        - raw / preprocessed / a2 stages without any chunk context
-        - later stages as well, because the canonical prompt body remains the same
-        """
         lines: List[str] = []
 
         task_value = (self.sp.body.get("task") or "").strip()
@@ -202,30 +166,15 @@ class SuperPromptProjector:
         return "\n".join(lines).strip()
 
     def _format_score(self, score: float) -> str:
-        """
-        Format numeric scores compactly for the Related Context headers.
-        """
         return f"{float(score):.8f}".rstrip("0").rstrip(".")
 
     def _render_related_context_md(self) -> str:
         """
         Render a chunk-based context preview from the current selected chunks.
 
-        Design intention:
-        - The GUI should show only the selected chunk texts.
-        - During Retrieval, show:
-            Rt     = final fused Retrieval score
-            Emb    = dense branch score
-            Splade = sparse branch score
-        - During ReRanker, show:
-            Rnk   = final fused rerank RRF score
-            RcolB = ColBERT score
-            Rt    = final fused Retrieval score from the previous stage
-        - For other stages, keep the header simple.
-        - Technical metadata such as ID, source, status, and span remain
-          inside SuperPrompt as internal structured data and are not rendered here.
-        - If no chunks exist yet, this method returns an empty string and the caller
-          simply skips the section.
+        During A3, show:
+            selection_band at block level
+            usefulness judgment per chunk
         """
         ordered_chunks = self._get_ordered_context_chunks()
         if not ordered_chunks:
@@ -241,9 +190,20 @@ class SuperPromptProjector:
             for chunk_id, score, _status in self.sp.views_by_stage.get("reranked", [])
         }
 
+        a3_decision_map: Dict[str, Dict[str, Any]] = {}
+        raw_a3_decisions = self.sp.extras.get("a3_item_decisions", {})
+        if isinstance(raw_a3_decisions, dict):
+            a3_decision_map = raw_a3_decisions
+
+        selection_band = str(self.sp.extras.get("a3_selection_band", "") or "").strip()
+
         lines: List[str] = []
         lines.append("## Related Context")
         lines.append("")
+
+        if self.sp.stage == "a3" and selection_band:
+            lines.append(f"Selection band: {selection_band}")
+            lines.append("")
 
         chunk_counter = 1
         for chunk_obj in ordered_chunks:
@@ -291,6 +251,12 @@ class SuperPromptProjector:
                 if score_parts:
                     header = f"{header} [{', '.join(score_parts)}]"
 
+            elif self.sp.stage == "a3":
+                decision = a3_decision_map.get(chunk_obj.id, {})
+                usefulness = str(decision.get("usefulness_label", "") or "").strip()
+                if usefulness:
+                    header = f"{header} [Use={usefulness}]"
+
             lines.append(header)
             lines.append("")
             lines.append(chunk_obj.snippet.strip())
@@ -301,9 +267,6 @@ class SuperPromptProjector:
 
     @staticmethod
     def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:
-        """
-        Safely read one numeric value from chunk metadata.
-        """
         if not isinstance(meta, dict):
             return None
         value = meta.get(key)
@@ -315,14 +278,6 @@ class SuperPromptProjector:
             return None
 
     def _get_ordered_context_chunks(self) -> List["Chunk"]:
-        """
-        Return the currently relevant chunks in the intended display order.
-
-        Order policy:
-        1. If final_selection_ids exists, use that order.
-        2. Otherwise, if the current stage has a view in views_by_stage, use that order.
-        3. Otherwise, fall back to the raw order of base_context_chunks.
-        """
         if not self.sp.base_context_chunks:
             return []
 
@@ -331,6 +286,14 @@ class SuperPromptProjector:
             chunk_by_id[chunk_obj.id] = chunk_obj
 
         ordered_chunks: List["Chunk"] = []
+
+        if self.sp.stage == "a3" and "a3" in self.sp.views_by_stage:
+            stage_rows = self.sp.views_by_stage["a3"]
+            for row in stage_rows:
+                chunk_id = row[0]
+                if chunk_id in chunk_by_id:
+                    ordered_chunks.append(chunk_by_id[chunk_id])
+            return ordered_chunks
 
         if self.sp.final_selection_ids:
             for chunk_id in self.sp.final_selection_ids:

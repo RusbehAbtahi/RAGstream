@@ -105,6 +105,8 @@ def main() -> None:
         st.session_state.sp_rtv = SuperPrompt()
     if "sp_rrk" not in st.session_state:
         st.session_state.sp_rrk = SuperPrompt()
+    if "sp_a3" not in st.session_state:
+        st.session_state.sp_a3 = SuperPrompt()
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
     if "ingestion_status" not in st.session_state:
@@ -267,24 +269,34 @@ def main() -> None:
         with b1c4:
             clicked_reranker = st.button("ReRanker", key="btn_reranker", use_container_width=True)
             if clicked_reranker:
-          #      try:
-                    ctrl: AppController = st.session_state.controller
-                    sp: SuperPrompt = st.session_state.sp
+                ctrl: AppController = st.session_state.controller
+                sp: SuperPrompt = st.session_state.sp
 
-                    sp = ctrl.run_reranker(sp)
-                    sp.compose_prompt_ready()
+                sp = ctrl.run_reranker(sp)
+                sp.compose_prompt_ready()
 
-                    st.session_state.sp = sp
-                    st.session_state.sp_rrk = copy.deepcopy(sp)
-                    st.session_state["super_prompt_text"] = sp.prompt_ready
-
-             #   except Exception as e:
-                #    st.error(str(e))
+                st.session_state.sp = sp
+                st.session_state.sp_rrk = copy.deepcopy(sp)
+                st.session_state["super_prompt_text"] = sp.prompt_ready
 
         # Row 2: 4 buttons
         b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")
         with b2c1:
-            st.button("A3 NLI Gate", key="btn_a3", use_container_width=True)
+            clicked_a3 = st.button("A3 NLI Gate", key="btn_a3", use_container_width=True)
+            if clicked_a3:
+                try:
+                    ctrl: AppController = st.session_state.controller
+                    sp: SuperPrompt = st.session_state.sp
+
+                    sp = ctrl.run_a3(sp)
+
+                    st.session_state.sp = sp
+                    st.session_state.sp_a3 = copy.deepcopy(sp)
+                    st.session_state["super_prompt_text"] = sp.prompt_ready
+
+                except Exception as e:
+                    st.error(str(e))
+
         with b2c2:
             st.button("A4 Condenser", key="btn_a4", use_container_width=True)
         with b2c3:

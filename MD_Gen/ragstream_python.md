@@ -58,6 +58,7 @@ from ragstream.preprocessing.preprocessing import preprocess
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
 from ragstream.agents.a2_promptshaper import A2PromptShaper
+from ragstream.agents.a3_nli_gate import A3NLIGate
 
 # Added on 10.03.2026:
 # Project-based document ingestion is wired here only at controller level.
@@ -86,6 +87,7 @@ class AppController:
           you used in your original working version.
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
+        - Creates the A3NLIGate agent.
         - Creates the Retrieval stage object.
         """
         # PreProcessing schema (OLD, working behaviour)
@@ -99,6 +101,12 @@ class AppController:
 
         # A2 agent
         self.a2_promptshaper = A2PromptShaper(
+            agent_factory=self.agent_factory,
+            llm_client=self.llm_client,
+        )
+
+        # A3 agent
+        self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
             llm_client=self.llm_client,
         )
@@ -146,6 +154,24 @@ class AppController:
         Run A2 on the current SuperPrompt.
         """
         return self.a2_promptshaper.run(sp)
+
+    def run_a3(self, sp: SuperPrompt) -> SuperPrompt:
+        """
+        Run A3 on the current SuperPrompt.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt, typically after ReRanker.
+
+        Returns:
+            Updated SuperPrompt after A3 has populated:
+            - views_by_stage["a3"]
+            - extras["a3_selection_band"]
+            - extras["a3_item_decisions"]
+            - final_selection_ids
+            - stage / history_of_stages
+        """
+        return self.a3_nli_gate.run(sp)
 
     # Added on 18.03.2026:
     # Small demo helper for the future memory view in the GUI.
@@ -1109,6 +1135,8 @@ def main() -> None:
         st.session_state.sp_rtv = SuperPrompt()
     if "sp_rrk" not in st.session_state:
         st.session_state.sp_rrk = SuperPrompt()
+    if "sp_a3" not in st.session_state:
+        st.session_state.sp_a3 = SuperPrompt()
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
     if "ingestion_status" not in st.session_state:
@@ -1271,24 +1299,34 @@ def main() -> None:
         with b1c4:
             clicked_reranker = st.button("ReRanker", key="btn_reranker", use_container_width=True)
             if clicked_reranker:
-          #      try:
-                    ctrl: AppController = st.session_state.controller
-                    sp: SuperPrompt = st.session_state.sp
+                ctrl: AppController = st.session_state.controller
+                sp: SuperPrompt = st.session_state.sp
 
-                    sp = ctrl.run_reranker(sp)
-                    sp.compose_prompt_ready()
+                sp = ctrl.run_reranker(sp)
+                sp.compose_prompt_ready()
 
-                    st.session_state.sp = sp
-                    st.session_state.sp_rrk = copy.deepcopy(sp)
-                    st.session_state["super_prompt_text"] = sp.prompt_ready
-
-             #   except Exception as e:
-                #    st.error(str(e))
+                st.session_state.sp = sp
+                st.session_state.sp_rrk = copy.deepcopy(sp)
+                st.session_state["super_prompt_text"] = sp.prompt_ready
 
         # Row 2: 4 buttons
         b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")
         with b2c1:
-            st.button("A3 NLI Gate", key="btn_a3", use_container_width=True)
+            clicked_a3 = st.button("A3 NLI Gate", key="btn_a3", use_container_width=True)
+            if clicked_a3:
+                try:
+                    ctrl: AppController = st.session_state.controller
+                    sp: SuperPrompt = st.session_state.sp
+
+                    sp = ctrl.run_a3(sp)
+
+                    st.session_state.sp = sp
+                    st.session_state.sp_a3 = copy.deepcopy(sp)
+                    st.session_state["super_prompt_text"] = sp.prompt_ready
+
+                except Exception as e:
+                    st.error(str(e))
+
         with b2c2:
             st.button("A4 Condenser", key="btn_a4", use_container_width=True)
         with b2c3:
@@ -3450,7 +3488,6 @@ class VectorStoreSplade(SpladeVectorStoreBase):
 AgentFactory
 ============
 
-
 - This is the single place where AgentPrompt objects are created from JSON configs.
 - It hides all file-system details (where JSON lives, how paths are built).
 - It also caches created agents, so JSON is read only once per (agent_id, version).
@@ -3458,7 +3495,7 @@ AgentFactory
 Usage model (high level):
 - Controller creates ONE AgentFactory instance at startup.
 - Each Agent (A2, A3, ...) asks this factory for its AgentPrompt:
-    factory.get_agent("a2_promptshaper", "001")
+    factory.get_agent("a2_promptshaper", "003")
 - The returned AgentPrompt is then used to compose/parse LLM calls.
 """
 
@@ -3483,33 +3520,7 @@ class AgentFactory:
     """
 
     def __init__(self, agents_root: Optional[Path] = None) -> None:
-        """
-        Initialize the factory.
-
-        Parameters
-        ----------
-        agents_root:
-            Optional base directory where all agent JSON configs live.
-            If None, we derive it from the package layout assuming the repo root
-            looks like:
-
-                RAGstream/
-                    data/
-                        agents/
-                            a2_promptshaper/001.json
-                    ragstream/
-                        orchestration/
-                            agent_factory.py
-                        ...
-
-            In that case:
-                repo_root = Path(__file__).resolve().parents[2]
-                agents_root = repo_root / "data" / "agents"
-        """
         if agents_root is None:
-            # Go from ragstream/orchestration/agent_factory.py
-            #   -> ragstream/
-            #   -> RAGstream/ (repo root)
             repo_root = Path(__file__).resolve().parents[2]
             agents_root = repo_root / "data" / "agents"
 
@@ -3519,69 +3530,174 @@ class AgentFactory:
         SimpleLogger.info(f"AgentFactory initialized with agents_root={self.agents_root}")
 
     # ------------------------------------------------------------------
-    # Internal path builder
+    # Internal helpers
     # ------------------------------------------------------------------
 
     def _build_config_path(self, agent_id: str, version: str) -> Path:
-        """
-        Internal helper: compute the JSON config path for a given agent_id/version.
-
-        Example:
-            agent_id = "a2_promptshaper"
-            version  = "001"
-        Path becomes:
-            <agents_root>/a2_promptshaper/001.json
-        """
         return self.agents_root / agent_id / f"{version}.json"
+
+    def _load_json_file(self, path: Path) -> Dict[str, Any]:
+        if not path.is_file():
+            msg = f"AgentFactory: JSON file not found at {path}"
+            SimpleLogger.error(msg)
+            raise FileNotFoundError(msg)
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            msg = f"AgentFactory: failed to load JSON from {path}: {exc}"
+            SimpleLogger.error(msg)
+            raise RuntimeError(msg) from exc
+
+        if not isinstance(data, dict):
+            msg = f"AgentFactory: top-level JSON in {path} must be an object/dict"
+            SimpleLogger.error(msg)
+            raise ValueError(msg)
+
+        return data
+
+    def _extract_catalog_block(
+        self,
+        *,
+        catalog: Dict[str, Any],
+        target_id: str,
+        catalog_path: Path,
+    ) -> Dict[str, Any]:
+        """
+        Extract one decision-target block from an external catalog.
+
+        Supported neutral shapes:
+
+        1) Wrapped-by-target_id
+           {
+             "system": {
+               "options": [...],
+               "default": ...
+             }
+           }
+
+        2) Direct/root block
+           {
+             "options": [...],
+             "default": ...
+           }
+
+        3) Single-valid-block fallback
+           {
+             "<some_other_name>": {
+               "options": [...],
+               "default": ...
+             }
+           }
+
+        Shape (3) remains neutral and is accepted only when there is exactly
+        one valid block in the catalog, so no agent-specific logic is needed.
+        """
+        exact_block = catalog.get(target_id)
+        if isinstance(exact_block, dict):
+            return exact_block
+
+        root_options = catalog.get("options")
+        if isinstance(root_options, list):
+            return catalog
+
+        valid_blocks: Dict[str, Dict[str, Any]] = {}
+        for key, value in catalog.items():
+            if isinstance(value, dict) and isinstance(value.get("options"), list):
+                valid_blocks[key] = value
+
+        if len(valid_blocks) == 1:
+            block_name, block = next(iter(valid_blocks.items()))
+            SimpleLogger.info(
+                "AgentFactory: catalog fallback accepted single valid block "
+                f"'{block_name}' for decision_target id='{target_id}' from {catalog_path}"
+            )
+            return block
+
+        msg = (
+            f"AgentFactory: catalog {catalog_path} does not contain a valid block "
+            f"for decision_target id='{target_id}'"
+        )
+        SimpleLogger.error(msg)
+        raise KeyError(msg)
+
+    def _resolve_decision_targets(
+        self,
+        *,
+        config: Dict[str, Any],
+        cfg_path: Path,
+    ) -> Dict[str, Any]:
+        """
+        Resolve external catalog references inside decision_targets.
+
+        Neutral convention:
+        - main config contains decision_targets
+        - each target may point to an external catalog file via:
+              "options": "a2_catalogs/003_option_catalogs_system.json"
+        - supported external catalog shapes are handled by _extract_catalog_block()
+
+        Result:
+        - options path string is replaced by the real inline options list
+        - default from the catalog is copied into the decision target
+        """
+        targets = config.get("decision_targets")
+        if not isinstance(targets, list):
+            return config
+
+        resolved_targets = []
+        base_dir = cfg_path.parent
+
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+
+            target_id = target.get("id")
+            if not target_id:
+                continue
+
+            resolved = dict(target)
+            options_ref = resolved.get("options")
+
+            if isinstance(options_ref, str):
+                catalog_path = base_dir / options_ref
+                catalog = self._load_json_file(catalog_path)
+                block = self._extract_catalog_block(
+                    catalog=catalog,
+                    target_id=str(target_id),
+                    catalog_path=catalog_path,
+                )
+
+                options_list = block.get("options", [])
+                if not isinstance(options_list, list):
+                    msg = (
+                        f"AgentFactory: catalog block for '{target_id}' in {catalog_path} "
+                        f"has invalid 'options' (expected list)"
+                    )
+                    SimpleLogger.error(msg)
+                    raise ValueError(msg)
+
+                resolved["options"] = options_list
+
+                if "default" in block:
+                    resolved["default"] = block["default"]
+
+            resolved_targets.append(resolved)
+
+        config["decision_targets"] = resolved_targets
+        return config
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def load_config(self, agent_id: str, version: str) -> Dict[str, Any]:
-        """
-        Load the raw JSON config for a given agent_id and version.
-
-        Responsibilities:
-        - Build the file path.
-        - Read JSON from disk.
-        - Raise a clear error if the file does not exist or is invalid.
-
-        This method does NOT cache anything; it just returns the config dict.
-        """
         cfg_path = self._build_config_path(agent_id, version)
-
-        if not cfg_path.is_file():
-            msg = f"AgentFactory: config not found for {agent_id=} {version=} at {cfg_path}"
-            SimpleLogger.error(msg)
-            raise FileNotFoundError(msg)
-
-        try:
-            with cfg_path.open("r", encoding="utf-8") as f:
-                config: Dict[str, Any] = json.load(f)
-        except Exception as exc:
-            msg = f"AgentFactory: failed to load JSON config from {cfg_path}: {exc}"
-            SimpleLogger.error(msg)
-            raise
-
+        config = self._load_json_file(cfg_path)
+        config = self._resolve_decision_targets(config=config, cfg_path=cfg_path)
         return config
 
     def get_agent(self, agent_id: str, version: str = "001") -> AgentPrompt:
-        """
-        Return an AgentPrompt instance for the given (agent_id, version).
-
-        Responsibilities:
-        - Check the in-memory cache first.
-        - If not present:
-            - Load the JSON config.
-            - Build AgentPrompt via AgentPrompt.from_config(config).
-            - Store it in the cache.
-        - Always return the same AgentPrompt instance for the same key.
-
-        This ensures:
-        - We only hit the file system once per agent/version.
-        - All callers share the same AgentPrompt configuration object.
-        """
         key = (agent_id, version)
         if key in self._cache:
             return self._cache[key]
@@ -3596,16 +3712,6 @@ class AgentFactory:
         return agent
 
     def clear_cache(self) -> None:
-        """
-        Clear the internal cache of AgentPrompt instances.
-
-        Why this exists:
-        - Mostly for testing or advanced scenarios (e.g. live-reloading configs).
-        - In normal operation you probably never call this.
-
-        Behavior:
-        - Simply empties the cache dict; no further side effects.
-        """
         self._cache.clear()
         SimpleLogger.info("AgentFactory: cache cleared")
 ```
@@ -3623,11 +3729,15 @@ This file only:
 - Defines AgentPromptValidationError (small helper exception).
 - Delegates JSON parsing, field config extraction, normalization and text
   composition to helper modules in agent_prompt_helpers.
+
+Neutrality rule:
+- No agent-specific visible wording is invented here.
+- Visible prompt wording must come from JSON or from the agent runtime payload.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 from ragstream.utils.logging import SimpleLogger
 from ragstream.orchestration.agent_prompt_helpers.config_loader import (
@@ -3645,7 +3755,8 @@ from ragstream.orchestration.agent_prompt_helpers.field_normalizer import (
 )
 from ragstream.orchestration.agent_prompt_helpers.compose_texts import (
     build_system_text,
-    build_user_text_for_chooser,
+    build_user_text_for_selector,
+    build_user_text_for_classifier,
 )
 
 
@@ -3667,8 +3778,9 @@ class AgentPrompt:
         agent_name: str,
         version: str,
         mode: str,
-        system_text: str,
-        purpose_text: str,
+        static_prompt: Dict[str, Any],
+        dynamic_bindings: List[Dict[str, Any]],
+        decision_targets: List[Dict[str, Any]],
         output_schema: Dict[str, Any],
         enums: Dict[str, List[str]],
         defaults: Dict[str, Any],
@@ -3681,70 +3793,89 @@ class AgentPrompt:
     ) -> None:
         self.agent_name: str = agent_name
         self.version: str = version
-        self.mode: str = mode  # "chooser" | "writer" | "extractor" | "scorer"
-        self.system_text: str = system_text
-        self.purpose_text: str = purpose_text
+        self.mode: str = mode  # "selector" | "classifier" | "writer" | "extractor" | "scorer"
+
+        self.static_prompt: Dict[str, Any] = static_prompt
+        self.dynamic_bindings: List[Dict[str, Any]] = dynamic_bindings
+        self.decision_targets: List[Dict[str, Any]] = decision_targets
         self.output_schema: Dict[str, Any] = output_schema
 
-        # Per-field configuration
         self.enums: Dict[str, List[str]] = enums
         self.defaults: Dict[str, Any] = defaults
         self.cardinality: Dict[str, str] = cardinality
         self.option_descriptions: Dict[str, Dict[str, str]] = option_descriptions
         self.option_labels: Dict[str, Dict[str, str]] = option_labels
 
-        # Model configuration
         self.model_name: str = model_name
         self.temperature: float = temperature
         self.max_output_tokens: int = max_output_tokens
 
-        # Derived mapping: field_id -> result_key in JSON
         self._result_keys: Dict[str, str] = build_result_key_map(output_schema)
+        self._top_level_result_keys: Dict[str, str] = self._build_field_map(
+            output_schema.get("top_level_fields", []) or []
+        )
+        self._item_result_keys: Dict[str, str] = self._build_field_map(
+            output_schema.get("item_fields", []) or []
+        )
 
-        if self.mode not in ("chooser", "writer", "extractor", "scorer"):
+        if self.mode not in ("selector", "classifier", "writer", "extractor", "scorer"):
             SimpleLogger.error(f"AgentPrompt[{self.agent_name}] unknown mode: {self.mode}")
 
-    # ------------------------------------------------------------------
-    # Construction helpers
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _build_field_map(fields_cfg: List[Dict[str, Any]]) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for field in fields_cfg:
+            field_id = field.get("field_id")
+            if not field_id:
+                continue
+            result[field_id] = field.get("result_key", field_id)
+        return result
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "AgentPrompt":
-        """
-        Build AgentPrompt from a JSON config dict as stored in data/agents/...
-
-        Expects an A2-style schema with:
-          - agent_meta
-          - prompt_profile
-          - llm_config
-          - fields
-          - output_schema
-        """
-        agent_meta = config.get("agent_meta", {})
-        prompt_profile = config.get("prompt_profile", {})
-        llm_cfg = config.get("llm_config", {})
-        fields_cfg = config.get("fields", []) or []
+        agent_meta = config.get("agent_meta", {}) or {}
+        llm_cfg = config.get("llm_config", {}) or {}
         output_schema = config.get("output_schema", {}) or {}
+
+        static_prompt = config.get("static_prompt", {}) or {}
+        dynamic_bindings = config.get("dynamic_bindings", []) or []
+        decision_targets = config.get("decision_targets", []) or []
+
+        if not static_prompt:
+            prompt_profile = config.get("prompt_profile", {}) or {}
+            static_prompt = {
+                "system_role": prompt_profile.get("system_role", ""),
+                "agent_purpose": prompt_profile.get("agent_purpose", ""),
+                "notes": prompt_profile.get("notes", ""),
+            }
+
+        if not decision_targets:
+            decision_targets = config.get("fields", []) or []
 
         agent_name = agent_meta.get("agent_id") or agent_meta.get("agent_name") or "unknown_agent"
         version = str(agent_meta.get("version", "000"))
-        mode = agent_meta.get("agent_type", "chooser")
 
-        system_text = prompt_profile.get("system_role", "")
-        purpose_text = prompt_profile.get("agent_purpose", "")
+        raw_mode = str(agent_meta.get("agent_type", "selector")).strip().lower()
+        mode_aliases = {
+            "chooser": "selector",
+            "multi-chooser": "classifier",
+            "multi_chooser": "classifier",
+        }
+        mode = mode_aliases.get(raw_mode, raw_mode)
 
-        model_name = llm_cfg.get("model_name", "gpt-5.1-mini")
+        model_name = llm_cfg.get("model_name", "gpt-4.1-mini")
         temperature = float(llm_cfg.get("temperature", 0.0))
         max_tokens = int(llm_cfg.get("max_tokens", 256))
 
-        enums, defaults, cardinality, opt_desc, opt_labels = extract_field_config(fields_cfg)
+        enums, defaults, cardinality, opt_desc, opt_labels = extract_field_config(decision_targets)
 
         return cls(
             agent_name=agent_name,
             version=version,
             mode=mode,
-            system_text=system_text,
-            purpose_text=purpose_text,
+            static_prompt=static_prompt,
+            dynamic_bindings=dynamic_bindings,
+            decision_targets=decision_targets,
             output_schema=output_schema,
             enums=enums,
             defaults=defaults,
@@ -3756,23 +3887,13 @@ class AgentPrompt:
             max_output_tokens=max_tokens,
         )
 
-    # ------------------------------------------------------------------
-    # Public properties
-    # ------------------------------------------------------------------
-
     @property
     def model(self) -> str:
-        """Model name used by llm_client."""
         return self.model_name
 
     @property
     def max_tokens(self) -> int:
-        """Maximum output tokens for llm_client."""
         return self.max_output_tokens
-
-    # ------------------------------------------------------------------
-    # Core API
-    # ------------------------------------------------------------------
 
     def compose(
         self,
@@ -3782,46 +3903,64 @@ class AgentPrompt:
         """
         Build SYSTEM + USER messages and the response_format for the LLM.
 
-        input_payload:
-            Dict with keys like "task", "purpose", "context" (from SuperPrompt).
-
-        active_fields:
-            Optional list of field_ids that are "live" for this call, decided by A2.
-            If None, all known enum fields are considered active.
+        Neutrality rule:
+        - SYSTEM text comes only from static_prompt.
+        - USER text comes only from dynamic_bindings + runtime payload.
         """
-        if self.mode != "chooser":
-            raise AgentPromptValidationError(
-                f"AgentPrompt[{self.agent_name}] compose() currently only supports mode='chooser'"
-            )
-
-        active_set: Set[str]
-        if active_fields is None:
-            active_set = set(self.enums.keys())
-        else:
-            active_set = set(f for f in active_fields if f in self.enums)
+        for binding in self.dynamic_bindings:
+            binding_id = binding.get("id")
+            if not binding_id:
+                continue
+            if binding.get("required", False) and binding_id not in input_payload:
+                raise AgentPromptValidationError(
+                    f"AgentPrompt[{self.agent_name}] missing required input binding: '{binding_id}'"
+                )
 
         system_text = build_system_text(
-            system_text=self.system_text,
-            purpose_text=self.purpose_text,
+            static_prompt=self.static_prompt,
             agent_name=self.agent_name,
             version=self.version,
         )
 
-        user_text = build_user_text_for_chooser(
-            input_payload=input_payload,
-            enums=self.enums,
-            cardinality=self.cardinality,
-            option_descriptions=self.option_descriptions,
-            option_labels=self.option_labels,
-            result_keys=self._result_keys,
-            active_fields=sorted(active_set),
-        )
+        if self.mode == "selector":
+            if active_fields is None:
+                active_list: List[str] = list(self.enums.keys())
+            else:
+                active_list = [field_id for field_id in active_fields if field_id in self.enums]
+
+            user_text = build_user_text_for_selector(
+                input_payload=input_payload,
+                dynamic_bindings=self.dynamic_bindings,
+                decision_targets=self.decision_targets,
+                result_keys=self._result_keys,
+                active_fields=active_list,
+            )
+
+        elif self.mode == "classifier":
+            user_text = build_user_text_for_classifier(
+                input_payload=input_payload,
+                dynamic_bindings=self.dynamic_bindings,
+                decision_targets=self.decision_targets,
+                output_schema=self.output_schema,
+                top_level_result_keys=self._top_level_result_keys,
+                item_result_keys=self._item_result_keys,
+            )
+
+        else:
+            raise AgentPromptValidationError(
+                f"AgentPrompt[{self.agent_name}] compose() currently only supports mode='selector' or mode='classifier'"
+            )
 
         messages = [
             {"role": "system", "content": system_text},
             {"role": "user", "content": user_text},
         ]
         response_format = {"type": "json_object"}
+
+        SimpleLogger.info(f"AgentPrompt[{self.agent_name}] SYSTEM prompt:")
+        SimpleLogger.info(system_text)
+        SimpleLogger.info(f"AgentPrompt[{self.agent_name}] USER prompt:")
+        SimpleLogger.info(user_text)
 
         return messages, response_format
 
@@ -3832,68 +3971,103 @@ class AgentPrompt:
     ) -> Dict[str, Any]:
         """
         Parse and validate the LLM raw output into a clean Python dict.
-
-        raw_output:
-            Raw LLM response. Usually a string; treated as JSON or JSON-like.
-
-        active_fields:
-            Optional list of field_ids that were active for this call.
-            If None, all enum fields are considered active.
-
-        Returns
-        -------
-        result:
-            Dict with normalized values per field_id, e.g.:
-            {
-                "system": ["rag_architect", "prompt_engineer"],
-                "audience": "self_power_user",
-                "tone": "neutral_analytical",
-                "depth": "exhaustive",
-                "confidence": "high",
-            }
         """
-        if self.mode != "chooser":
-            raise AgentPromptValidationError(
-                f"AgentPrompt[{self.agent_name}] parse() currently only supports mode='chooser'"
-            )
-
-        if active_fields is None:
-            active_set: Set[str] = set(self.enums.keys())
-        else:
-            active_set = set(f for f in active_fields if f in self.enums)
-
         json_obj = extract_json_object(raw_output)
 
-        result: Dict[str, Any] = {}
-        for field_id, allowed in self.enums.items():
-            if field_id not in active_set:
-                # Inactive: caller (A2) keeps the existing value (e.g. user-set).
-                continue
-
-            result_key = self._result_keys.get(field_id, field_id)
-            card = self.cardinality.get(field_id, "one")
-            default_value = self.defaults.get(field_id)
-
-            raw_value = json_obj.get(result_key, None)
-
-            if card == "many":
-                normalized = normalize_many(
-                    field_id=field_id,
-                    raw_value=raw_value,
-                    allowed=allowed,
-                    default_value=default_value,
-                )
+        if self.mode == "selector":
+            if active_fields is None:
+                active_list: List[str] = list(self.enums.keys())
             else:
-                normalized = normalize_one(
-                    field_id=field_id,
-                    raw_value=raw_value,
-                    allowed=allowed,
-                    default_value=default_value,
-                )
+                active_list = [field_id for field_id in active_fields if field_id in self.enums]
 
-            result[field_id] = normalized
+            active_set = set(active_list)
+            result: Dict[str, Any] = {}
 
-        return result
+            for field_id, allowed in self.enums.items():
+                if field_id not in active_set:
+                    continue
+
+                result_key = self._result_keys.get(field_id, field_id)
+                card = self.cardinality.get(field_id, "one")
+                default_value = self.defaults.get(field_id)
+
+                raw_value = json_obj.get(result_key, None)
+
+                if card == "many":
+                    normalized = normalize_many(
+                        field_id=field_id,
+                        raw_value=raw_value,
+                        allowed=allowed,
+                        default_value=default_value,
+                    )
+                else:
+                    normalized = normalize_one(
+                        field_id=field_id,
+                        raw_value=raw_value,
+                        allowed=allowed,
+                        default_value=default_value,
+                    )
+
+                result[field_id] = normalized
+
+            return result
+
+        if self.mode == "classifier":
+            result: Dict[str, Any] = {}
+
+            for field_id, result_key in self._top_level_result_keys.items():
+                raw_value = json_obj.get(result_key, "")
+                if isinstance(raw_value, str):
+                    result[field_id] = raw_value.strip().lower()
+                elif raw_value is None:
+                    result[field_id] = ""
+                else:
+                    result[field_id] = str(raw_value).strip()
+
+            root_key = self.output_schema.get("root_key", "item_decisions")
+            item_id_key = self.output_schema.get("item_id_key", "chunk_id")
+
+            raw_items = json_obj.get(root_key, []) or []
+            if not isinstance(raw_items, list):
+                raw_items = []
+
+            normalized_items: List[Dict[str, Any]] = []
+
+            for raw_item in raw_items:
+                if not isinstance(raw_item, dict):
+                    continue
+
+                raw_chunk_id = raw_item.get(item_id_key)
+                if raw_chunk_id is None:
+                    continue
+
+                chunk_id = str(raw_chunk_id).strip()
+                if not chunk_id:
+                    continue
+
+                item_result: Dict[str, Any] = {"chunk_id": chunk_id}
+
+                for field_id, allowed in self.enums.items():
+                    result_key = self._item_result_keys.get(field_id, field_id)
+                    default_value = self.defaults.get(field_id)
+                    raw_value = raw_item.get(result_key, None)
+
+                    normalized = normalize_one(
+                        field_id=field_id,
+                        raw_value=raw_value,
+                        allowed=allowed,
+                        default_value=default_value,
+                    )
+                    item_result[field_id] = normalized
+
+                normalized_items.append(item_result)
+
+            result[root_key] = normalized_items
+            return result
+
+        raise AgentPromptValidationError(
+            f"AgentPrompt[{self.agent_name}] parse() currently only supports mode='selector' or mode='classifier'"
+        )
 ```
 
 ### ~\ragstream\orchestration\llm_client.py
@@ -4190,13 +4364,6 @@ if TYPE_CHECKING:
 class SuperPromptProjector:
     """
     Projection / render helper around one SuperPrompt instance.
-
-    Main responsibilities:
-    - render System_MD
-    - render Prompt_MD
-    - render Related Context preview
-    - compose prompt_ready
-    - project retrieval query text from SuperPrompt
     """
 
     def __init__(self, sp: "SuperPrompt") -> None:
@@ -4206,14 +4373,6 @@ class SuperPromptProjector:
 
     @staticmethod
     def build_query_text(sp: "SuperPrompt") -> str:
-        """
-        Build a retrieval-oriented query text from the structured SuperPrompt body.
-
-        Current design choice:
-        - Use only TASK / PURPOSE / CONTEXT.
-        - Keep the order explicit and stable.
-        - Skip empty fields.
-        """
         if sp is None:
             raise ValueError("SuperPromptProjector.build_query_text: 'sp' must not be None")
 
@@ -4252,14 +4411,6 @@ class SuperPromptProjector:
         return query_text
 
     def compose_prompt_ready(self) -> str:
-        """
-        Central render method for the current SuperPrompt.
-
-        Purpose:
-        - Build a single display/send-ready markdown text from the current object state.
-        - Work already for PreProcessing and A2, where no chunks exist yet.
-        - Also work for Retrieval and later stages, where chunk-based context may exist.
-        """
         self.sp.System_MD = self._render_system_md()
         self.sp.Prompt_MD = self._render_prompt_md()
 
@@ -4285,12 +4436,6 @@ class SuperPromptProjector:
         return self.sp.prompt_ready
 
     def _render_system_md(self) -> str:
-        """
-        Render the high-authority system/config part from sp.body.
-
-        This method is intentionally deterministic and simple.
-        It does not depend on retrieval artifacts.
-        """
         lines: List[str] = []
 
         system_value = (self.sp.body.get("system") or "").strip()
@@ -4323,13 +4468,6 @@ class SuperPromptProjector:
         return "\n".join(lines).strip()
 
     def _render_prompt_md(self) -> str:
-        """
-        Render the user-facing prompt part from sp.body.
-
-        This method is designed to cover:
-        - raw / preprocessed / a2 stages without any chunk context
-        - later stages as well, because the canonical prompt body remains the same
-        """
         lines: List[str] = []
 
         task_value = (self.sp.body.get("task") or "").strip()
@@ -4366,30 +4504,15 @@ class SuperPromptProjector:
         return "\n".join(lines).strip()
 
     def _format_score(self, score: float) -> str:
-        """
-        Format numeric scores compactly for the Related Context headers.
-        """
         return f"{float(score):.8f}".rstrip("0").rstrip(".")
 
     def _render_related_context_md(self) -> str:
         """
         Render a chunk-based context preview from the current selected chunks.
 
-        Design intention:
-        - The GUI should show only the selected chunk texts.
-        - During Retrieval, show:
-            Rt     = final fused Retrieval score
-            Emb    = dense branch score
-            Splade = sparse branch score
-        - During ReRanker, show:
-            Rnk   = final fused rerank RRF score
-            RcolB = ColBERT score
-            Rt    = final fused Retrieval score from the previous stage
-        - For other stages, keep the header simple.
-        - Technical metadata such as ID, source, status, and span remain
-          inside SuperPrompt as internal structured data and are not rendered here.
-        - If no chunks exist yet, this method returns an empty string and the caller
-          simply skips the section.
+        During A3, show:
+            selection_band at block level
+            usefulness judgment per chunk
         """
         ordered_chunks = self._get_ordered_context_chunks()
         if not ordered_chunks:
@@ -4405,9 +4528,20 @@ class SuperPromptProjector:
             for chunk_id, score, _status in self.sp.views_by_stage.get("reranked", [])
         }
 
+        a3_decision_map: Dict[str, Dict[str, Any]] = {}
+        raw_a3_decisions = self.sp.extras.get("a3_item_decisions", {})
+        if isinstance(raw_a3_decisions, dict):
+            a3_decision_map = raw_a3_decisions
+
+        selection_band = str(self.sp.extras.get("a3_selection_band", "") or "").strip()
+
         lines: List[str] = []
         lines.append("## Related Context")
         lines.append("")
+
+        if self.sp.stage == "a3" and selection_band:
+            lines.append(f"Selection band: {selection_band}")
+            lines.append("")
 
         chunk_counter = 1
         for chunk_obj in ordered_chunks:
@@ -4455,6 +4589,12 @@ class SuperPromptProjector:
                 if score_parts:
                     header = f"{header} [{', '.join(score_parts)}]"
 
+            elif self.sp.stage == "a3":
+                decision = a3_decision_map.get(chunk_obj.id, {})
+                usefulness = str(decision.get("usefulness_label", "") or "").strip()
+                if usefulness:
+                    header = f"{header} [Use={usefulness}]"
+
             lines.append(header)
             lines.append("")
             lines.append(chunk_obj.snippet.strip())
@@ -4465,9 +4605,6 @@ class SuperPromptProjector:
 
     @staticmethod
     def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:
-        """
-        Safely read one numeric value from chunk metadata.
-        """
         if not isinstance(meta, dict):
             return None
         value = meta.get(key)
@@ -4479,14 +4616,6 @@ class SuperPromptProjector:
             return None
 
     def _get_ordered_context_chunks(self) -> List["Chunk"]:
-        """
-        Return the currently relevant chunks in the intended display order.
-
-        Order policy:
-        1. If final_selection_ids exists, use that order.
-        2. Otherwise, if the current stage has a view in views_by_stage, use that order.
-        3. Otherwise, fall back to the raw order of base_context_chunks.
-        """
         if not self.sp.base_context_chunks:
             return []
 
@@ -4495,6 +4624,14 @@ class SuperPromptProjector:
             chunk_by_id[chunk_obj.id] = chunk_obj
 
         ordered_chunks: List["Chunk"] = []
+
+        if self.sp.stage == "a3" and "a3" in self.sp.views_by_stage:
+            stage_rows = self.sp.views_by_stage["a3"]
+            for row in stage_rows:
+                chunk_id = row[0]
+                if chunk_id in chunk_by_id:
+                    ordered_chunks.append(chunk_by_id[chunk_id])
+            return ordered_chunks
 
         if self.sp.final_selection_ids:
             for chunk_id in self.sp.final_selection_ids:
@@ -4523,134 +4660,139 @@ class SuperPromptProjector:
 compose_texts
 =============
 
-Why this helper exists:
-- Composing SYSTEM and USER messages is text-heavy and easy to clutter the
-  main AgentPrompt class.
-- We want the core class to read like a high-level story, and all text
-  formatting to live here.
+Neutral text render helpers for AgentPrompt.
 
-What it does:
-- Provides `build_system_text(...)` for the SYSTEM message.
-- Provides `build_user_text_for_chooser(...)` for the USER message when
-  agent_type == "chooser".
+Rule:
+- No agent-specific visible wording is invented here.
+- Visible prompt wording must come from JSON or from agent-prepared runtime text.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 
+def _stringify_for_prompt(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(value)
+
+    return str(value)
+
+
 def build_system_text(
-    system_text: str,
-    purpose_text: str,
+    static_prompt: Dict[str, Any],
     agent_name: str,
     version: str,
 ) -> str:
     """
     Build the SYSTEM message content for the LLM.
+
+    Neutral rule:
+    - static_prompt is treated as dump-only content.
+    - No agent-specific wording is invented here.
+    - If key == 'preamble', render the text without a heading.
+    - Otherwise use the JSON key itself as the heading label.
     """
     lines: List[str] = []
 
-    if system_text:
-        lines.append(system_text.strip())
+    for key, value in static_prompt.items():
+        text = _stringify_for_prompt(value)
+        if not text:
+            continue
 
-    if purpose_text:
-        lines.append("")
-        lines.append(f"Agent purpose: {purpose_text.strip()}")
+        if str(key).strip().lower() == "preamble":
+            lines.append(text)
+            lines.append("")
+        else:
+            lines.append(f"## {key}")
+            lines.append(text)
+            lines.append("")
 
-    lines.append("")
-    lines.append(f"Agent id: {agent_name} v{version}")
-    lines.append(
-        "You never answer the user's question directly. "
-        "You ONLY choose configuration values as instructed."
-    )
-    lines.append(
-        "You MUST respond with a single JSON object and nothing else "
-        "(no prose, no comments)."
-    )
-
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
 
 
-def build_user_text_for_chooser(
+def _build_user_text_from_dynamic_bindings(
     input_payload: Dict[str, Any],
-    enums: Dict[str, List[str]],
-    cardinality: Dict[str, str],
-    option_descriptions: Dict[str, Dict[str, str]],
-    option_labels: Dict[str, Dict[str, str]],
+    dynamic_bindings: List[Dict[str, Any]],
+) -> str:
+    """
+    Generic neutral renderer for USER content from dynamic bindings.
+
+    Rule:
+    - prompt_text is rendered exactly as provided by JSON.
+    - payload values are rendered exactly as provided by the agent.
+    - no extra visible wording is added here.
+    """
+    lines: List[str] = []
+
+    for binding in dynamic_bindings:
+        if not binding.get("visible_in_prompt", True):
+            continue
+
+        binding_id = binding.get("id")
+        if not binding_id:
+            continue
+
+        prompt_text = (binding.get("prompt_text") or "").strip()
+        value = input_payload.get(binding_id, "")
+
+        if prompt_text:
+            lines.append(prompt_text)
+
+        rendered = _stringify_for_prompt(value)
+        if rendered:
+            lines.append(rendered)
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def build_user_text_for_selector(
+    input_payload: Dict[str, Any],
+    dynamic_bindings: List[Dict[str, Any]],
+    decision_targets: List[Dict[str, Any]],
     result_keys: Dict[str, str],
     active_fields: List[str],
 ) -> str:
     """
-    Build the USER message content for a chooser-type agent.
+    Neutral USER renderer for selector agents.
 
-    Shows:
-    - Current SuperPrompt state (task, purpose, context, ...).
-    - For each active field: allowed option ids plus label/description for clarity, and expected JSON shape.
+    All visible wording must already exist in JSON or in agent-prepared runtime text.
     """
-    lines: List[str] = []
-
-    # Show SuperPrompt state
-    lines.append("Current SuperPrompt state:")
-    for key, value in input_payload.items():
-        lines.append(f"- {key}: {value!r}")
-    lines.append("")
-
-    # Explain the decision task
-    lines.append(
-        "Based on this, choose values for the following configuration fields. "
-        "For each field, you MUST choose only from the allowed option ids."
+    return _build_user_text_from_dynamic_bindings(
+        input_payload=input_payload,
+        dynamic_bindings=dynamic_bindings,
     )
-    lines.append("")
 
-    # List fields and options
-    for field_id in active_fields:
-        allowed = enums.get(field_id, [])
-        if not allowed:
-            continue
 
-        card = cardinality.get(field_id, "one")
-        result_key = result_keys.get(field_id, field_id)
+def build_user_text_for_classifier(
+    input_payload: Dict[str, Any],
+    dynamic_bindings: List[Dict[str, Any]],
+    decision_targets: List[Dict[str, Any]],
+    output_schema: Dict[str, Any],
+    top_level_result_keys: Dict[str, str],
+    item_result_keys: Dict[str, str],
+) -> str:
+    """
+    Neutral USER renderer for classifier agents.
 
-        lines.append(f"Field '{field_id}' (JSON key: '{result_key}'):")
-
-        if card == "many":
-            lines.append(
-                "  - Type: array of one or more option ids (strings) from the list below."
-            )
-        else:
-            lines.append("  - Type: single option id (string) from the list below.")
-
-        labels = option_labels.get(field_id, {})
-        descs = option_descriptions.get(field_id, {})
-        for opt_id in allowed:
-            label = labels.get(opt_id)
-            desc = descs.get(opt_id)
-            if label and desc:
-                lines.append(f"    * {opt_id}: {label} — {desc}")
-            elif label:
-                lines.append(f"    * {opt_id}: {label}")
-            elif desc:
-                lines.append(f"    * {opt_id}: {desc}")
-            else:
-                lines.append(f"    * {opt_id}")
-
-        lines.append("")
-
-    # Describe expected JSON keys and shapes
-    lines.append("Return ONLY a JSON object with keys:")
-    for field_id in active_fields:
-        result_key = result_keys.get(field_id, field_id)
-        card = cardinality.get(field_id, "one")
-        if card == "many":
-            lines.append(f"- '{result_key}': array of option ids (strings).")
-        else:
-            lines.append(f"- '{result_key}': single option id (string).")
-
-    lines.append("")
-    lines.append("Do NOT add explanations, comments or extra keys. JSON only.")
-
-    return "\n".join(lines)
+    All visible wording must already exist in JSON or in agent-prepared runtime text.
+    """
+    return _build_user_text_from_dynamic_bindings(
+        input_payload=input_payload,
+        dynamic_bindings=dynamic_bindings,
+    )
 ```
 
 ### ~\ragstream\orchestration\agent_prompt_helpers\config_loader.py
@@ -4661,17 +4803,22 @@ config_loader
 =============
 
 Why this helper exists:
-- Agent JSON configs contain a 'fields' list with enums, defaults and cardinality.
-- Converting this list into clean Python dictionaries is generic logic and should
+- Agent JSON configs define decision targets with enums, defaults and selection counts.
+- Converting these targets into clean Python dictionaries is generic logic and should
   not clutter AgentPrompt.
 
 What it does:
 - Provides a single function `extract_field_config(fields_cfg)` that returns:
-  - enums[field_id] = list of allowed option ids.
-  - defaults[field_id] = default value from config (may be str or list).
-  - cardinality[field_id] = "one" or "many".
-  - option_labels[field_id][opt_id] = human-readable label (optional).
-  - option_descriptions[field_id][opt_id] = human-readable description (optional).
+  - enums[field_id] = list of allowed option ids
+  - defaults[field_id] = default value from config (may be str or list)
+  - cardinality[field_id] = "one" or "many"
+  - option_labels[field_id][opt_id] = human-readable label (optional)
+  - option_descriptions[field_id][opt_id] = human-readable description (optional)
+
+Compatibility:
+- Works with the new `decision_targets` structure.
+- Also tolerates older inline `fields` configs, as long as they use the same
+  basic keys (`id`, `type`, `options`, `default`, `cardinality`).
 """
 
 from __future__ import annotations
@@ -4689,8 +4836,7 @@ def extract_field_config(
     Dict[str, Dict[str, str]],
 ]:
     """
-    Convert the JSON 'fields' list into enums/defaults/cardinality/option_descriptions/option_labels.
-
+    Convert decision targets / fields into:
     - enums[field_id] = ["opt1", "opt2", ...]
     - defaults[field_id] = default value from config (may be str or list)
     - cardinality[field_id] = "one" | "many"
@@ -4710,20 +4856,27 @@ def extract_field_config(
 
         field_type = field.get("type", "enum")
         if field_type != "enum":
-            # For v1, AgentPrompt only supports enum-based Chooser behaviour.
-            # Writer / Extractor / Scorer can be handled later.
+            # For v1 implementation, AgentPrompt only supports enum-based Selector behaviour.
             continue
 
         options = field.get("options", []) or []
+        if not isinstance(options, list):
+            options = []
+
         allowed_ids: List[str] = []
         descs: Dict[str, str] = {}
         labels: Dict[str, str] = {}
 
         for opt in options:
+            if not isinstance(opt, dict):
+                continue
+
             opt_id = opt.get("id")
             if not opt_id:
                 continue
+
             allowed_ids.append(opt_id)
+
             if "label" in opt:
                 labels[opt_id] = opt["label"]
             if "description" in opt:
@@ -4737,7 +4890,15 @@ def extract_field_config(
                 option_descriptions[field_id] = descs
 
         defaults[field_id] = field.get("default")
-        cardinality[field_id] = field.get("cardinality", "one")
+
+        if "cardinality" in field:
+            cardinality[field_id] = field.get("cardinality", "one")
+        else:
+            try:
+                max_selected = int(field.get("max_selected", 1))
+            except Exception:
+                max_selected = 1
+            cardinality[field_id] = "many" if max_selected > 1 else "one"
 
     return enums, defaults, cardinality, option_descriptions, option_labels
 ```

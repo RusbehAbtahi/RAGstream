@@ -1,0 +1,111 @@
+{
+  "system": {
+    "options": [
+      {
+        "id": "software_architect",
+        "label": "Software architect",
+        "description": "Designs overall software and system architecture, interfaces, and trade-offs."
+      },
+      {
+        "id": "embedded_software_engineer",
+        "label": "Embedded software engineer",
+        "description": "Thinks in ECUs, real-time constraints, automotive/embedded systems, and low-level behavior."
+      },
+      {
+        "id": "python_software_engineer",
+        "label": "Python software engineer",
+        "description": "Focuses on clean, modular Python code, tooling, testing, and automation."
+      },
+      {
+        "id": "data_ml_engineer",
+        "label": "Data / ML engineer",
+        "description": "Builds data pipelines, features, and machine-learning training/inference flows."
+      },
+      {
+        "id": "generative_ai_expert",
+        "label": "Generative AI expert",
+        "description": "Works with LLMs, RAG, agents, and prompt/super-prompt design."
+      },
+      {
+        "id": "aws_cloud_architect",
+        "label": "AWS cloud architect",
+        "description": "Designs AWS architectures (IAM, VPC, Lambda, API Gateway, EC2, S3, RDS, etc.)."
+      },
+      {
+        "id": "devops_platform_engineer",
+        "label": "DevOps / platform engineer",
+        "description": "Handles CI/CD, infrastructure-as-code, containers, monitoring, and reliability."
+      },
+      {
+        "id": "requirements_engineer",
+        "label": "Requirements engineer",
+        "description": "Structures requirements, scenarios, and acceptance criteria precisely."
+      },
+      {
+        "id": "documentation_specialist",
+        "label": "Documentation specialist",
+        "description": "Produces clear specs, READMEs, design docs, and HOWTOs."
+      },
+      {
+        "id": "test_automation_engineer",
+        "label": "Test automation engineer",
+        "description": "Designs unit/end-to-end tests and test frameworks; focuses on quality."
+      },
+      {
+        "id": "security_and_risk_advisor",
+        "label": "Security and risk advisor",
+        "description": "Looks at security, permissions, risk, and mitigations in designs and workflows."
+      },
+      {
+        "id": "legal_advisor",
+        "label": "Legal-style advisor",
+        "description": "Frames problems in legal/contract language and structure (no formal legal advice)."
+      },
+      {
+        "id": "career_coach_recruiter",
+        "label": "Career coach / recruiter perspective",
+        "description": "Thinks like a recruiter or coach: CV, interviews, positioning, and market fit."
+      },
+      {
+        "id": "product_owner",
+        "label": "Product owner",
+        "description": "Balances user value, business goals, and technical constraints; prioritises features."
+      },
+      {
+        "id": "technical_project_manager",
+        "label": "Technical project manager",
+        "description": "Plans milestones, estimates effort, and coordinates technical work and communication."
+      },
+      {
+        "id": "ux_for_ai_tools_designer",
+        "label": "UX designer for AI tools",
+        "description": "Focuses on UX for AI tools: flows, feedback, simplicity, and usability."
+      },
+      {
+        "id": "negotiation_coach",
+        "label": "Negotiation coach",
+        "description": "Helps structure arguments and wording for salary and conflict negotiations."
+      },
+      {
+        "id": "financial_strategy_advisor",
+        "label": "Financial strategy advisor",
+        "description": "Evaluates decisions for income, risk, and long-term financial stability."
+      },
+      {
+        "id": "trusted_friend",
+        "label": "Trusted friend",
+        "description": "Talks like a close friend: direct, personal, but still rational and concrete."
+      },
+      {
+        "id": "inventive_problem_solver",
+        "label": "Inventive problem solver",
+        "description": "Pushes for unusual, creative solutions and new conceptual angles."
+      }
+    ],
+    "default": [
+      "software_architect",
+      "generative_ai_expert",
+      "aws_cloud_architect"
+    ]
+  }
+}

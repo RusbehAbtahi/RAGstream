@@ -15,6 +15,7 @@ from ragstream.preprocessing.preprocessing import preprocess
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
 from ragstream.agents.a2_promptshaper import A2PromptShaper
+from ragstream.agents.a3_nli_gate import A3NLIGate
 
 # Added on 10.03.2026:
 # Project-based document ingestion is wired here only at controller level.
@@ -43,6 +44,7 @@ class AppController:
           you used in your original working version.
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
+        - Creates the A3NLIGate agent.
         - Creates the Retrieval stage object.
         """
         # PreProcessing schema (OLD, working behaviour)
@@ -56,6 +58,12 @@ class AppController:
 
         # A2 agent
         self.a2_promptshaper = A2PromptShaper(
+            agent_factory=self.agent_factory,
+            llm_client=self.llm_client,
+        )
+
+        # A3 agent
+        self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
             llm_client=self.llm_client,
         )
@@ -103,6 +111,24 @@ class AppController:
         Run A2 on the current SuperPrompt.
         """
         return self.a2_promptshaper.run(sp)
+
+    def run_a3(self, sp: SuperPrompt) -> SuperPrompt:
+        """
+        Run A3 on the current SuperPrompt.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt, typically after ReRanker.
+
+        Returns:
+            Updated SuperPrompt after A3 has populated:
+            - views_by_stage["a3"]
+            - extras["a3_selection_band"]
+            - extras["a3_item_decisions"]
+            - final_selection_ids
+            - stage / history_of_stages
+        """
+        return self.a3_nli_gate.run(sp)
 
     # Added on 18.03.2026:
     # Small demo helper for the future memory view in the GUI.

@@ -1,0 +1,22 @@
+{
+  "usefulness_label": {
+    "options": [
+      {
+        "id": "useful",
+        "label": "Useful",
+        "description": "Relevant and worth keeping for downstream synthesis."
+      },
+      {
+        "id": "borderline",
+        "label": "Borderline",
+        "description": "Potentially useful but weaker, partial, or low-priority."
+      },
+      {
+        "id": "discarded",
+        "label": "Discarded",
+        "description": "Not useful enough for downstream synthesis."
+      }
+    ],
+    "default": "borderline"
+  }
+}
