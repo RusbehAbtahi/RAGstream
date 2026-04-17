@@ -66,7 +66,7 @@ class A3NLIGate:
         sp: SuperPrompt,
         *,
         agent_id: str = "a3_nli_gate",
-        version: str = "001",
+        version: str = "002",
     ) -> SuperPrompt:
         """
         Main entry point for A3.

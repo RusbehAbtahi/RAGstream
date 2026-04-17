@@ -1,0 +1,88 @@
+{
+  "agent_meta": {
+    "agent_id": "a3_nli_gate",
+    "version": "002",
+    "agent_type": "Classifier",
+    "name": "A3 NLI Gate – Chunk Classifier",
+    "description": "Classifies reranked candidate chunks jointly for usefulness before synthesis.",
+    "tags": [
+      "a3",
+      "classifier",
+      "chunk_selection",
+      "ragstream"
+    ],
+    "enabled": true
+  },
+
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-4o-mini",
+    "temperature": 0.0,
+    "max_tokens": 1024,
+    "response_format": "json"
+  },
+
+  "static_prompt": {
+    "preamble": "You are a chunk classification assistant.\nYou do not answer the original user request.",
+    "Agent Purpose": "Given one reranked evidence set and the user prompt under evaluation, produce a clean, discriminative, synthesis-ready working set by classifying each chunk for usefulness.",
+    "Task": "Classify every candidate chunk as useful, borderline, or discarded.\nAssign exactly one global selection_band for the whole candidate set: high, medium, or low.\nUsefulness_label is a local chunk decision; selection_band is a whole-set judgment.\nEvaluate all chunks comparatively as one set, not independently.\nUse the reranker order as a meaningful prior signal.\nKeep the original input order in the output.\nReturn only the required JSON object.",
+    "Hard Rules": "- Never answer the original user request.\n- Never return unknown, empty, or omitted selection_band.\n- selection_band judges the quality of the whole candidate set, not individual chunks.\n- Prefer selection_band = medium unless the whole set is clearly strong or clearly weak.\n- Assign high only when the set contains a strong useful core and most useful chunks are distinctly informative, with limited redundancy.\n- Assign low only when the set has weak relevance, weak insight density, or too little usable evidence for synthesis.\n- Judge each chunk by its overall content in full, not by isolated matching phrases.\n- A chunk is useful only if it is both relevant and meaningfully additive for synthesis.\n- If two chunks substantially repeat the same meaning, keep the stronger, clearer, or more complete one as useful and downgrade the weaker one to borderline or discarded.\n- Do not treat complementary chunks as duplicates when each contributes a clearly new part of the same idea.\n- Produce a discriminative distribution. Do not label almost everything as borderline.\n- For a 30-chunk candidate set, assign at least 4 chunks as useful and at least 6 chunks as discarded.\n- Use borderline only for genuine middle cases.\n- When uncertain between useful and borderline, prefer borderline.\n- When uncertain between high and medium, prefer medium.\n- Prefer higher-ranked chunks unless a lower-ranked chunk is clearly more complete and more relevant.\n- Keep the original input order in the output.\n- Return only the required JSON object.\n- Do not return prose, comments, explanations, or extra keys."
+  },
+
+  "dynamic_bindings": [
+    {
+      "id": "user_prompt_under_evaluation",
+      "prompt_text": "",
+      "bind_from": "A3.user_prompt_under_evaluation",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "evidence_chunks",
+      "prompt_text": "",
+      "bind_from": "A3.evidence_chunks",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "required_output",
+      "prompt_text": "",
+      "bind_from": "A3.required_output",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    }
+  ],
+
+  "decision_targets": [
+    {
+      "id": "usefulness_label",
+      "label": "Usefulness class for each candidate chunk",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "options": "a3_catalogs/002_option_catalogs_labels.json"
+    }
+  ],
+
+  "output_schema": {
+    "format": "json",
+    "type": "object",
+    "top_level_fields": [
+      {
+        "field_id": "selection_band",
+        "result_key": "selection_band"
+      }
+    ],
+    "root_key": "item_decisions",
+    "item_id_key": "chunk_id",
+    "item_fields": [
+      {
+        "field_id": "usefulness_label",
+        "result_key": "usefulness_label"
+      }
+    ]
+  }
+}

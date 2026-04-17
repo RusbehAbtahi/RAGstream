@@ -67,6 +67,7 @@ def preprocess(user_text: str, sp: Any, schema: PromptSchema) -> None:
     """
 
     # ---------------- Step 1: parse headers (or treat as plain text) ----------------
+
     sections = _parse_markdown_sections(user_text)
 
     # If no headers exist: whole text → TASK (plain mode)

@@ -121,14 +121,21 @@ class Retriever:
     # Public API
     # -----------------------------------------------------------------
 
-    def run(self, sp: SuperPrompt, project_name: str, top_k: int) -> SuperPrompt:
+    def run(
+        self,
+        sp: SuperPrompt,
+        project_name: str,
+        top_k: int,
+        *,
+        use_retrieval_splade: bool = True,
+    ) -> SuperPrompt:
         """
         Execute the Retrieval stage and update the same SuperPrompt in place.
 
         Visible flow:
             1) PreProcessing
             2) Retriever_EMB
-            3) Retriever_SPLADE
+            3) Retriever_SPLADE or dense passthrough clone
             4) RRF_Merger
             5) PostProcessing
 
@@ -143,18 +150,28 @@ class Retriever:
             top_k=top_k,
         )
 
-        candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
+        ranked_rows_splade: List[RankedRow]
 
-        try:
-            ranked_rows_splade = self._get_retriever_splade().run(
-                project_name=project_name,
-                query_pieces=query_pieces,
-                top_k=top_k,
-                candidate_ids=candidate_ids,
-            )
-        except FileNotFoundError:
-            # Keep Retrieval usable even if an older project has no SPLADE store yet.
-            ranked_rows_splade = []
+        if use_retrieval_splade:
+            candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
+
+            try:
+                ranked_rows_splade = self._get_retriever_splade().run(
+                    project_name=project_name,
+                    query_pieces=query_pieces,
+                    top_k=top_k,
+                    candidate_ids=candidate_ids,
+                )
+            except FileNotFoundError:
+                # Keep Retrieval usable even if an older project has no SPLADE store yet.
+                ranked_rows_splade = []
+        else:
+            # Bypass real SPLADE and duplicate the dense branch into the second
+            # RRF input slot so the downstream Retrieval contract stays unchanged.
+            ranked_rows_splade = [
+                (str(chunk_id), float(score), dict(meta or {}))
+                for chunk_id, score, meta in ranked_rows_emb
+            ]
 
         ranked_rows = rrf_merge(
             ranked_rows_emb,

@@ -40,12 +40,13 @@ class AppController:
         """
         Central app controller.
 
-        - Loads PromptSchema once (for PreProcessing) from the same path
-          you used in your original working version.
+        Light initialization only.
+
+        - Loads PromptSchema once (for PreProcessing).
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
         - Creates the A3NLIGate agent.
-        - Creates the Retrieval stage object.
+        - Prepares project/data paths.
         """
         # PreProcessing schema (OLD, working behaviour)
         self.schema = PromptSchema(schema_path)
@@ -79,6 +80,14 @@ class AppController:
         self.doc_root.mkdir(parents=True, exist_ok=True)
         self.chroma_root.mkdir(parents=True, exist_ok=True)
         self.splade_root.mkdir(parents=True, exist_ok=True)
+
+    def initialize_heavy_components(self) -> None:
+        """
+        Heavy initialization only.
+
+        - Creates the Retrieval stage object.
+        - Creates the ReRanker stage object.
+        """
 
         # Added on 15.03.2026:
         # Retrieval is initialized once and re-used. It reads the active project
@@ -190,7 +199,14 @@ class AppController:
     # Retrieval is a separate deterministic stage and must remain independent
     # from ReRanker / A3. The controller only passes the current SuperPrompt,
     # the active GUI project, and the GUI top-k value.
-    def run_retrieval(self, sp: SuperPrompt, project_name: str, top_k: int) -> SuperPrompt:
+    def run_retrieval(
+        self,
+        sp: SuperPrompt,
+        project_name: str,
+        top_k: int,
+        *,
+        use_retrieval_splade: bool = True,
+    ) -> SuperPrompt:
         """
         Run Retrieval on the current SuperPrompt for the selected active project.
 
@@ -201,6 +217,10 @@ class AppController:
                 Active project selected in the GUI.
             top_k:
                 Number of chunks to keep after retrieval ranking.
+            use_retrieval_splade:
+                If False, bypass the real SPLADE branch and duplicate the dense
+                ranking into the SPLADE input slot before RRF so the Retrieval
+                output contract stays unchanged.
 
         Returns:
             Updated SuperPrompt after Retrieval has populated:
@@ -214,18 +234,27 @@ class AppController:
             sp=sp,
             project_name=project_name,
             top_k=int(top_k),
+            use_retrieval_splade=bool(use_retrieval_splade),
         )
 
     # Added on 31.03.2026:
     # ReRanker is a separate deterministic stage after Retrieval. The controller
     # only passes the current SuperPrompt and returns the same updated object.
-    def run_reranker(self, sp: SuperPrompt) -> SuperPrompt:
+    def run_reranker(
+        self,
+        sp: SuperPrompt,
+        *,
+        use_reranking_colbert: bool = True,
+    ) -> SuperPrompt:
         """
         Run ReRanker on the current SuperPrompt.
 
         Inputs:
             sp:
                 Current evolving SuperPrompt, typically after Retrieval.
+            use_reranking_colbert:
+                If False, bypass real ColBERT scoring and copy the Retrieval
+                order into the reranked stage so A3 can run immediately.
 
         Returns:
             Updated SuperPrompt after ReRanker has populated:
@@ -233,7 +262,10 @@ class AppController:
             - final_selection_ids
             - stage / history_of_stages
         """
-        return self.reranker.run(sp)
+        return self.reranker.run(
+            sp,
+            use_reranking_colbert=bool(use_reranking_colbert),
+        )
 
     # Added on 10.03.2026:
     # Project-based ingestion helpers for the new Streamlit buttons.

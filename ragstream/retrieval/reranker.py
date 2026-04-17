@@ -106,13 +106,21 @@ class Reranker:
     # Public API
     # -----------------------------------------------------------------
 
-    def run(self, sp: SuperPrompt) -> SuperPrompt:
+    def run(
+        self,
+        sp: SuperPrompt,
+        *,
+        use_reranking_colbert: bool = True,
+    ) -> SuperPrompt:
         """
         Execute the ReRanker stage and update the same SuperPrompt in place.
 
         Inputs:
             sp:
                 The current evolving SuperPrompt, typically after Retrieval.
+            use_reranking_colbert:
+                If False, bypass real ColBERT scoring and copy the Retrieval
+                order directly into the reranked stage.
 
         Returns:
             The same SuperPrompt instance, mutated in place.
@@ -123,6 +131,14 @@ class Reranker:
             - Appends "reranked" to sp.history_of_stages
             - Sets sp.stage = "reranked"
         """
+        if not use_reranking_colbert:
+            reranked_view, reranked_ids = self._build_passthrough_from_retrieval(sp)
+            sp.views_by_stage["reranked"] = reranked_view
+            sp.final_selection_ids = reranked_ids
+            sp.stage = "reranked"
+            sp.history_of_stages.append("reranked")
+            return sp
+
         query_pieces, retrieval_rows, chunk_lookup = self._prepare_inputs(sp)
         colbert_rows = self._score_with_colbert(query_pieces, retrieval_rows, chunk_lookup)
         fused_rows = self._fuse_with_retrieval(retrieval_rows, colbert_rows, chunk_lookup)
@@ -140,6 +156,63 @@ class Reranker:
     # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
+
+    def _build_passthrough_from_retrieval(
+        self,
+        sp: SuperPrompt,
+    ) -> tuple[List[tuple[str, float, A3ChunkStatus]], List[str]]:
+        """
+        Bypass real ColBERT and copy the Retrieval order directly into the
+        reranked stage so downstream A3 can run unchanged.
+        """
+        if sp is None:
+            raise ValueError("Reranker.run: 'sp' must not be None")
+
+        retrieval_rows = sp.views_by_stage.get("retrieval")
+        if not retrieval_rows:
+            raise ValueError(
+                "Reranker.run: Retrieval candidates are missing. "
+                "Please run Retrieval before ReRanker."
+            )
+
+        if not sp.base_context_chunks:
+            raise ValueError(
+                "Reranker.run: base_context_chunks is empty. "
+                "Please run Retrieval before ReRanker."
+            )
+
+        candidate_rows = list(retrieval_rows)[: self._top_k]
+        chunk_lookup = {chunk_obj.id: chunk_obj for chunk_obj in sp.base_context_chunks}
+
+        reranked_view: List[tuple[str, float, A3ChunkStatus]] = []
+        reranked_ids: List[str] = []
+
+        for position, (chunk_id, retrieval_score, _status) in enumerate(candidate_rows, start=1):
+            chunk_id_str = str(chunk_id)
+            score = float(retrieval_score)
+
+            reranked_view.append((chunk_id_str, score, A3ChunkStatus.SELECTED))
+            reranked_ids.append(chunk_id_str)
+
+            chunk_obj = chunk_lookup.get(chunk_id_str)
+            if chunk_obj is None:
+                continue
+
+            merged_meta = dict(chunk_obj.meta or {})
+            base_retrieval_rrf = float(merged_meta.get("rrf_score", score))
+
+            merged_meta["retrieval_rrf_score"] = float(
+                merged_meta.get("retrieval_rrf_score", base_retrieval_rrf)
+            )
+            merged_meta["retrieval_score"] = score
+            merged_meta["colbert_score"] = score
+            merged_meta["retrieval_rank"] = int(position)
+            merged_meta["colbert_rank"] = int(position)
+            merged_meta["rerank_rrf_score"] = score
+
+            chunk_obj.meta = merged_meta
+
+        return reranked_view, reranked_ids
 
     def _prepare_inputs(
         self,
