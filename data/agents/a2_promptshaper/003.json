@@ -16,7 +16,7 @@
 
   "llm_config": {
     "provider": "openai",
-    "model_name": "gpt-4.1-mini",
+    "model_name": "gpt-5-mini",
     "temperature": 0.0,
     "max_tokens": 256,
     "response_format": "json"
@@ -34,14 +34,6 @@
       "id": "prompt_under_evaluation",
       "prompt_text": "## Prompt Under Evaluation",
       "bind_from": "A2.prompt_under_evaluation",
-      "expected_type": "string",
-      "required": true,
-      "visible_in_prompt": true
-    },
-    {
-      "id": "decision_targets",
-      "prompt_text": "## Decision Targets",
-      "bind_from": "A2.decision_targets",
       "expected_type": "string",
       "required": true,
       "visible_in_prompt": true

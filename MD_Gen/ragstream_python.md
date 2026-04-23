@@ -83,12 +83,13 @@ class AppController:
         """
         Central app controller.
 
-        - Loads PromptSchema once (for PreProcessing) from the same path
-          you used in your original working version.
+        Light initialization only.
+
+        - Loads PromptSchema once (for PreProcessing).
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
         - Creates the A3NLIGate agent.
-        - Creates the Retrieval stage object.
+        - Prepares project/data paths.
         """
         # PreProcessing schema (OLD, working behaviour)
         self.schema = PromptSchema(schema_path)
@@ -122,6 +123,14 @@ class AppController:
         self.doc_root.mkdir(parents=True, exist_ok=True)
         self.chroma_root.mkdir(parents=True, exist_ok=True)
         self.splade_root.mkdir(parents=True, exist_ok=True)
+
+    def initialize_heavy_components(self) -> None:
+        """
+        Heavy initialization only.
+
+        - Creates the Retrieval stage object.
+        - Creates the ReRanker stage object.
+        """
 
         # Added on 15.03.2026:
         # Retrieval is initialized once and re-used. It reads the active project
@@ -233,7 +242,14 @@ class AppController:
     # Retrieval is a separate deterministic stage and must remain independent
     # from ReRanker / A3. The controller only passes the current SuperPrompt,
     # the active GUI project, and the GUI top-k value.
-    def run_retrieval(self, sp: SuperPrompt, project_name: str, top_k: int) -> SuperPrompt:
+    def run_retrieval(
+        self,
+        sp: SuperPrompt,
+        project_name: str,
+        top_k: int,
+        *,
+        use_retrieval_splade: bool = True,
+    ) -> SuperPrompt:
         """
         Run Retrieval on the current SuperPrompt for the selected active project.
 
@@ -244,6 +260,10 @@ class AppController:
                 Active project selected in the GUI.
             top_k:
                 Number of chunks to keep after retrieval ranking.
+            use_retrieval_splade:
+                If False, bypass the real SPLADE branch and duplicate the dense
+                ranking into the SPLADE input slot before RRF so the Retrieval
+                output contract stays unchanged.
 
         Returns:
             Updated SuperPrompt after Retrieval has populated:
@@ -257,18 +277,27 @@ class AppController:
             sp=sp,
             project_name=project_name,
             top_k=int(top_k),
+            use_retrieval_splade=bool(use_retrieval_splade),
         )
 
     # Added on 31.03.2026:
     # ReRanker is a separate deterministic stage after Retrieval. The controller
     # only passes the current SuperPrompt and returns the same updated object.
-    def run_reranker(self, sp: SuperPrompt) -> SuperPrompt:
+    def run_reranker(
+        self,
+        sp: SuperPrompt,
+        *,
+        use_reranking_colbert: bool = True,
+    ) -> SuperPrompt:
         """
         Run ReRanker on the current SuperPrompt.
 
         Inputs:
             sp:
                 Current evolving SuperPrompt, typically after Retrieval.
+            use_reranking_colbert:
+                If False, bypass real ColBERT scoring and copy the Retrieval
+                order into the reranked stage so A3 can run immediately.
 
         Returns:
             Updated SuperPrompt after ReRanker has populated:
@@ -276,7 +305,10 @@ class AppController:
             - final_selection_ids
             - stage / history_of_stages
         """
-        return self.reranker.run(sp)
+        return self.reranker.run(
+            sp,
+            use_reranking_colbert=bool(use_reranking_colbert),
+        )
 
     # Added on 10.03.2026:
     # Project-based ingestion helpers for the new Streamlit buttons.
@@ -1026,18 +1058,18 @@ if __name__ == "__main__":
     main()
 ```
 
-### ~\ragstream\app\ui_streamlit.py
+### ~\ragstream\app\ui_actions.py
 ```python
-# ui_streamlit.py
+# ragstream/app/ui_actions.py
 # -*- coding: utf-8 -*-
 """
-Run on a free port, e.g.:
-  /home/rusbeh_ab/venvs/ragstream/bin/python -m streamlit run /home/rusbeh_ab/project/RAGstream/ragstream/app/ui_streamlit.py --server.port 8503
+Small callback helpers for Streamlit button/form actions.
+Keep controller calls and session-state mutations here.
 """
 
 from __future__ import annotations
+
 import copy
-import html
 
 import streamlit as st
 
@@ -1045,9 +1077,225 @@ from ragstream.app.controller import AppController
 from ragstream.orchestration.super_prompt import SuperPrompt
 
 
-def main() -> None:
-    st.set_page_config(page_title="RAGstream", layout="wide")
+def do_preprocess() -> None:
+    ctrl: AppController = st.session_state.controller
+    user_text = st.session_state.get("prompt_text", "")
 
+    # Start a fresh pipeline run from clean SuperPrompt objects
+    st.session_state.sp = SuperPrompt()
+    st.session_state.sp_pre = SuperPrompt()
+    st.session_state.sp_a2 = SuperPrompt()
+    st.session_state.sp_rtv = SuperPrompt()
+    st.session_state.sp_rrk = SuperPrompt()
+    st.session_state.sp_a3 = SuperPrompt()
+
+    sp: SuperPrompt = st.session_state.sp
+    sp = ctrl.preprocess(user_text, sp)
+
+    st.session_state.sp = sp
+    st.session_state.sp_pre = copy.deepcopy(sp)
+    st.session_state["super_prompt_text"] = sp.prompt_ready
+
+
+def do_a2_promptshaper() -> None:
+    """A2 button callback."""
+    ctrl: AppController = st.session_state.controller
+    sp: SuperPrompt = st.session_state.sp
+
+    sp = ctrl.run_a2_promptshaper(sp)
+    entry = ctrl.build_a2_memory_demo_entry(sp)
+
+    next_id = st.session_state.get("a2_memory_demo_counter", 0) + 1
+    st.session_state["a2_memory_demo_counter"] = next_id
+    entry["id"] = next_id
+
+    st.session_state[f"a2_memory_tag_{next_id}"] = "Green"
+    st.session_state["a2_memory_demo_entries"].append(entry)
+
+    st.session_state.sp = sp
+    st.session_state.sp_a2 = copy.deepcopy(sp)
+    st.session_state["super_prompt_text"] = sp.prompt_ready
+    st.session_state["pending_a2_memory_refresh"] = True
+
+    #st.rerun()
+
+
+def do_retrieval() -> None:
+    """Retrieval button callback."""
+    try:
+        ctrl: AppController = st.session_state.controller
+        sp: SuperPrompt = st.session_state.sp
+
+        project_name = st.session_state.get("active_project")
+        if not project_name:
+            available_projects = ctrl.list_projects()
+            if available_projects:
+                project_name = available_projects[0]
+                st.session_state["active_project"] = project_name
+
+        if not project_name or project_name == "(no projects yet)":
+            st.error("No active project is available for Retrieval.")
+            return
+
+        top_k = int(st.session_state.get("retrieval_top_k", 100))
+        use_retrieval_splade = bool(st.session_state.get("use_retrieval_splade", False))
+
+        sp = ctrl.run_retrieval(
+            sp,
+            project_name,
+            top_k,
+            use_retrieval_splade=use_retrieval_splade,
+        )
+        sp.compose_prompt_ready()
+
+        st.session_state.sp = sp
+        st.session_state.sp_rtv = copy.deepcopy(sp)
+        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+    except Exception as e:
+        st.error(str(e))
+
+
+def do_reranker() -> None:
+    """ReRanker button callback."""
+    try:
+        ctrl: AppController = st.session_state.controller
+        sp: SuperPrompt = st.session_state.sp
+
+        use_reranking_colbert = bool(st.session_state.get("use_reranking_colbert", False))
+
+        sp = ctrl.run_reranker(
+            sp,
+            use_reranking_colbert=use_reranking_colbert,
+        )
+        sp.compose_prompt_ready()
+
+        st.session_state.sp = sp
+        st.session_state.sp_rrk = copy.deepcopy(sp)
+        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+    except Exception as e:
+        st.error(str(e))
+
+
+def do_a3_nli_gate() -> None:
+    """A3 button callback."""
+    try:
+        ctrl: AppController = st.session_state.controller
+        sp: SuperPrompt = st.session_state.sp
+
+        sp = ctrl.run_a3(sp)
+
+        st.session_state.sp = sp
+        st.session_state.sp_a3 = copy.deepcopy(sp)
+        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+    except Exception as e:
+        st.error(str(e))
+
+
+def do_create_project() -> None:
+    """Create Project form callback."""
+    try:
+        ctrl: AppController = st.session_state.controller
+        result = ctrl.create_project(st.session_state.get("new_project_name", ""))
+
+        st.session_state["ingestion_status"] = {
+            "type": "success",
+            "message": f"Project created: {result['project_name']}",
+            "details": [
+                f"doc_raw: {result['raw_dir']}",
+                f"chroma_db: {result['chroma_dir']}",
+                f"manifest: {result['manifest_path']}",
+            ],
+        }
+        st.session_state["pending_active_project"] = result["project_name"]
+        st.rerun()
+
+    except Exception as e:
+        st.session_state["ingestion_status"] = {
+            "type": "error",
+            "message": str(e),
+            "details": [],
+        }
+
+
+def do_add_files() -> None:
+    """Add Files form callback."""
+    try:
+        ctrl: AppController = st.session_state.controller
+
+        result = ctrl.import_files_to_project(
+            st.session_state.get("add_files_project", ""),
+            uploaded_files=st.session_state.get("ingestion_uploaded_files"),
+        )
+
+        if result.get("success"):
+            st.session_state["ingestion_status"] = {
+                "type": "success",
+                "message": (
+                    f"Files added to {result['project_name']} "
+                    f"and ingestion finished."
+                ),
+                "details": [
+                    f"copied files: {result.get('copied_count', 0)}",
+                    f"files scanned: {result.get('files_scanned', 0)}",
+                    f"to process: {result.get('to_process', 0)}",
+                    f"unchanged: {result.get('unchanged', 0)}",
+                    f"vectors upserted: {result.get('vectors_upserted', 0)}",
+                    f"manifest: {result.get('manifest_path', '')}",
+                ] + [
+                    f"rejected: {item}" for item in result.get("rejected_files", [])
+                ],
+            }
+            st.session_state["pending_active_project"] = result["project_name"]
+            st.rerun()
+        else:
+            st.session_state["ingestion_status"] = {
+                "type": "error",
+                "message": result.get("message", "No files were added."),
+                "details": [
+                    f"rejected: {item}" for item in result.get("rejected_files", [])
+                ],
+            }
+
+    except Exception as e:
+        st.session_state["ingestion_status"] = {
+            "type": "error",
+            "message": str(e),
+            "details": [],
+        }
+```
+
+### ~\ragstream\app\ui_layout.py
+```python
+# ragstream/app/ui_layout.py
+# -*- coding: utf-8 -*-
+"""
+Layout / geometry helpers for Streamlit UI.
+Keep columns, containers, labels and visual order here.
+"""
+
+from __future__ import annotations
+
+import html
+
+import streamlit as st
+
+from ragstream.app.controller import AppController
+from ragstream.app.ui_actions import (
+    do_a2_promptshaper,
+    do_a3_nli_gate,
+    do_add_files,
+    do_create_project,
+    do_preprocess,
+    do_reranker,
+    do_retrieval,
+)
+
+
+def inject_base_css() -> None:
+    """Global CSS for simple spacing and boxes."""
     st.markdown(
         """
         <style>
@@ -1072,11 +1320,12 @@ def main() -> None:
                 margin-bottom: 0.35rem;
             }
 
-            /* Make the row gaps compact */
+            /* Make row gaps compact */
             div[data-testid="stHorizontalBlock"]{
                 gap: 0.4rem !important;
             }
 
+            /* Memory card style */
             .memory-box {
                 border-radius: 0.45rem;
                 padding: 0.55rem 0.7rem;
@@ -1120,11 +1369,355 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.title("RAGstream")
 
-    # one controller + one SuperPrompt per user session
+def render_page() -> None:
+    """
+    Two-column layout:
+
+    LEFT:
+      Prompt
+      Super-Prompt
+
+    RIGHT:
+      Memory Demo
+      Buttons / Top-K / project controls / status
+    """
+    # Main 2-column layout
+    gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
+
+    with gutter_l:  # left gutter
+        st.empty()
+
+    with col_right:
+        render_right_panel()
+
+    with spacer:
+        st.empty()
+
+    with col_left:
+        render_left_panel()
+
+    with gutter_r:  # right gutter
+        st.empty()
+
+
+def render_left_panel() -> None:
+    """Left panel: Prompt at top, Super-Prompt below."""
+    # Prompt section
+    st.markdown('<div class="field-title">Prompt</div>', unsafe_allow_html=True)
+    st.text_area(
+        label="Prompt (hidden)",
+        key="prompt_text",
+        height=240,
+        label_visibility="collapsed",
+    )
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
+    # Super-Prompt section
+    st.markdown('<div class="field-title">Super-Prompt</div>', unsafe_allow_html=True)
+    st.text_area(
+        label="Super-Prompt (hidden)",
+        key="super_prompt_text",
+        height=780,
+        label_visibility="collapsed",
+    )
+
+
+def render_right_panel() -> None:
+    """Right panel: Memory Demo at top, all controls below."""
+    ctrl: AppController = st.session_state.controller
+    retrieval_ready = getattr(ctrl, "retriever", None) is not None
+    reranker_ready = getattr(ctrl, "reranker", None) is not None
+
+    # Memory Demo section
+    st.markdown('<div class="field-title">MEMORY DEMO</div>', unsafe_allow_html=True)
+    render_memory_demo(height=420)
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
+    # Row 1: 4 pipeline buttons
+    b1c1, b1c2, b1c3, b1c4 = st.columns(4, gap="small")
+
+    with b1c1:  # Pre-Processing button
+        if st.button("Pre-Processing", key="btn_preproc", use_container_width=True):
+            do_preprocess()
+
+    with b1c2:  # A2-PromptShaper button
+        if st.button("A2-PromptShaper", key="btn_a2", use_container_width=True):
+            do_a2_promptshaper()
+
+    with b1c3:  # Retrieval button
+        if st.button(
+            "Retrieval",
+            key="btn_retrieval",
+            use_container_width=True,
+            disabled=not retrieval_ready,
+        ):
+            do_retrieval()
+
+    with b1c4:  # ReRanker button
+        if st.button(
+            "ReRanker",
+            key="btn_reranker",
+            use_container_width=True,
+            disabled=not reranker_ready,
+        ):
+            do_reranker()
+
+    # Row 2: 4 pipeline buttons
+    b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")
+
+    with b2c1:  # A3 NLI Gate button
+        if st.button("A3 NLI Gate", key="btn_a3", use_container_width=True):
+            do_a3_nli_gate()
+
+    with b2c2:  # A4 button
+        st.button("A4 Condenser", key="btn_a4", use_container_width=True)
+
+    with b2c3:  # A5 button
+        st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
+
+    with b2c4:  # Prompt Builder button
+        st.button("Prompt Builder", key="btn_builder", use_container_width=True)
+
+    topk_c, gap_c, opt_c1, opt_c2 = st.columns([0.5, 1, 1, 1],
+                                               gap="small")  # row: Top-K + spacer + 2 checkboxes
+
+    with topk_c:  # number input: Retrieval Top-K
+        st.number_input(
+            "Retrieval Top-K",
+            min_value=1,
+            max_value=1000,
+            step=1,
+            key="retrieval_top_k",
+        )
+
+    with gap_c:  # empty spacer between Top-K and first checkbox
+        st.empty()
+
+    with opt_c1:  # checkbox: use Retrieval Splade
+        st.checkbox(
+            "use Retrieval Splade",
+            key="use_retrieval_splade",
+        )
+
+    with opt_c2:  # checkbox: use Reranking Colbert
+        st.checkbox(
+            "use Reranking Colbert",
+            key="use_reranking_colbert",
+        )
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
+    # Project controls / file ingestion
+    render_project_area(ctrl)
+
+
+def render_memory_demo(height: int = 420) -> None:
+    """Memory Demo list."""
+    memory_entries = st.session_state["a2_memory_demo_entries"]
+
+    try:
+        memory_container = st.container(height=height)
+    except TypeError:
+        memory_container = st.container()
+
+    with memory_container:  # Memory container
+        if not memory_entries:
+            st.info("No memory entries yet.")
+        else:
+            for entry in memory_entries:
+                entry_id = entry["id"]
+                tag_key = f"a2_memory_tag_{entry_id}"
+
+                if tag_key not in st.session_state:
+                    st.session_state[tag_key] = entry.get("tag", "Green")
+
+                input_col, tag_col = st.columns([8.8, 1.0], gap="small")
+
+                with input_col:  # Memory INPUT box
+                    input_html = html.escape(entry.get("input_text", "")).replace("\n", "<br>")
+                    st.markdown(
+                        f"""
+                        <div class="memory-box memory-input-box">
+                            <div class="memory-label">INPUT</div>
+                            <div class="memory-plain-text">{input_html}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                with tag_col:  # Memory TAG selectbox
+                    selected_tag = st.selectbox(
+                        "Tag",
+                        options=["Platin", "GOLD", "SILVER", "Green", "Black"],
+                        key=tag_key,
+                        label_visibility="collapsed",
+                    )
+                    entry["tag"] = selected_tag
+
+                output_html = html.escape(entry.get("output_text", "")).replace("\n", "<br>")
+                st.markdown(
+                    f"""
+                    <div class="memory-box memory-output-box">
+                        <div class="memory-label">OUTPUT</div>
+                        <div class="memory-plain-text">{output_html}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("<div style='height:0.40rem'></div>", unsafe_allow_html=True)
+
+
+def render_project_area(ctrl: AppController) -> None:
+    """Project selector, embedded files, Create Project and Add Files forms."""
+    projects = ctrl.list_projects()
+
+    # Apply pending project switch before widget creation
+    pending_project = st.session_state.get("pending_active_project")
+    if pending_project is not None:
+        if projects and pending_project in projects:
+            st.session_state["active_project"] = pending_project
+        st.session_state["pending_active_project"] = None
+
+    # Active project selectbox
+    if projects:
+        if st.session_state.get("active_project") not in projects:
+            st.session_state["active_project"] = projects[0]
+
+        st.selectbox(
+            "Active DB / Project",
+            options=projects,
+            key="active_project",
+        )
+    else:
+        st.selectbox(
+            "Active DB / Project",
+            options=["(no projects yet)"],
+            index=0,
+            disabled=True,
+        )
+
+    # Embedded Files view
+    active_project = st.session_state.get("active_project")
+    if projects and active_project in projects:
+        embedded_info = ctrl.get_embedded_files(active_project)
+
+        st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
+        st.markdown(
+            '<div class="field-title" style="font-size:1.05rem;">Embedded Files</div>',
+            unsafe_allow_html=True,
+        )
+
+        if embedded_info.get("success"):
+            embedded_files = embedded_info.get("files", [])
+            embedded_text = "\n".join(embedded_files) if embedded_files else "(no embedded files yet)"
+            st.text_area(
+                label="Embedded Files (hidden)",
+                value=embedded_text,
+                height=120,
+                disabled=True,
+                label_visibility="collapsed",
+            )
+        else:
+            st.error(embedded_info.get("message", "Could not read embedded file list."))
+
+    # Project forms row
+    create_col, add_col = st.columns(2, gap="small")
+
+    with create_col:  # Create Project form
+        with st.form("create_project_form", clear_on_submit=False):  # form: create project
+            st.text_input("Project Name", key="new_project_name")
+            create_clicked = st.form_submit_button("Create Project", use_container_width=True)
+
+            if create_clicked:
+                do_create_project()
+
+    with add_col:  # Add Files form
+        with st.form("add_files_form", clear_on_submit=False):  # form: add files
+            add_projects = ctrl.list_projects()
+
+            if add_projects:
+                current_active_project = st.session_state.get("active_project")
+                if current_active_project in add_projects:
+                    default_add_project = current_active_project
+                else:
+                    default_add_project = add_projects[0]
+
+                st.selectbox(
+                    "Choose Project",
+                    options=add_projects,
+                    key="add_files_project",
+                    index=add_projects.index(default_add_project),
+                )
+
+                st.file_uploader(
+                    "Select .txt / .md files from your local machine",
+                    type=["txt", "md"],
+                    accept_multiple_files=True,
+                    key="ingestion_uploaded_files",
+                )
+
+                add_clicked = st.form_submit_button("Add Files", use_container_width=True)
+
+                if add_clicked:
+                    do_add_files()
+            else:
+                st.info("Create a project first, then add files.")
+
+    # Status area
+    status = st.session_state.get("ingestion_status")
+    if status:
+        if status.get("type") == "success":
+            st.success(status.get("message", ""))
+        else:
+            st.error(status.get("message", ""))
+        for detail in status.get("details", []):
+            st.caption(detail)
+```
+
+### ~\ragstream\app\ui_streamlit.py
+```python
+# ragstream/app/ui_streamlit.py
+# -*- coding: utf-8 -*-
+"""
+Run on a free port, e.g.:
+  /home/rusbeh_ab/venvs/ragstream/bin/python -m streamlit run /home/rusbeh_ab/project/RAGstream/ragstream/app/ui_streamlit.py --server.port 8503
+"""
+
+from __future__ import annotations
+
+import threading
+
+import streamlit as st
+
+from ragstream.app.controller import AppController
+from ragstream.app.ui_layout import inject_base_css, render_page
+from ragstream.orchestration.super_prompt import SuperPrompt
+
+
+def init_session_state() -> None:
+    """Create one controller + one SuperPrompt set per user session."""
     if "controller" not in st.session_state:
-        st.session_state.controller = AppController()
+        ctrl = AppController()
+        st.session_state.controller = ctrl
+
+    if "heavy_init_started" not in st.session_state:
+        st.session_state["heavy_init_started"] = False
+
+    if not st.session_state["heavy_init_started"]:
+        ctrl: AppController = st.session_state.controller
+
+        t = threading.Thread(
+            target=ctrl.initialize_heavy_components,
+            daemon=True,
+        )
+        t.start()
+
+        st.session_state["heavy_init_started"] = True
+
     if "sp" not in st.session_state:
         st.session_state.sp = SuperPrompt()
     if "sp_pre" not in st.session_state:
@@ -1137,386 +1730,52 @@ def main() -> None:
         st.session_state.sp_rrk = SuperPrompt()
     if "sp_a3" not in st.session_state:
         st.session_state.sp_a3 = SuperPrompt()
+
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
+
     if "ingestion_status" not in st.session_state:
         st.session_state["ingestion_status"] = None
+
     if "new_project_name" not in st.session_state:
         st.session_state["new_project_name"] = ""
+
     if "pending_active_project" not in st.session_state:
-        # Temporary project switch key. We use this instead of modifying
-        # the widget-owned key "active_project" after that widget exists.
+        # Temporary project switch key
         st.session_state["pending_active_project"] = None
+
     if "retrieval_top_k" not in st.session_state:
-        st.session_state["retrieval_top_k"] = 50
+        st.session_state["retrieval_top_k"] = 30
+
+    if "use_retrieval_splade" not in st.session_state:
+            st.session_state["use_retrieval_splade"] = False
+
+    if "use_reranking_colbert" not in st.session_state:
+            st.session_state["use_reranking_colbert"] = False
+
     if "a2_memory_demo_entries" not in st.session_state:
         st.session_state["a2_memory_demo_entries"] = []
+
     if "a2_memory_demo_counter" not in st.session_state:
         st.session_state["a2_memory_demo_counter"] = 0
 
-    # Layout: gutters left/right, two main columns, small spacer between
-    gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
 
-    with gutter_l:
-        st.empty()
+def main() -> None:
+    st.set_page_config(page_title="RAGstream", layout="wide")
 
-    # LEFT: Memory Demo + Prompt + two rows of pipeline buttons
-    with col_left:
-        st.markdown('<div class="field-title">MEMORY DEMO</div>', unsafe_allow_html=True)
+    # Base CSS / compact styles
+    inject_base_css()
 
-        memory_entries = st.session_state["a2_memory_demo_entries"]
+    # Page title
+    st.title("RAGstream")
 
-        try:
-            memory_container = st.container(height=780)
-        except TypeError:
-            memory_container = st.container()
+    # Session bootstrap / background heavy init
+    init_session_state()
 
-        with memory_container:
-            if not memory_entries:
-                st.info("No memory entries yet.")
-            else:
-                for entry in memory_entries:
-                    entry_id = entry["id"]
-                    tag_key = f"a2_memory_tag_{entry_id}"
-
-                    if tag_key not in st.session_state:
-                        st.session_state[tag_key] = entry.get("tag", "Green")
-
-                    input_col, tag_col = st.columns([8.8, 1.0], gap="small")
-
-                    with input_col:
-                        input_html = html.escape(entry.get("input_text", "")).replace("\n", "<br>")
-                        st.markdown(
-                            f"""
-                            <div class="memory-box memory-input-box">
-                                <div class="memory-label">INPUT</div>
-                                <div class="memory-plain-text">{input_html}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                    with tag_col:
-                        selected_tag = st.selectbox(
-                            "Tag",
-                            options=["Platin", "GOLD", "SILVER", "Green", "Black"],
-                            key=tag_key,
-                            index=["Platin", "GOLD", "SILVER", "Green", "Black"].index(
-                                st.session_state[tag_key]
-                            ),
-                            label_visibility="collapsed",
-                        )
-                        entry["tag"] = selected_tag
-
-                    output_html = html.escape(entry.get("output_text", "")).replace("\n", "<br>")
-                    st.markdown(
-                        f"""
-                        <div class="memory-box memory-output-box">
-                            <div class="memory-label">OUTPUT</div>
-                            <div class="memory-plain-text">{output_html}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown("<div style='height:0.40rem'></div>", unsafe_allow_html=True)
-
-        st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="field-title">Prompt</div>', unsafe_allow_html=True)
-        st.text_area(
-            label="Prompt (hidden)",
-            key="prompt_text",
-            height=240,
-            label_visibility="collapsed",
-        )
-
-        # Small vertical spacer
-        st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
-
-        # Row 1: 4 buttons
-        b1c1, b1c2, b1c3, b1c4 = st.columns(4, gap="small")
-        with b1c1:
-            clicked = st.button("Pre-Processing", key="btn_preproc", use_container_width=True)
-            if clicked:
-                ctrl: AppController = st.session_state.controller
-                sp: SuperPrompt = st.session_state.sp
-                user_text = st.session_state.get("prompt_text", "")
-                sp = ctrl.preprocess(user_text, sp)
-                st.session_state.sp = sp
-                st.session_state.sp_pre = copy.deepcopy(sp)
-                st.session_state["super_prompt_text"] = sp.prompt_ready
-
-        with b1c2:
-            clicked_a2 = st.button("A2-PromptShaper", key="btn_a2", use_container_width=True)
-            if clicked_a2:
-                ctrl: AppController = st.session_state.controller
-                sp: SuperPrompt = st.session_state.sp
-
-                sp = ctrl.run_a2_promptshaper(sp)
-                entry = ctrl.build_a2_memory_demo_entry(sp)
-
-                next_id = st.session_state.get("a2_memory_demo_counter", 0) + 1
-                st.session_state["a2_memory_demo_counter"] = next_id
-                entry["id"] = next_id
-
-                st.session_state[f"a2_memory_tag_{next_id}"] = "Green"
-                st.session_state["a2_memory_demo_entries"].append(entry)
-
-                st.session_state.sp = sp
-                st.session_state.sp_a2 = copy.deepcopy(sp)
-                st.session_state["super_prompt_text"] = sp.prompt_ready
-
-                st.rerun()
-
-        with b1c3:
-            clicked_retrieval = st.button("Retrieval", key="btn_retrieval", use_container_width=True)
-            if clicked_retrieval:
-                try:
-                    ctrl: AppController = st.session_state.controller
-                    sp: SuperPrompt = st.session_state.sp
-
-                    project_name = st.session_state.get("active_project")
-                    if not project_name:
-                        available_projects = ctrl.list_projects()
-                        if available_projects:
-                            project_name = available_projects[0]
-                            st.session_state["active_project"] = project_name
-
-                    if not project_name or project_name == "(no projects yet)":
-                        st.error("No active project is available for Retrieval.")
-                    else:
-                        top_k = int(st.session_state.get("retrieval_top_k", 100))
-                        sp = ctrl.run_retrieval(sp, project_name, top_k)
-                        sp.compose_prompt_ready()
-
-                        st.session_state.sp = sp
-                        st.session_state.sp_rtv = copy.deepcopy(sp)
-                        st.session_state["super_prompt_text"] = sp.prompt_ready
-
-                except Exception as e:
-                    st.error(str(e))
-
-        with b1c4:
-            clicked_reranker = st.button("ReRanker", key="btn_reranker", use_container_width=True)
-            if clicked_reranker:
-                ctrl: AppController = st.session_state.controller
-                sp: SuperPrompt = st.session_state.sp
-
-                sp = ctrl.run_reranker(sp)
-                sp.compose_prompt_ready()
-
-                st.session_state.sp = sp
-                st.session_state.sp_rrk = copy.deepcopy(sp)
-                st.session_state["super_prompt_text"] = sp.prompt_ready
-
-        # Row 2: 4 buttons
-        b2c1, b2c2, b2c3, b2c4 = st.columns(4, gap="small")
-        with b2c1:
-            clicked_a3 = st.button("A3 NLI Gate", key="btn_a3", use_container_width=True)
-            if clicked_a3:
-                try:
-                    ctrl: AppController = st.session_state.controller
-                    sp: SuperPrompt = st.session_state.sp
-
-                    sp = ctrl.run_a3(sp)
-
-                    st.session_state.sp = sp
-                    st.session_state.sp_a3 = copy.deepcopy(sp)
-                    st.session_state["super_prompt_text"] = sp.prompt_ready
-
-                except Exception as e:
-                    st.error(str(e))
-
-        with b2c2:
-            st.button("A4 Condenser", key="btn_a4", use_container_width=True)
-        with b2c3:
-            st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
-        with b2c4:
-            st.button("Prompt Builder", key="btn_builder", use_container_width=True)
-
-        st.number_input(
-            "Retrieval Top-K (number of chunks)",
-            min_value=1,
-            max_value=1000,
-            step=1,
-            key="retrieval_top_k",
-        )
-
-        # New project-based ingestion controls placed below the agent buttons.
-        st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
-
-        ctrl: AppController = st.session_state.controller
-        projects = ctrl.list_projects()
-
-        # Apply requested project switch before the "active_project" widget
-        # is created in this run. This avoids the Streamlit session-state error.
-        pending_project = st.session_state.get("pending_active_project")
-        if pending_project is not None:
-            if projects and pending_project in projects:
-                st.session_state["active_project"] = pending_project
-            st.session_state["pending_active_project"] = None
-
-        if projects:
-            if st.session_state.get("active_project") not in projects:
-                st.session_state["active_project"] = projects[0]
-            st.selectbox(
-                "Active DB / Project",
-                options=projects,
-                key="active_project",
-            )
-        else:
-            st.selectbox(
-                "Active DB / Project",
-                options=["(no projects yet)"],
-                index=0,
-                disabled=True,
-            )
-
-        # Show the files that are actually ingested/embedded for the currently
-        # active project by reading the standardized manifest through the controller.
-        active_project = st.session_state.get("active_project")
-        if projects and active_project in projects:
-            embedded_info = ctrl.get_embedded_files(active_project)
-
-            st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-            st.markdown(
-                '<div class="field-title" style="font-size:1.05rem;">Embedded Files</div>',
-                unsafe_allow_html=True,
-            )
-
-            if embedded_info.get("success"):
-                embedded_files = embedded_info.get("files", [])
-                embedded_text = "\n".join(embedded_files) if embedded_files else "(no embedded files yet)"
-                st.text_area(
-                    label="Embedded Files (hidden)",
-                    value=embedded_text,
-                    height=120,
-                    disabled=True,
-                    label_visibility="collapsed",
-                )
-            else:
-                st.error(embedded_info.get("message", "Could not read embedded file list."))
-
-        create_col, add_col = st.columns(2, gap="small")
-
-        with create_col:
-            with st.form("create_project_form", clear_on_submit=False):
-                st.text_input("Project Name", key="new_project_name")
-                create_clicked = st.form_submit_button("Create Project", use_container_width=True)
-                if create_clicked:
-                    try:
-                        result = ctrl.create_project(st.session_state.get("new_project_name", ""))
-                        st.session_state["ingestion_status"] = {
-                            "type": "success",
-                            "message": f"Project created: {result['project_name']}",
-                            "details": [
-                                f"doc_raw: {result['raw_dir']}",
-                                f"chroma_db: {result['chroma_dir']}",
-                                f"manifest: {result['manifest_path']}",
-                            ],
-                        }
-                        st.session_state["pending_active_project"] = result["project_name"]
-                        st.rerun()
-                    except Exception as e:
-                        st.session_state["ingestion_status"] = {
-                            "type": "error",
-                            "message": str(e),
-                            "details": [],
-                        }
-
-        with add_col:
-            with st.form("add_files_form", clear_on_submit=False):
-                add_projects = ctrl.list_projects()
-                if add_projects:
-                    current_active_project = st.session_state.get("active_project")
-                    if current_active_project in add_projects:
-                        default_add_project = current_active_project
-                    else:
-                        default_add_project = add_projects[0]
-
-                    st.selectbox(
-                        "Choose Project",
-                        options=add_projects,
-                        key="add_files_project",
-                        index=add_projects.index(default_add_project),
-                    )
-                    uploaded_files = st.file_uploader(
-                        "Select .txt / .md files from your local machine",
-                        type=["txt", "md"],
-                        accept_multiple_files=True,
-                        key="ingestion_uploaded_files",
-                    )
-                    add_clicked = st.form_submit_button("Add Files", use_container_width=True)
-                    if add_clicked:
-                        try:
-                            result = ctrl.import_files_to_project(
-                                st.session_state.get("add_files_project", ""),
-                                uploaded_files=uploaded_files,
-                            )
-                            if result.get("success"):
-                                st.session_state["ingestion_status"] = {
-                                    "type": "success",
-                                    "message": (
-                                        f"Files added to {result['project_name']} "
-                                        f"and ingestion finished."
-                                    ),
-                                    "details": [
-                                        f"copied files: {result.get('copied_count', 0)}",
-                                        f"files scanned: {result.get('files_scanned', 0)}",
-                                        f"to process: {result.get('to_process', 0)}",
-                                        f"unchanged: {result.get('unchanged', 0)}",
-                                        f"vectors upserted: {result.get('vectors_upserted', 0)}",
-                                        f"manifest: {result.get('manifest_path', '')}",
-                                    ] + [
-                                        f"rejected: {item}" for item in result.get("rejected_files", [])
-                                    ],
-                                }
-                                st.session_state["pending_active_project"] = result["project_name"]
-                                st.rerun()
-                            else:
-                                st.session_state["ingestion_status"] = {
-                                    "type": "error",
-                                    "message": result.get("message", "No files were added."),
-                                    "details": [
-                                        f"rejected: {item}" for item in result.get("rejected_files", [])
-                                    ],
-                                }
-                        except Exception as e:
-                            st.session_state["ingestion_status"] = {
-                                "type": "error",
-                                "message": str(e),
-                                "details": [],
-                            }
-                else:
-                    st.info("Create a project first, then add files.")
-
-        # Small status/debug area for the new ingestion workflow.
-        status = st.session_state.get("ingestion_status")
-        if status:
-            if status.get("type") == "success":
-                st.success(status.get("message", ""))
-            else:
-                st.error(status.get("message", ""))
-            for detail in status.get("details", []):
-                st.caption(detail)
-
-    # SPACER between columns
-    with spacer:
-        st.empty()
-
-    # RIGHT: Super-Prompt box
-    with col_right:
-        st.markdown('<div class="field-title">Super-Prompt</div>', unsafe_allow_html=True)
-        st.text_area(
-            label="Super-Prompt (hidden)",
-            key="super_prompt_text",
-            height=240,
-            label_visibility="collapsed",
-        )
-
-    with gutter_r:
-        st.empty()
-
+    # Page layout
+    render_page()
+    if st.session_state.pop("pending_a2_memory_refresh", False):
+       st.rerun()
 
 if __name__ == "__main__":
     main()
@@ -5294,13 +5553,21 @@ class Reranker:
     # Public API
     # -----------------------------------------------------------------
 
-    def run(self, sp: SuperPrompt) -> SuperPrompt:
+    def run(
+        self,
+        sp: SuperPrompt,
+        *,
+        use_reranking_colbert: bool = True,
+    ) -> SuperPrompt:
         """
         Execute the ReRanker stage and update the same SuperPrompt in place.
 
         Inputs:
             sp:
                 The current evolving SuperPrompt, typically after Retrieval.
+            use_reranking_colbert:
+                If False, bypass real ColBERT scoring and copy the Retrieval
+                order directly into the reranked stage.
 
         Returns:
             The same SuperPrompt instance, mutated in place.
@@ -5311,6 +5578,14 @@ class Reranker:
             - Appends "reranked" to sp.history_of_stages
             - Sets sp.stage = "reranked"
         """
+        if not use_reranking_colbert:
+            reranked_view, reranked_ids = self._build_passthrough_from_retrieval(sp)
+            sp.views_by_stage["reranked"] = reranked_view
+            sp.final_selection_ids = reranked_ids
+            sp.stage = "reranked"
+            sp.history_of_stages.append("reranked")
+            return sp
+
         query_pieces, retrieval_rows, chunk_lookup = self._prepare_inputs(sp)
         colbert_rows = self._score_with_colbert(query_pieces, retrieval_rows, chunk_lookup)
         fused_rows = self._fuse_with_retrieval(retrieval_rows, colbert_rows, chunk_lookup)
@@ -5328,6 +5603,63 @@ class Reranker:
     # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
+
+    def _build_passthrough_from_retrieval(
+        self,
+        sp: SuperPrompt,
+    ) -> tuple[List[tuple[str, float, A3ChunkStatus]], List[str]]:
+        """
+        Bypass real ColBERT and copy the Retrieval order directly into the
+        reranked stage so downstream A3 can run unchanged.
+        """
+        if sp is None:
+            raise ValueError("Reranker.run: 'sp' must not be None")
+
+        retrieval_rows = sp.views_by_stage.get("retrieval")
+        if not retrieval_rows:
+            raise ValueError(
+                "Reranker.run: Retrieval candidates are missing. "
+                "Please run Retrieval before ReRanker."
+            )
+
+        if not sp.base_context_chunks:
+            raise ValueError(
+                "Reranker.run: base_context_chunks is empty. "
+                "Please run Retrieval before ReRanker."
+            )
+
+        candidate_rows = list(retrieval_rows)[: self._top_k]
+        chunk_lookup = {chunk_obj.id: chunk_obj for chunk_obj in sp.base_context_chunks}
+
+        reranked_view: List[tuple[str, float, A3ChunkStatus]] = []
+        reranked_ids: List[str] = []
+
+        for position, (chunk_id, retrieval_score, _status) in enumerate(candidate_rows, start=1):
+            chunk_id_str = str(chunk_id)
+            score = float(retrieval_score)
+
+            reranked_view.append((chunk_id_str, score, A3ChunkStatus.SELECTED))
+            reranked_ids.append(chunk_id_str)
+
+            chunk_obj = chunk_lookup.get(chunk_id_str)
+            if chunk_obj is None:
+                continue
+
+            merged_meta = dict(chunk_obj.meta or {})
+            base_retrieval_rrf = float(merged_meta.get("rrf_score", score))
+
+            merged_meta["retrieval_rrf_score"] = float(
+                merged_meta.get("retrieval_rrf_score", base_retrieval_rrf)
+            )
+            merged_meta["retrieval_score"] = score
+            merged_meta["colbert_score"] = score
+            merged_meta["retrieval_rank"] = int(position)
+            merged_meta["colbert_rank"] = int(position)
+            merged_meta["rerank_rrf_score"] = score
+
+            chunk_obj.meta = merged_meta
+
+        return reranked_view, reranked_ids
 
     def _prepare_inputs(
         self,
@@ -5772,14 +6104,21 @@ class Retriever:
     # Public API
     # -----------------------------------------------------------------
 
-    def run(self, sp: SuperPrompt, project_name: str, top_k: int) -> SuperPrompt:
+    def run(
+        self,
+        sp: SuperPrompt,
+        project_name: str,
+        top_k: int,
+        *,
+        use_retrieval_splade: bool = True,
+    ) -> SuperPrompt:
         """
         Execute the Retrieval stage and update the same SuperPrompt in place.
 
         Visible flow:
             1) PreProcessing
             2) Retriever_EMB
-            3) Retriever_SPLADE
+            3) Retriever_SPLADE or dense passthrough clone
             4) RRF_Merger
             5) PostProcessing
 
@@ -5794,18 +6133,28 @@ class Retriever:
             top_k=top_k,
         )
 
-        candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
+        ranked_rows_splade: List[RankedRow]
 
-        try:
-            ranked_rows_splade = self._get_retriever_splade().run(
-                project_name=project_name,
-                query_pieces=query_pieces,
-                top_k=top_k,
-                candidate_ids=candidate_ids,
-            )
-        except FileNotFoundError:
-            # Keep Retrieval usable even if an older project has no SPLADE store yet.
-            ranked_rows_splade = []
+        if use_retrieval_splade:
+            candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
+
+            try:
+                ranked_rows_splade = self._get_retriever_splade().run(
+                    project_name=project_name,
+                    query_pieces=query_pieces,
+                    top_k=top_k,
+                    candidate_ids=candidate_ids,
+                )
+            except FileNotFoundError:
+                # Keep Retrieval usable even if an older project has no SPLADE store yet.
+                ranked_rows_splade = []
+        else:
+            # Bypass real SPLADE and duplicate the dense branch into the second
+            # RRF input slot so the downstream Retrieval contract stays unchanged.
+            ranked_rows_splade = [
+                (str(chunk_id), float(score), dict(meta or {}))
+                for chunk_id, score, meta in ranked_rows_emb
+            ]
 
         ranked_rows = rrf_merge(
             ranked_rows_emb,

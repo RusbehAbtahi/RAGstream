@@ -55,7 +55,7 @@ At the highest level, RAGstream consists of:
   * A2 PromptShaper (LLM-based Chooser agent).
   * Retrieval (deterministic hybrid first-pass retrieval stage).
   * ReRanker (deterministic bounded reranking stage).
-  * A3 NLI Gate (LLM-based chunk labeling and duplicate-marking agent).
+  * A3 NLI Gate (LLM-based usefulness classifier over reranked chunks).
   * A4 Condenser (LLM-based summarization / context compressor).
   * A5 Format Enforcer (LLM-based format / style agent).
   * Prompt Builder (deterministic prompt composer).
@@ -100,7 +100,7 @@ At minimum, SuperPrompt must represent:
   * Optional attachments (raw excerpts that the final LLM may see).
 * Stage and history:
 
-  * Current stage name (raw, preprocessed, a2, retrieval, reranked, a3, a4, a5, built).
+  * Current stage name (raw, preprocessed, a2, retrieval, reranked, a3, a4, a5). Prompt Builder does not introduce a new lifecycle stage; it keeps the stage at `a5`.
   * A history of stages that have been run in order.
 * GUI snapshot:
 
@@ -193,14 +193,14 @@ In intermediate mode, the GUI exposes eight buttons, one per stage. The typical 
 5. ReRanker (button “ReRanker”):
 
    * Controller calls ReRanker on those Retrieval candidates.
-   * ReRanker is a deterministic bounded reranking stage that uses query splitting and ColBERT-based reranking on the Retrieval candidate band, then fuses that result with the previous Retrieval ranking.
+   * ReRanker is a deterministic bounded reranking stage. The current implemented code path is cross-encoder based; the agreed immediate next direction is ColBERT.
    * SuperPrompt records the reranked stage snapshot in `views_by_stage["reranked"]` and updates the current selection accordingly.
 
 6. A3 NLI Gate (button “A3 NLI Gate”):
 
    * Controller calls A3, another agent driven via AgentFactory/AgentPrompt/llm_client.
-   * A3 inspects the reranked candidate set, assigns labels such as `Must_Keep`, `Useful`, `BorderLine`, or `Discarded`, and records duplicate relations against higher-ranked chunks.
-   * SuperPrompt’s selection is filtered; only “keep” chunks remain.
+   * A3 inspects the reranked candidate set, assigns usefulness labels such as `useful`, `borderline`, or `discarded`, and produces a structured working set for downstream stages.
+   * SuperPrompt’s selection is filtered through useful-first selection with deterministic borderline fallback when needed.
 
 7. A4 Condenser (button “A4 Condenser”):
 

@@ -1,6 +1,6 @@
 # Requirements_RAG_Pipeline.md
 
-Last update: 14.04.2026
+Last update: 21.04.2026
 
 Note for future maintenance:
 - When new implementation-aligned decisions or stage changes are added here, they should be date-stamped inline so the chronology stays visible.
@@ -13,7 +13,7 @@ Goal: define the 8-step RAG pipeline (A0…A5 + Prompt Builder), how each stage 
 
 1. The pipeline is a single linear chain of stages, driven either:
 
-   * manually via the 8 GUI buttons in `ui_streamlit.py`, or
+   * manually via the 8 GUI buttons in the Generation-1 Streamlit GUI (`ui_streamlit.py`, `ui_layout.py`, `ui_actions.py`), or
    * automatically by the controller in the same order.
 2. The canonical state carrier is `SuperPrompt` (class in `ragstream/orchestration/super_prompt.py`). All stages are **memoryless**: they take `(SuperPrompt, config)` as input, mutate it in a controlled way, and return it; no stage keeps its own long-lived internal memory.
 3. Retrieval and reranking are fully **deterministic** at ranking level. Retrieval uses CPU-friendly dense + sparse retrieval, and ReRanker uses a bounded deterministic reranking stage. The current implementation is cross-encoder based; the agreed immediate next direction is ColBERT. All other “A-agents” use the neutral agent stack (`AgentFactory`, `AgentPrompt`, `llm_client`) defined in `Requirements_AgentStack.md`.
@@ -57,7 +57,7 @@ Button sequence (manual mode), which is also the execution order in auto mode:
 | 2    | A2_PromptShaper    | `a2`           | Agent          | LLM-only                              | Chooser                              | Classify `system`, `audience`, `tone`, `depth`, `confidence` from task/context/purpose.                                                                 |
 | 3    | Retrieval          | `retrieval`    | Function       | No LLM                                | –                                    | Hybrid first-pass retrieval: dense branch selects the candidate IDs, SPLADE scores exactly those same candidate IDs, then weighted RRF populates `base_context_chunks` and `views_by_stage["retrieval"]`. |
 | 4    | ReRanker           | `reranked`     | Function       | No LLM in the current code path       | –                                    | Current bounded cross-encoder reranking of top Retrieval candidates; agreed immediate next direction is ColBERT.                                        |
-| 5    | A3_NLI_Gate        | `a3`           | Agent          | Hybrid                                | Multi-Chooser                        | LLM-based chunk labeling and duplicate marking on the reranked candidates, write `views_by_stage["a3"]` and update `final_selection_ids`.            |
+| 5    | A3_NLI_Gate        | `a3`           | Agent          | Hybrid                                | Multi-Chooser                        | LLM-based usefulness classification over the reranked candidates, write `views_by_stage["a3"]`, and update `final_selection_ids` with useful-first plus borderline fallback.            |
 | 6    | A4_Condenser       | `a4`           | Agent          | LLM-only                              | Writer                               | Condense selected chunks into `S_CTX_MD`, enforce token budget, finalize `final_selection_ids`.                                                         |
 | 7    | A5_Format_Enforcer | `a5`           | Agent          | LLM-only                              | Writer/Extractor                     | Normalize instructions and output format rules in `sp.body`/`extras` so final answer obeys structure.                                                   |
 | 8    | Prompt_Builder     | (stays `a5`)   | Function       | No LLM                                | –                                    | Render `System_MD`, `Prompt_MD`, `S_CTX_MD`, `Attachments_MD`, final `prompt_ready` from `SuperPrompt`.                                                 |
@@ -68,7 +68,7 @@ Button sequence (manual mode), which is also the execution order in auto mode:
 
 All stages use the same `SuperPrompt` invariants:
 
-1. `base_context_chunks` is the **authoritative set** of retrieved `Chunk` objects for the session (merged from conversation history + long-term memory, de-duplicated by `id`). No stage creates a second corpus; later stages only manipulate views on these chunks.
+1. `base_context_chunks` is the **authoritative set** of hydrated `Chunk` objects returned by the current project-document retrieval path for the session, de-duplicated by `id`. In the current implemented code path this is document/project retrieval, not conversation-history retrieval. No stage creates a second corpus; later stages only manipulate views on these chunks.
 2. `views_by_stage[stage]` is an **ordered list of per-chunk stage snapshots** written by each stage that deals with retrieval results. In the current implementation the snapshot item is `(chunk_id, stage_score, stage_status)`. This keeps ranking/filter information next to the `chunk_id` without mutating the `Chunk` itself.
 3. `final_selection_ids` always contains the current chosen `chunk_id`s for building `S_CTX_MD` and `Attachments_MD`. After A4 it reflects the token-budgeted subset that feeds the final LLM.
 4. `Chunk` objects are **immutable** after creation. Scores and keep/drop status live in `views_by_stage` (and optionally in other stage-local metadata), not inside `Chunk`.
@@ -179,7 +179,7 @@ Inputs
 * `sp: SuperPrompt` with `stage="preprocessed"`.
 * A2 agent config JSON (see `Requirements_AgentStack.md`), containing:
 
-  * Name / version (e.g. `"agent_name": "A2_PromptShaper", "version": "v1"`).
+  * Agent id / version (e.g. `"agent_meta": {"agent_id": "a2_promptshaper", "version": "003"}`).
   * Enum lists for `system`, `audience`, `tone`, `depth`, `confidence`.
   * Default values and thresholds (e.g. min confidence).
   * Underlying model id (e.g. `ft:gpt-4.1-mini-...`), temperature, etc.
@@ -298,12 +298,13 @@ ReRanker must therefore act as a bounded refinement stage, not as a blind overwr
 
 Purpose
 
-* Filter and clean the reranked list using an LLM as a semantic gate and structured chunk labeler.
+* Filter and clean the reranked list using an LLM as a usefulness classifier over the reranked candidate set.
+* Current implemented truth: A3 is usefulness-only. Duplicate marking has been intentionally removed from the A3 contract.
 
 Nature
 
 * Kind: Agent.
-* Type: **Hybrid**: optional Python pre-filters + LLM Multi-Chooser.
+* Type: **Hybrid**: LLM usefulness classification over a candidate list plus deterministic post-processing.
 
 Inputs
 
@@ -312,37 +313,61 @@ Inputs
 * A3 agent config JSON (via AgentFactory), including:
 
   * max candidates to consider,
-  * allowed labels,
-  * duplicate-detection fields,
+  * allowed usefulness labels,
+  * selection-band contract,
   * final-selection policy parameters.
 
 Behaviour
 
 1. Optional deterministic pre-filter:
 
-   * Cap candidates to the working set produced by ReRanker.
-   * Remove obviously empty or trivial chunks.
-2. Build an A3 AgentPrompt (Multi-Chooser over many items):
+   * cap candidates to the working set produced by ReRanker,
+   * remove obviously empty or trivial chunks.
+2. Build the prompt-under-evaluation block from the current user prompt in this semantic order:
 
-   * Input payload: the current prompt plus the ordered list of reranked candidate chunks.
-   * Output: one structured decision per chunk.
-3. Call LLM via llm_client and parse the JSON response.
-4. For each candidate chunk, A3 assigns one label from the agreed set, for example:
+   * `purpose`, if present,
+   * `task`,
+   * `context`, if present.
 
-   * `Must_Keep`
-   * `Useful`
-   * `BorderLine`
-   * `Discarded`
-5. A3 also marks duplicates / near-duplicates. If two chunks are effectively the same in meaning, only the weaker-ranked chunk is marked as duplicated and points to the stronger `chunk_id`.
-6. Write:
+   Important current rule:
 
-   * `sp.views_by_stage["a3"] = [(chunk_id, a3_score, a3_status), ...]`.
-   * `sp.final_selection_ids` becomes the ordered list that survives A3, with a target corridor from a small minimum working set up to `N3_FINAL_SELECTION_MAX`.
-7. Update stage:
+   * no `## Purpose` / `## Task` / `## Context` labels,
+   * no A2 meta fields such as audience / tone / depth / confidence,
+   * only the real prompt text is sent to A3.
+3. Build the evidence block from the reranked candidates using local ids `1..N` mapped internally back to the real chunk ids.
+
+   Important current rules:
+
+   * the LLM-facing prompt must not expose the long real chunk ids,
+   * evidence chunks use one outer XML-like wrapper style only,
+   * chunk-internal line-start structure markers such as headings and code fences are sanitized so they do not fight with the outer prompt structure.
+4. Call the LLM via `AgentFactory -> AgentPrompt -> llm_client` and parse the structured JSON response.
+5. The current A3 output contract is conceptually:
+
+   * one global `selection_band`, and
+   * `item_decisions` with one `usefulness_label` per local chunk id.
+
+   Current usefulness labels are:
+
+   * `useful`
+   * `borderline`
+   * `discarded`
+
+   No duplicate fields, canonical ids, or duplicate references belong to the current A3 contract.
+6. Deterministic post-processing is mandatory after the LLM response:
+
+   * `useful` chunks form the primary selected working set,
+   * a hard max selection cap is enforced,
+   * if too few useful chunks exist, the best `borderline` chunks are promoted in reranker order until the minimum working floor is reached.
+7. Write:
+
+   * `sp.views_by_stage["a3"] = [(chunk_id, a3_score, a3_status), ...]`,
+   * `sp.final_selection_ids` from the useful-first policy plus borderline fallback.
+8. Update stage:
 
    * `sp.stage = "a3"`; append history.
 
-A3 must **never** mutate `Chunk` contents; it only changes labels, duplicate markers, and which ids survive.
+A3 must **never** mutate `Chunk` contents; it only changes usefulness labels, stage statuses, and which ids survive into the downstream selection.
 
 ### 5.6 A4_Condenser
 

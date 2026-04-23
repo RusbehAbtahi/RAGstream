@@ -48,6 +48,8 @@ def init_session_state() -> None:
         st.session_state.sp_rrk = SuperPrompt()
     if "sp_a3" not in st.session_state:
         st.session_state.sp_a3 = SuperPrompt()
+    if "sp_a4" not in st.session_state:
+        st.session_state.sp_a4 = SuperPrompt()
 
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""

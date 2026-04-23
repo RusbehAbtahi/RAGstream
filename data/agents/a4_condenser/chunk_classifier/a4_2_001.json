@@ -1,0 +1,105 @@
+{
+  "agent_meta": {
+    "agent_id": "a4_chunk_classifier",
+    "version": "001",
+    "agent_type": "Classifier",
+    "name": "A4 Chunk Classifier",
+    "description": "Assigns each selected chunk to exactly one active class id produced by the chunk phraser.",
+    "tags": [
+      "a4",
+      "classifier",
+      "chunk_classifier",
+      "ragstream"
+    ],
+    "enabled": true
+  },
+
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-5-mini",
+    "temperature": 0.0,
+    "max_tokens": 1200,
+    "response_format": "json"
+  },
+
+  "static_prompt": {
+    "preamble": "You are an evidence-processing assistant.\nYou do not answer the original user request directly.",
+    "Agent Purpose": "Given the selected evidence chunks, the prompt under evaluation, and the active class definitions, assign each chunk to exactly one active class for downstream deterministic regrouping.",
+    "Task": "Classify every candidate chunk into exactly one active class id.\nEvaluate the chunks comparatively as one set, not independently.\nUse the active class definitions exactly as provided.\nKeep the original input order in the output.\nReturn only the required JSON object.",
+    "Hard Rules": "- Never answer the original user request.\n- Assign exactly one class id to every chunk.\n- Never assign multiple classes to one chunk.\n- Use only the active class ids provided in this run.\n- If a chunk could fit more than one class, break ties in this order: stronger relevance to the current prompt, then stronger semantic fit to the class meaning, then the more specific class, then the higher-ranked class.\n- Keep the original input order in the output.\n- Do not invent classes.\n- Do not omit chunks.\n- Do not return prose, comments, explanations, or extra keys.\n- Return only the required JSON object."
+  },
+
+  "dynamic_bindings": [
+    {
+      "id": "user_prompt_under_evaluation",
+      "prompt_text": "## Prompt Under Evaluation",
+      "bind_from": "A4.user_prompt_under_evaluation",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "active_class_definitions",
+      "prompt_text": "## Active Class Definitions",
+      "bind_from": "A4.active_class_definitions",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "evidence_chunks",
+      "prompt_text": "## Evidence Chunks",
+      "bind_from": "A4.evidence_chunks",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "required_output",
+      "prompt_text": "## Required Output",
+      "bind_from": "A4.required_output",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    }
+  ],
+
+  "decision_targets": [
+    {
+      "id": "class_id",
+      "label": "Allowed class ids for chunk assignment",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "options": [
+        "ID1",
+        "ID2",
+        "ID3",
+        "ID4"
+      ]
+    }
+  ],
+
+  "output_schema": {
+    "format": "json",
+    "type": "object",
+    "root_key": "item_decisions",
+    "item_id_key": "chunk_id",
+    "item_fields": [
+      {
+        "field_id": "class_id",
+        "result_key": "class_id"
+      }
+    ]
+  },
+
+  "elements_order": [
+    "evidence_chunks",
+    "user_prompt_under_evaluation",
+    "active_class_definitions",
+    "Hard Rules",
+    "Agent Purpose",
+    "Task",
+    "required_output"
+  ]
+}

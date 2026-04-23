@@ -1,0 +1,95 @@
+{
+  "agent_meta": {
+    "agent_id": "a4_chunk_phraser",
+    "version": "001",
+    "agent_type": "Synthesizer",
+    "name": "A4 Chunk Phraser",
+    "description": "Produces a small ranked set of orthogonal class phrases from the A3 useful chunks and the prompt under evaluation.",
+    "tags": [
+      "a4",
+      "synthesizer",
+      "chunk_phraser",
+      "ragstream"
+    ],
+    "enabled": true
+  },
+
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-5-mini",
+    "temperature": 0.0,
+    "max_tokens": 700,
+    "response_format": "json"
+  },
+
+  "static_prompt": {
+   "preamble": "You are an evidence-processing assistant.\nYou do not answer the original user request directly.",
+    "Agent Purpose": "Given one selected evidence set and the user prompt under evaluation, produce a small ranked set of thematic class phrases that will later be used for deterministic regrouping and final synthesis.",
+    "Task": "Produce a small ranked class set for the current evidence set.\nUse only class ids from ID1 to ID4.\nProduce only as many classes as are really needed.\nEach class must contain one class_phrase and one class_context_text.\nKeep the classes as orthogonal as possible.\nReturn only the required JSON object.",
+    "Hard Rules": "- Never answer the original user request.\n- Never invent a theme that is not supported by the chunks.\n- Prefer fewer classes over overlapping classes.\n- class_phrase must be short, phrase-like, and not sentence-like.\n- class_phrase should typically be 1 to 4 words.\n- Hyphenated phrases are allowed.\n- class_context_text must be short, concrete, and useful for later classification.\n- Rank the classes by importance for the current prompt under evaluation.\n- Use contiguous class ids starting from ID1.\n- If only two classes are needed, return only ID1 and ID2.\n- Do not skip to ID4 if ID3 is absent.\n- Do not return prose, comments, explanations, or extra keys.\n- Return only the required JSON object."
+  },
+
+  "dynamic_bindings": [
+    {
+      "id": "user_prompt_under_evaluation",
+      "prompt_text": "## Prompt Under Evaluation",
+      "bind_from": "A4.user_prompt_under_evaluation",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "evidence_chunks",
+      "prompt_text": "## Evidence Chunks",
+      "bind_from": "A4.evidence_chunks",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "decision_targets",
+      "prompt_text": "## Decision Targets",
+      "bind_from": "A4.decision_targets",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "required_output",
+      "prompt_text": "## Required Output",
+      "bind_from": "A4.required_output",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    }
+  ],
+
+  "decision_targets": [],
+
+  "output_schema": {
+    "format": "json",
+    "type": "object",
+    "root_key": "class_definitions",
+    "item_id_key": "class_id",
+    "item_fields": [
+      {
+        "field_id": "class_phrase",
+        "result_key": "class_phrase"
+      },
+      {
+        "field_id": "class_context_text",
+        "result_key": "class_context_text"
+      }
+    ]
+  },
+
+  "elements_order": [
+    "evidence_chunks",
+    "user_prompt_under_evaluation",
+    "Hard Rules",
+    "Agent Purpose",
+    "Task",
+    "decision_targets",
+    "required_output"
+  ]
+}

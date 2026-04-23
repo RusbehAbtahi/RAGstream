@@ -4,29 +4,42 @@
 
 ---
 
-This document specifies the “Agent Stack” used by all LLM-using agents in RAGstream.
+This document specifies the “Agent Stack” used by the LLM-using agents in RAGstream.
 
 The Agent Stack covers:
 
-* AgentFactory (agent_factory.py)
-* AgentPrompt (agent_prompt.py)
-* llm_client (llm_client.py)
+* AgentFactory (`agent_factory.py`)
+* AgentPrompt (`agent_prompt.py`)
+* llm_client (`llm_client.py`)
 
-The Controller and each Agent (e.g. A2 PromptShaper, PreProcessing, A3, A4, A5) are mentioned only where needed to define interfaces, but their detailed requirements live elsewhere.
+The Controller and each Agent (e.g. A2 PromptShaper, A3, and later A4/A5) are mentioned only where needed to define interfaces, but their detailed requirements live elsewhere.
 
 The goals of this stack are:
 
 * Neutral, stateless behavior (no hidden state, no A2-specific logic inside AgentFactory / AgentPrompt / llm_client).
 * Agents defined as **data** (JSON configs) instead of hard-coded logic.
-* Support for four agent types: **Chooser**, **Writer**, **Extractor**, **Multi-Chooser**.
 * Clean separation of concerns:
 
   * Agent = domain logic and deterministic post-processing
-  * AgentFactory = config loader + validation + AgentPrompt construction
-  * AgentPrompt = neutral prompt composer + output validator
+  * AgentFactory = config loader + config resolution + AgentPrompt construction
+  * AgentPrompt = neutral prompt composer + parser/validator
   * llm_client = low-level LLM call
 
-A2 PromptShaper is used as the running example, but the same stack must work for PreProcessing, A3, A4, A5, the future `NLP_Splitter`, and later agents.
+Current implementation-aligned neutrality rule:
+
+* AgentFactory, AgentPrompt, and llm_client MUST remain neutral.
+* A3-specific evidence rendering, local chunk-id mapping, chunk-text sanitization, and A3-specific prompt assembly MUST live in `a3_nli_gate.py` and/or the A3 JSON config, not inside neutral Agent Stack files.
+
+Current practical scope:
+
+* The current live Agent Stack consumers are A2 PromptShaper and A3 NLI Gate.
+* The stack is intended to remain reusable for later A4, A5, `NLP_Splitter`, and other agents, but those later consumers must not be described here as if they were already active runtime behavior where code does not yet show that.
+
+Implementation note:
+
+* The current code keeps a transparent read-only cache of constructed `AgentPrompt` objects inside `AgentFactory`. This cache is configuration-level reuse, not agent business state.
+
+A2 PromptShaper is used as the running example, but the same neutral stack should remain reusable for A3 and later agents.
 
 2. High-level data flow (A2 example)
 
@@ -38,34 +51,33 @@ The A2 data flow using the Agent Stack:
 
 1. Controller
 
-   * Calls `A2.run(superprompt, agent_id="a2_promptshaper", version="002")`.
-   * Does not know anything about agent configs, AgentFactory, AgentPrompt, or llm_client.
+   * Calls `A2.run(superprompt)`.
+   * Does not know anything about agent configs, AgentFactory, AgentPrompt, or llm_client internals.
 
 2. A2 (agent code)
 
-   * Extracts from `superprompt` the fields it wants to send to the LLM, e.g.:
+   * Extracts from `superprompt.body` the fields it wants to send to the LLM, e.g.:
 
      * `task`
      * `purpose`
      * `context`
 
-   * Builds an `input_payload` dict:
+   * Builds an `input_payload` dict, for example:
 
      ```python
      input_payload = {
-         "task": superprompt.task,
-         "purpose": superprompt.purpose,
-         "context": superprompt.context,
+         "task": superprompt.body.get("task", ""),
+         "purpose": superprompt.body.get("purpose", ""),
+         "context": superprompt.body.get("context", ""),
      }
      ```
 
    * Calls AgentFactory:
 
      ```python
-     agent_prompt = AgentFactory.create(
+     agent_prompt = self.agent_factory.get_agent(
          agent_id="a2_promptshaper",
-         version="002",
-         input_payload=input_payload,
+         version="003",
      )
      ```
 
@@ -78,40 +90,41 @@ The A2 data flow using the Agent Stack:
    * Calls llm_client:
 
      ```python
-     llm_raw_output = llm_client.call(
-         model=agent_prompt.model_name,
+     llm_raw_output = self.llm_client.chat(
          messages=messages,
-         response_format=response_format,
+         model_name=agent_prompt.model_name,
          temperature=agent_prompt.temperature,
+         max_output_tokens=agent_prompt.max_output_tokens,
+         response_format=response_format,
      )
      ```
 
-   * Uses AgentPrompt to validate / parse the output:
+   * Uses AgentPrompt to parse and validate the output:
 
      ```python
-     labels = agent_prompt.parse_and_validate(llm_raw_output)
-     # labels: dict with system, audience, tone, response_depth, confidence
+     labels = agent_prompt.parse(llm_raw_output)
+     # labels: dict with system, audience, tone, depth, confidence
      ```
 
    * Runs deterministic checks and logging, updates SuperPrompt with the new labels, and returns to the Controller.
 
 3. AgentFactory
 
-   * Loads the JSON config for agent `"A2"` and version `"v1"`.
-   * Validates `input_payload` shape (required keys, types).
-   * Builds a configured AgentPrompt instance and returns it to A2.
+   * Loads the JSON config for agent id `a2_promptshaper` and version `003`.
+   * Resolves any catalog-backed decision-target expansions needed by the config.
+   * Builds or reuses a configured AgentPrompt instance and returns it to A2.
 
 4. AgentPrompt
 
-   * Holds the agent’s **configuration** (from JSON): mode (Chooser/Writer/Extractor), system text, purpose text, enums, response schema, model name, temperature, etc.
-   * Is **neutral**: no A2-specific or agent-specific logic.
-   * When `compose(input_payload)` is called, it produces the LLM prompt (SYSTEM + USER messages) and the JSON schema (`response_format`).
-   * When `parse_and_validate(raw_output)` is called, it validates the LLM’s JSON against enums / schema / defaults and returns a clean Python dict.
+   * Holds the agent’s configuration (from JSON): mode, static prompt fields, dynamic bindings, decision targets, output schema, model name, temperature, etc.
+   * Is neutral: no A2-specific or agent-specific business logic.
+   * When `compose(input_payload)` is called, it produces the LLM prompt (SYSTEM + USER messages) and the response-format object.
+   * When `parse(raw_output)` is called, it parses and validates the LLM’s JSON against schema/enums/defaults and returns a clean Python dict.
 
 5. llm_client
 
    * Low-level wrapper around the LLM API (OpenAI for now).
-   * Only knows about `model`, `messages`, `response_format` (JSON schema), and standard parameters like temperature.
+   * Only knows about `messages`, `model_name`, `temperature`, `max_output_tokens`, and optional `response_format`.
    * Does not know anything about agents or AgentPrompt.
 
 3) Agent configuration data (JSON)
@@ -132,98 +145,76 @@ The A2 data flow using the Agent Stack:
 
   Examples:
 
-  * `data/agents/a2_promptshaper/002.json`
-  * `data/agents/a3_nligate/001.json`
+  * `data/agents/a2_promptshaper/003.json`
+  * `data/agents/a3_nli_gate/001.json`
   * `data/agents/a4_condenser/001.json`
 
 * The exact path construction is the responsibility of AgentFactory; calling agents (A2, etc.) must not hard-code file paths.
 * The current AgentFactory derives this base path from the repository root and treats it as the single source of truth for runtime agent configs.
 
-3.3. AgentConfig JSON schema (conceptual)
+3.3. AgentConfig JSON schema (current implementation-aligned conceptual structure)
 
-Each agent config JSON MUST follow this conceptual structure:
+Each agent config JSON is currently expected to follow this conceptual structure:
 
 ```json
 {
-  "agent_id": "a2_promptshaper",
-  "version": "002",
+  "agent_meta": {
+    "agent_id": "a2_promptshaper",
+    "version": "003",
+    "agent_type": "chooser"
+  },
 
-  "mode": "Chooser",         // Chooser | Writer | Extractor | Multi-Chooser
+  "llm_config": {
+    "model_name": "gpt-4.1-mini",
+    "temperature": 0.0,
+    "max_tokens": 256
+  },
 
-  "system_text": "You are A2 PromptShaper. ...",
-  "purpose_text": "You must inspect task/purpose/context and choose labels for system, audience, tone, response_depth, confidence.",
+  "static_prompt": {
+    "system_role": "You are A2 PromptShaper.",
+    "agent_purpose": "Inspect task/purpose/context and choose labels.",
+    "notes": ""
+  },
+
+  "dynamic_bindings": [
+    {"id": "task", "required": true},
+    {"id": "purpose", "required": false},
+    {"id": "context", "required": false}
+  ],
+
+  "decision_targets": [
+    {
+      "id": "tone",
+      "result_key": "tone",
+      "options": ["direct", "friendly", "formal"],
+      "default": "direct"
+    }
+  ],
 
   "output_schema": {
-    "type": "object",
-    "required": ["system", "audience", "tone", "response_depth", "confidence"],
-    "properties": {
-      "system": {
-        "type": "string",
-        "enum": ["Python_Programmer", "AWS_Architect", "Friend"]
-      },
-      "audience": {
-        "type": "string",
-        "enum": ["Developer", "Manager", "Friend", "Self"]
-      },
-      "tone": {
-        "type": "string",
-        "enum": ["direct", "friendly", "formal"]
-      },
-      "response_depth": {
-        "type": "string",
-        "enum": ["short", "detailed", "exhaustive"]
-      },
-      "confidence": {
-        "type": "string",
-        "enum": ["low", "medium", "high"]
-      }
-    }
-  },
-
-  "enums": {
-    "system": ["Python_Programmer", "AWS_Architect", "Friend"],
-    "audience": ["Developer", "Manager", "Friend", "Self"],
-    "tone": ["direct", "friendly", "formal"],
-    "response_depth": ["short", "detailed", "exhaustive"],
-    "confidence": ["low", "medium", "high"]
-  },
-
-  "defaults": {
-    "tone": "direct",
-    "response_depth": "detailed",
-    "confidence": "medium"
-  },
-
-  "model_name": "gpt-4.1-mini",
-  "temperature": 0.0,
-  "max_output_tokens": 256
+    "type": "object"
+  }
 }
 ```
 
 Requirements:
 
-* `agent_name` and `version` MUST match what the Agent passes to AgentFactory.
+* `agent_meta.agent_id` and `agent_meta.version` MUST match what the Agent passes to AgentFactory.
+* The current code reads `agent_meta.agent_type` and maps conceptual aliases into runtime modes. In particular:
 
-* `mode` MUST be one of `"Chooser"`, `"Writer"`, `"Extractor"`, `"Multi-Chooser"`.
+  * `chooser` -> runtime mode `selector`
+  * `multi-chooser` / `multi_chooser` -> runtime mode `classifier`
 
-  * **Chooser:** LLM selects one or more values from enums for each output field.
-  * **Writer:** LLM fills text fields (e.g. summaries, explanations) according to schema; enums may be absent or minimal.
-  * **Extractor:** LLM extracts structured information from input and maps it into schema fields (e.g. named entities, slots).
-  * **Multi-Chooser:** LLM assigns one structured decision per item in a list (for example one label per chunk, plus duplicate metadata) while still returning one JSON object.
+* The current live compose/parse path actively supports runtime modes `selector` and `classifier`.
+* The broader conceptual families Writer / Extractor / Scorer may appear in code comments or future config vocabulary, but they are not the current live compose/parse branches and must not be described here as if they were already active runtime support.
+* `static_prompt`, `dynamic_bindings`, `decision_targets`, `llm_config`, and `output_schema` are the current primary config blocks consumed by `AgentPrompt.from_config(...)`.
+* The current code still supports limited backward-compatible fallbacks when some configs use older names such as `prompt_profile` instead of `static_prompt`, or `fields` instead of `decision_targets`.
+* `output_schema` defines the structured response target. In the current code path the response format sent to the LLM is `{"type": "json_object"}`, while schema/enums/defaults are enforced during parse/validation.
+* `decision_targets` are the source of enums, defaults, cardinality, and option metadata for selector/classifier behavior.
+* `model_name` MUST match an OpenAI chat model name or fine-tuned model id.
+* `temperature` and `max_tokens` are basic numeric parameters; no further tuning knobs are required at this stage.
 
-* `system_text` and `purpose_text` are pure text; they define behavior but contain no code.
-
-* `output_schema` defines the JSON schema to be used as `response_format` for the LLM.
-
-* `enums` MUST be consistent with `output_schema.properties[<field>].enum` where applicable.
-
-* `defaults` MAY provide fallback values if a field is missing in the LLM output.
-
-* `model_name` MUST match an OpenAI chat model name (or a fine-tuned model id).
-
-* `temperature` and `max_output_tokens` are basic numeric parameters; no further tuning knobs are required at this stage.
-
-Future extension: if you later need multiple providers (OpenAI, local TinyLlama, etc.), a `provider` field can be introduced, but it is not part of this initial requirement.
+Future extension: if you later need multiple providers (OpenAI, local TinyLlama, etc.), a `provider` field can be introduced, but it is not part of this current requirement.
 
 3.4. Agreed future agent additions
 
@@ -232,14 +223,16 @@ The following agent additions are now part of the agreed future direction and mu
 * `NLP_Splitter`
 
   * Purpose: read retrieval-relevant prompt fields and split a long prompt into several meaning-based subqueries under a configured upper token limit.
-  * Expected mode: `Writer` or `Extractor`, depending on the final chosen schema.
+  * Expected mode family: Writer or Extractor, depending on the final chosen schema.
   * Expected output shape: a JSON object containing an ordered list of subqueries.
 
-* `A3_NLI_Gate` future upgrade
+* `A3_NLI_Gate`
 
-  * Purpose: inspect multiple reranked chunks at the same time and assign one label per chunk.
-  * Expected mode: `Multi-Chooser`.
-  * Expected output shape: one JSON object containing, for each candidate chunk, a label such as `Must_Keep`, `Useful`, `BorderLine`, or `Discarded`, plus optional duplicate metadata.
+  * Current practical truth: A3 is already a live consumer of the Agent Stack.
+  * Current implemented direction: inspect multiple reranked chunks at the same time and assign one usefulness label per chunk as part of one structured set-level decision.
+  * Conceptual mode family: Multi-Chooser.
+  * Current runtime mode mapping: `classifier`.
+  * Expected output shape: one JSON object containing one global `selection_band` plus `item_decisions`, where each candidate chunk receives a usefulness label such as `useful`, `borderline`, or `discarded`.
 
 4. AgentFactory (agent_factory.py)
 
@@ -249,11 +242,10 @@ The following agent additions are now part of the agreed future direction and mu
 
 AgentFactory is responsible for:
 
-* Mapping `(agent_name, version)` to the correct JSON config file.
-* Loading and parsing the JSON into an internal `AgentConfig` structure.
-* Validating the config’s internal consistency (e.g. enums vs schema).
-* Validating that the `input_payload` provided by the Agent matches what the config expects (required keys, types).
-* Constructing and returning a properly configured AgentPrompt instance.
+* Mapping `(agent_id, version)` to the correct JSON config file.
+* Loading and parsing the JSON into an internal configuration dict.
+* Resolving external catalog references inside `decision_targets`.
+* Constructing and returning a configured AgentPrompt instance, with transparent config-level caching in the current implementation.
 
 AgentFactory MUST NOT:
 
@@ -263,19 +255,25 @@ AgentFactory MUST NOT:
 
 4.2. Statelessness
 
-* AgentFactory MUST be stateless. Each call to `create(...)` must depend only on its arguments and the JSON file contents.
-* It MUST NOT cache mutable state between calls; if caching is later added (e.g. config cache), it must be read-only and transparent to callers.
+* AgentFactory MUST remain neutral and free of agent business state.
+* The current implementation keeps a transparent read-only cache of `AgentPrompt` instances keyed by `(agent_id, version)`. This cache is allowed because it reuses immutable configuration objects and does not introduce agent business memory.
 
 4.3. Public interface
 
-AgentFactory MUST provide at least one public function or class method with this conceptual signature:
+AgentFactory MUST provide at least these public functions or class methods conceptually aligned with the current code:
 
 ```python
-AgentFactory.create(
-    agent_name: str,
+AgentFactory.load_config(
+    agent_id: str,
     version: str,
-    input_payload: dict
+) -> dict
+
+AgentFactory.get_agent(
+    agent_id: str,
+    version: str = "001",
 ) -> AgentPrompt
+
+AgentFactory.clear_cache() -> None
 ```
 
 Behavior:
@@ -283,42 +281,29 @@ Behavior:
 1. Resolve the config path:
 
    * Deduce `data/agents/{agent_id}/{version}.json` according to the runtime path convention.
-   * If the file does not exist, raise a clear error (e.g. `UnknownAgentConfigError`).
+   * If the file does not exist, raise a clear error.
 
 2. Load and parse JSON:
 
    * Parse JSON to Python dict.
-   * Verify required top-level keys: `agent_name`, `version`, `mode`, `system_text`, `purpose_text`, `output_schema`, `model_name`.
-   * Verify that `agent_name` and `version` inside JSON match the inputs.
+   * Verify that the top-level structure is a dict/object.
 
-3. Validate enums vs schema:
+3. Resolve external catalog blocks when needed:
 
-   * For each field in `enums`, check that the schema has a property with matching enum list (if enum defined).
-   * For fields in `output_schema` with `enum`, ensure they appear in `enums`.
+   * If a decision target stores its `options` as a string path to a catalog JSON file, AgentFactory resolves that path relative to the main config file.
+   * The resolved catalog block is converted into inline `options` and copied defaults where applicable.
+   * This resolution is still neutral because it is purely config loading and resolution, not business logic.
 
-4. Validate input_payload shape (shallow check):
+4. Build AgentPrompt:
 
-   * For this requirement, AgentFactory SHOULD verify that `input_payload` is a dict.
-   * Optionally, the config may define expected input keys (e.g. `input_keys: ["task", "purpose", "context"]`). If present, AgentFactory SHOULD check that they exist.
-   * Semantic validation (e.g. “task must be nonempty string”) stays in the Agent.
+   * `load_config(...)` returns the resolved config dict.
+   * `get_agent(...)` returns a configured `AgentPrompt` created via `AgentPrompt.from_config(config)`.
+   * If the same `(agent_id, version)` was already requested, the cached AgentPrompt may be returned.
 
-5. Construct AgentPrompt:
+5. Input-payload validation:
 
-   * Create an AgentPrompt instance with:
-
-     * agent_name
-     * version
-     * mode
-     * system_text
-     * purpose_text
-     * output_schema
-     * enums
-     * defaults
-     * model_name
-     * temperature
-     * max_output_tokens
-
-   * Return this AgentPrompt instance to the Agent.
+   * In the current code, shallow required-input validation primarily happens at AgentPrompt compose time via `dynamic_bindings`.
+   * AgentFactory itself remains focused on config loading/resolution, not on deep payload semantics.
 
 5) AgentPrompt (agent_prompt.py)
 
@@ -332,13 +317,13 @@ Responsibilities:
 
 * Hold the agent configuration (as passed from AgentFactory).
 * Compose the LLM prompt (SYSTEM + USER message) for a given `input_payload`, using a fixed neutral pattern.
-* Provide the `response_format` (JSON schema) for structured output.
+* Provide the `response_format` for structured output.
 * Parse and validate the LLM’s raw output into a clean Python dict, enforcing enums, defaults, and required fields.
 
 AgentPrompt MUST NOT:
 
-* Know which concrete agent (A2, PreProcessing, etc.) is calling it, beyond the strings in config.
-* Contain any logic specific to A2 or any other agent.
+* Know which concrete agent (A2, A3, etc.) is calling it, beyond the strings in config.
+* Contain any logic specific to A2 or any other concrete agent.
 * Perform retrieval, reranking, or any pipeline-level decisions.
 * Call llm_client directly.
 
@@ -346,64 +331,61 @@ AgentPrompt MUST NOT:
 
 * AgentPrompt instances are **configuration holders**, not conversation memories.
 * They MUST NOT store any per-call state (no incremental history).
-* All per-call data (input_payload and raw output) MUST be passed as parameters to methods.
-* AgentPrompt MUST use the same composition pattern for all agents; the only differences come from the config fields.
+* All per-call data (`input_payload`, `active_fields`, `raw_output`) MUST be passed as parameters to methods.
+* AgentPrompt MUST use the same composition pattern for all agents; the only differences come from the config fields and current runtime mode.
 
 5.3. Configuration fields
 
-An AgentPrompt instance MUST hold the following configuration:
+An AgentPrompt instance MUST hold the following current implementation-aligned configuration:
 
 * `agent_name: str`
 * `version: str`
-* `mode: str` (Chooser | Writer | Extractor | Multi-Chooser)
-* `system_text: str`
-* `purpose_text: str`
-* `output_schema: dict` (JSON schema)
+* `mode: str` (current runtime mode such as `selector` or `classifier`)
+* `static_prompt: dict`
+* `dynamic_bindings: list[dict]`
+* `decision_targets: list[dict]`
+* `output_schema: dict`
 * `enums: dict[str, list[str]]`
-* `defaults: dict[str, Any]` (may be empty)
+* `defaults: dict[str, Any]`
+* `cardinality: dict[str, str]`
+* `option_descriptions: dict[str, dict[str, str]]`
+* `option_labels: dict[str, dict[str, str]]`
 * `model_name: str`
 * `temperature: float`
 * `max_output_tokens: int`
 
-These should be passed from AgentFactory, not modified later.
+These are passed from `AgentPrompt.from_config(...)` and then remain read-only.
 
 5.4. Public methods
 
-AgentPrompt MUST provide at least two public methods:
+AgentPrompt MUST provide at least these public methods:
 
-### 5.4.1. compose(input_payload: dict) -> (messages: list[dict], response_format: dict)
+### 5.4.1. from_config(config: dict) -> AgentPrompt
 
 Responsibilities:
 
-* Build the SYSTEM message text by combining:
+* Read `agent_meta`, `llm_config`, `static_prompt`, `dynamic_bindings`, `decision_targets`, and `output_schema`.
+* Support the current fallback compatibility behavior where older config names may still be mapped into the current internal structure.
+* Normalize conceptual agent-type aliases such as `chooser` -> `selector` and `multi-chooser` -> `classifier`.
+* Build a configured AgentPrompt instance.
 
-  * `system_text`
-  * `purpose_text`
-  * `agent_name` and `version` (for traceability)
-  * A fixed instruction to return only JSON that matches `output_schema`.
+### 5.4.2. compose(input_payload: dict, active_fields: list[str] | None = None) -> (messages: list[dict], response_format: dict)
 
-* Build the USER message text using a neutral pattern:
+Responsibilities:
 
-  * List all entries in `input_payload` as `key = "value"` lines, in a simple readable block.
+* Build the SYSTEM message text from the static prompt fields carried by the config.
+* Keep traceability information such as `agent_name` and `version` in the composed prompt.
 
-  * Based on `mode` and `enums`:
+* Build the USER message text from `dynamic_bindings` + runtime payload.
 
-    * **Chooser:**
-      For each field in `enums`, tell the LLM:
-      “Choose `<field>` from [list of allowed values].”
+  * In current live code:
 
-    * **Writer:**
-      Use `output_schema` to list the fields that must be filled with text; instruct the LLM to “fill each field with appropriate text following the purpose.”
+    * runtime mode `selector` builds a chooser-style prompt over configured decision targets and active fields,
+    * runtime mode `classifier` builds a multi-item structured prompt over the configured decision targets and output schema.
 
-    * **Extractor:**
-      Use `output_schema` to instruct the LLM to extract or map information from `input_payload` into the schema fields.
+  * The current live compose path does not yet implement separate Writer / Extractor prompt composition as an active runtime branch.
 
-    * **Multi-Chooser:**
-      Use `output_schema` to instruct the LLM to return one structured decision per listed item, for example one chunk label per candidate plus optional duplicate references.
-
-  * End with a fixed sentence such as:
-    “Reply with a single JSON object only, no extra text, matching the schema.”
-
+* Validate required `dynamic_bindings` before prompt composition. Missing required bindings raise `AgentPromptValidationError`.
 * Return:
 
   * `messages`: list of dicts for llm_client, for example:
@@ -415,30 +397,39 @@ Responsibilities:
     ]
     ```
 
-  * `response_format`: the `output_schema` dict (or the appropriate OpenAI structured output wrapper, if needed).
+  * `response_format`: in the current code path, `{"type": "json_object"}`.
 
-### 5.4.2. parse_and_validate(raw_output: Any) -> dict
+### 5.4.3. parse(raw_output: Any, active_fields: list[str] | None = None) -> dict
 
 Input:
 
-* `raw_output` is the raw LLM completion object or the JSON content (depending on llm_client design).
+* `raw_output` is the raw LLM content returned by llm_client (typically a string).
 
 Responsibilities:
 
 * Extract the JSON object from the LLM response.
 
-* Validate against `output_schema`:
+* Validate against the current output contract:
 
-  * All required fields are present.
-  * No type mismatches (string vs number, etc.).
-  * For fields with enums, the value MUST be in the allowed list.
-  * Fill missing fields from `defaults` if defined.
+  * for `selector` mode, normalize fields against enums/defaults/cardinality;
+  * for `classifier` mode, normalize top-level fields plus per-item decisions using the configured schema mappings and enums/defaults.
 
 * Return a clean Python dict representing the agent output.
 
 If validation fails:
 
-* Raise a clear error (e.g. `AgentPromptValidationError`) or return a structured error object that A2 can handle deterministically.
+* Raise a clear error such as `AgentPromptValidationError`.
+
+### 5.4.4. Convenience properties
+
+The current code also exposes:
+
+```python
+agent_prompt.model
+agent_prompt.max_tokens
+```
+
+as read-only convenience aliases for `model_name` and `max_output_tokens`.
 
 6. llm_client (llm_client.py)
 
@@ -452,14 +443,14 @@ Responsibilities:
 
 * Provide a simple function to call the LLM with:
 
-  * `model_name`
   * `messages`
-  * `response_format` (JSON schema)
-  * basic parameters such as `temperature` and `max_tokens`
+  * `model_name`
+  * `temperature`
+  * `max_output_tokens`
+  * optional `response_format`
 
 * Hide OpenAI API details from agents, AgentPrompt, and AgentFactory.
-
-* Return the raw completion object or parsed JSON, depending on design.
+* Return raw content that AgentPrompt can parse.
 
 llm_client MUST NOT:
 
@@ -480,31 +471,31 @@ llm_client MUST NOT:
 
 6.3. Public interface
 
-llm_client MUST provide at least one function with this conceptual signature:
+llm_client MUST provide at least one function with this conceptual signature aligned to the current code:
 
 ```python
-llm_client.call(
-    model: str,
+llm_client.chat(
+    *,
     messages: list[dict],
+    model_name: str,
+    temperature: float,
+    max_output_tokens: int,
     response_format: dict | None = None,
-    temperature: float = 0.0,
-    max_tokens: int | None = None,
 ) -> Any
 ```
 
 Behavior:
 
-* Build the appropriate payload for the OpenAI Chat Completions / Responses API, including:
+* Build the appropriate payload for the OpenAI chat client, including:
 
-  * `model`
   * `messages`
-  * `response_format` (for structured JSON output, if used)
+  * `model_name`
   * `temperature`
-  * `max_tokens`
+  * `max_output_tokens`
+  * optional `response_format`
 
-* Send the request and return the raw response.
-
-* It MAY optionally decode the JSON if the API returns a JSON object directly; if so, this behavior must be clearly documented so AgentPrompt knows what to expect.
+* In the current implementation, `gpt-5*` reasoning models are treated specially and temperature is not sent for those models.
+* Send the request and return the raw response content as a string (or stringified content) so that `AgentPrompt.parse(...)` can validate it.
 
 7. Non-functional requirements
 
@@ -527,14 +518,15 @@ Behavior:
 
 7.3. Logging (minimal expectations)
 
-* Agents (e.g. A2) are responsible for logging their own inputs and outputs.
-* AgentStack components SHOULD provide enough structured data so that A2 can log:
+* Agents (e.g. A2, A3) are responsible for logging their own inputs and outputs.
+* AgentStack components SHOULD provide enough structured data so that agents can log:
 
   * `agent_name`, `version`, `model_name`
   * composed SYSTEM/USER messages (if desired)
   * raw LLM output and validated output
 
-llm_client itself SHOULD at least log errors and basic metrics (e.g. token usage) where available, but detailed logging requirements can be defined in a separate document.
+* In the current code path, AgentPrompt already logs the composed SYSTEM and USER prompt text via `SimpleLogger`.
+* llm_client itself SHOULD at least log errors and basic metrics where available, but detailed logging requirements can be defined in a separate document.
 
 ---
 

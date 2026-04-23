@@ -15,6 +15,7 @@ from ragstream.app.controller import AppController
 from ragstream.app.ui_actions import (
     do_a2_promptshaper,
     do_a3_nli_gate,
+    do_a4_condenser,
     do_add_files,
     do_create_project,
     do_preprocess,
@@ -202,7 +203,8 @@ def render_right_panel() -> None:
             do_a3_nli_gate()
 
     with b2c2:  # A4 button
-        st.button("A4 Condenser", key="btn_a4", use_container_width=True)
+        if st.button("A4 Condenser", key="btn_a4", use_container_width=True):
+            do_a4_condenser()
 
     with b2c3:  # A5 button
         st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)

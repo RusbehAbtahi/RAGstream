@@ -22,7 +22,7 @@ Note for future maintenance:
    * Generation 2: Main GUI with history, tags, model selection, cost view, manual answer capture.
    * Generation 3: Advanced GUI (multi-history, attention controls, tools, etc.) – ideas only.
 
-3. The implementation technology for Generation 1 and 2 is currently Streamlit (`ui_streamlit.py` in `ragstream/app`), but the requirements are written so that the GUI could later be reimplemented in another framework without changing behavior.
+3. The implementation technology for Generation 1 and 2 is currently Streamlit. In the current implemented Generation-1 structure, the GUI is split into `ui_streamlit.py` (bootstrap / session setup / controller startup), `ui_layout.py` (geometry and widget layout), and `ui_actions.py` (callbacks and controller-triggered actions). The requirements are still written so that the GUI could later be reimplemented in another framework without changing behavior.
 
 4. All pipeline logic and state live in the controller + `SuperPrompt`. The GUI is a thin layer that:
 
@@ -199,6 +199,42 @@ The intermediate GUI must provide at least the following UI elements:
      * number of files copied,
      * and whether the automatic ingestion/update completed successfully or failed.
 
+
+3.2.2 Current implemented Generation-1 layout and runtime behavior
+
+1. [17.04.2026] The current implemented Generation-1 layout is split visually into two main sides:
+
+   * left side:
+
+     * Prompt input at the top,
+     * SuperPrompt view directly below it.
+
+   * right side:
+
+     * Memory Demo at the top,
+     * pipeline buttons below Memory Demo,
+     * Retrieval / ReRanker controls below the buttons,
+     * project / ingestion controls and related status areas below that.
+
+2. [17.04.2026] The Retrieval / ReRanker control row currently includes:
+
+   * `Retrieval Top-K`,
+   * checkbox `use Retrieval Splade`,
+   * checkbox `use Reranking Colbert`.
+
+3. [17.04.2026] The two checkboxes above are current Generation-1 controls and must default to `off` unless the user changes them.
+
+4. [17.04.2026] The current Generation-1 GUI/controller path supports optional slow-component bypass while keeping downstream stage contracts stable:
+
+   * if `use Retrieval Splade` is off, the system may bypass real SPLADE retrieval/scoring and preserve the downstream Retrieval contract with a deterministic substitute,
+   * if `use Reranking Colbert` is off, the system may bypass real ColBERT reranking and preserve the downstream reranked-stage contract with a deterministic substitute.
+
+5. [17.04.2026] The current controller/UI startup design is no longer a single blocking initialization step. The GUI must support:
+
+   * light startup for immediate page visibility,
+   * heavy Retrieval / ReRanker component warm-up in the background,
+   * readiness-gated behavior so buttons that depend on heavy components do not behave as if those components are ready before they actually are.
+
 3.3 Stage-specific behavior and state machine
 
 3.3.1 Global state machine
@@ -272,7 +308,7 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
 
 5. After “A3 – NLI Gate”
 
-   * `prompt_ready` is updated so the RAG context block now only contains the chunks that A3 decided to keep (after irrelevant/duplicate/conflicting chunks are dropped).
+   * `prompt_ready` is updated so the RAG context block now contains only the chunks that survive A3 usefulness filtering. Discarded chunks are removed; borderline chunks may still survive if the deterministic A3 post-processing promotes them to satisfy the working-set floor.
 
 6. After “A4 – Condenser”
 

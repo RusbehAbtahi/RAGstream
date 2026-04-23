@@ -1,3 +1,4 @@
+# ragstream/orchestration/agent_prompt.py
 # -*- coding: utf-8 -*-
 """
 AgentPrompt
@@ -37,6 +38,7 @@ from ragstream.orchestration.agent_prompt_helpers.compose_texts import (
     build_system_text,
     build_user_text_for_selector,
     build_user_text_for_classifier,
+    build_user_text_for_synthesizer,
 )
 
 
@@ -70,15 +72,17 @@ class AgentPrompt:
         model_name: str,
         temperature: float,
         max_output_tokens: int,
+        elements_order: Optional[List[str]] = None,
     ) -> None:
         self.agent_name: str = agent_name
         self.version: str = version
-        self.mode: str = mode  # "selector" | "classifier" | "writer" | "extractor" | "scorer"
+        self.mode: str = mode  # "selector" | "classifier" | "synthesizer" | "writer" | "extractor" | "scorer"
 
         self.static_prompt: Dict[str, Any] = static_prompt
         self.dynamic_bindings: List[Dict[str, Any]] = dynamic_bindings
         self.decision_targets: List[Dict[str, Any]] = decision_targets
         self.output_schema: Dict[str, Any] = output_schema
+        self.elements_order: List[str] = list(elements_order or [])
 
         self.enums: Dict[str, List[str]] = enums
         self.defaults: Dict[str, Any] = defaults
@@ -92,13 +96,13 @@ class AgentPrompt:
 
         self._result_keys: Dict[str, str] = build_result_key_map(output_schema)
         self._top_level_result_keys: Dict[str, str] = self._build_field_map(
-            output_schema.get("top_level_fields", []) or []
+            output_schema.get("top_level_fields", []) or output_schema.get("fields", []) or []
         )
         self._item_result_keys: Dict[str, str] = self._build_field_map(
             output_schema.get("item_fields", []) or []
         )
 
-        if self.mode not in ("selector", "classifier", "writer", "extractor", "scorer"):
+        if self.mode not in ("selector", "classifier", "synthesizer", "writer", "extractor", "scorer"):
             SimpleLogger.error(f"AgentPrompt[{self.agent_name}] unknown mode: {self.mode}")
 
     @staticmethod
@@ -120,6 +124,7 @@ class AgentPrompt:
         static_prompt = config.get("static_prompt", {}) or {}
         dynamic_bindings = config.get("dynamic_bindings", []) or []
         decision_targets = config.get("decision_targets", []) or []
+        elements_order = config.get("elements_order", []) or []
 
         if not static_prompt:
             prompt_profile = config.get("prompt_profile", {}) or {}
@@ -165,6 +170,7 @@ class AgentPrompt:
             model_name=model_name,
             temperature=temperature,
             max_output_tokens=max_tokens,
+            elements_order=elements_order,
         )
 
     @property
@@ -184,7 +190,7 @@ class AgentPrompt:
         Build SYSTEM + USER messages and the response_format for the LLM.
 
         Neutrality rule:
-        - SYSTEM text comes only from static_prompt.
+        - SYSTEM text comes from JSON-owned config sections handled by AgentPrompt.
         - USER text comes only from dynamic_bindings + runtime payload.
         """
         for binding in self.dynamic_bindings:
@@ -196,45 +202,62 @@ class AgentPrompt:
                     f"AgentPrompt[{self.agent_name}] missing required input binding: '{binding_id}'"
                 )
 
-        system_text = build_system_text(
-            static_prompt=self.static_prompt,
-            agent_name=self.agent_name,
-            version=self.version,
-        )
-
         if self.mode == "selector":
             if active_fields is None:
                 active_list: List[str] = list(self.enums.keys())
             else:
                 active_list = [field_id for field_id in active_fields if field_id in self.enums]
+        elif self.mode == "classifier":
+            if active_fields is None:
+                active_list = list(self.enums.keys())
+            else:
+                active_list = [field_id for field_id in active_fields if field_id in self.enums]
+        else:
+            active_list = []
 
+        system_text, system_consumed_binding_ids = build_system_text(
+            static_prompt=self.static_prompt,
+            agent_name=self.agent_name,
+            version=self.version,
+            decision_targets=self.decision_targets,
+            result_keys=self._result_keys,
+            enums=self.enums,
+            option_labels=self.option_labels,
+            option_descriptions=self.option_descriptions,
+            active_fields=active_list,
+            input_payload=input_payload,
+            dynamic_bindings=self.dynamic_bindings,
+            elements_order=self.elements_order,
+        )
+
+        if self.mode == "selector":
             user_text = build_user_text_for_selector(
                 input_payload=input_payload,
                 dynamic_bindings=self.dynamic_bindings,
-                decision_targets=self.decision_targets,
-                result_keys=self._result_keys,
-                active_fields=active_list,
+                consumed_binding_ids=system_consumed_binding_ids,
             )
-
         elif self.mode == "classifier":
             user_text = build_user_text_for_classifier(
                 input_payload=input_payload,
                 dynamic_bindings=self.dynamic_bindings,
-                decision_targets=self.decision_targets,
-                output_schema=self.output_schema,
-                top_level_result_keys=self._top_level_result_keys,
-                item_result_keys=self._item_result_keys,
+                consumed_binding_ids=system_consumed_binding_ids,
             )
-
+        elif self.mode == "synthesizer":
+            user_text = build_user_text_for_synthesizer(
+                input_payload=input_payload,
+                dynamic_bindings=self.dynamic_bindings,
+                consumed_binding_ids=system_consumed_binding_ids,
+            )
         else:
             raise AgentPromptValidationError(
-                f"AgentPrompt[{self.agent_name}] compose() currently only supports mode='selector' or mode='classifier'"
+                f"AgentPrompt[{self.agent_name}] compose() currently only supports "
+                f"mode='selector', mode='classifier', or mode='synthesizer'"
             )
 
-        messages = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
-        ]
+        messages = [{"role": "system", "content": system_text}]
+        if user_text.strip():
+            messages.append({"role": "user", "content": user_text})
+
         response_format = {"type": "json_object"}
 
         SimpleLogger.info(f"AgentPrompt[{self.agent_name}] SYSTEM prompt:")
@@ -325,7 +348,7 @@ class AgentPrompt:
                 if not chunk_id:
                     continue
 
-                item_result: Dict[str, Any] = {"chunk_id": chunk_id}
+                item_result: Dict[str, Any] = {item_id_key: chunk_id}
 
                 for field_id, allowed in self.enums.items():
                     result_key = self._item_result_keys.get(field_id, field_id)
@@ -345,6 +368,55 @@ class AgentPrompt:
             result[root_key] = normalized_items
             return result
 
+        if self.mode == "synthesizer":
+            result: Dict[str, Any] = {}
+
+            root_key = self.output_schema.get("root_key", "")
+            item_id_key = self.output_schema.get("item_id_key", "")
+
+            if root_key and self._item_result_keys:
+                raw_items = json_obj.get(root_key, []) or []
+                if not isinstance(raw_items, list):
+                    raw_items = []
+
+                normalized_items: List[Dict[str, Any]] = []
+                for raw_item in raw_items:
+                    if not isinstance(raw_item, dict):
+                        continue
+
+                    item_result: Dict[str, Any] = {}
+                    if item_id_key:
+                        raw_item_id = raw_item.get(item_id_key)
+                        if raw_item_id is None:
+                            continue
+                        item_result[item_id_key] = str(raw_item_id).strip()
+
+                    for field_id, result_key in self._item_result_keys.items():
+                        raw_value = raw_item.get(result_key, "")
+                        if raw_value is None:
+                            item_result[field_id] = ""
+                        elif isinstance(raw_value, str):
+                            item_result[field_id] = raw_value.strip()
+                        else:
+                            item_result[field_id] = str(raw_value).strip()
+
+                    normalized_items.append(item_result)
+
+                result[root_key] = normalized_items
+                return result
+
+            for field_id, result_key in self._top_level_result_keys.items():
+                raw_value = json_obj.get(result_key, "")
+                if raw_value is None:
+                    result[field_id] = ""
+                elif isinstance(raw_value, str):
+                    result[field_id] = raw_value.strip()
+                else:
+                    result[field_id] = str(raw_value).strip()
+
+            return result
+
         raise AgentPromptValidationError(
-            f"AgentPrompt[{self.agent_name}] parse() currently only supports mode='selector' or mode='classifier'"
+            f"AgentPrompt[{self.agent_name}] parse() currently only supports "
+            f"mode='selector', mode='classifier', or mode='synthesizer'"
         )

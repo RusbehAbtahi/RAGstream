@@ -1,3 +1,4 @@
+# ragstream/agents/a2_promptshaper.py
 # -*- coding: utf-8 -*-
 """
 A2 PromptShaper agent.
@@ -64,7 +65,9 @@ class A2PromptShaper:
 
         inputs: Dict[str, str] = {
             "prompt_under_evaluation": self._build_prompt_under_evaluation(sp),
-            "decision_targets": self._build_decision_targets_text(agent, active_fields),
+            # Changed:
+            # decision_targets now come from the top-level JSON config and are
+            # rendered inside AgentPrompt / compose_texts, not from A2 runtime payload.
             "required_output": self._build_required_output_text(agent, active_fields),
         }
 
@@ -173,54 +176,6 @@ class A2PromptShaper:
                 continue
             result[field_id] = field.get("result_key", field_id)
         return result
-
-    def _build_decision_targets_text(self, agent: Any, active_fields: List[str]) -> str:
-        """
-        Build the selector-specific decision-target block here in A2,
-        not in the neutral compose helper.
-        """
-        lines: List[str] = []
-        active_set = set(active_fields)
-        result_key_map = self._build_result_key_map(agent)
-
-        option_labels: Dict[str, Dict[str, str]] = getattr(agent, "option_labels", {}) or {}
-        option_descriptions: Dict[str, Dict[str, str]] = getattr(agent, "option_descriptions", {}) or {}
-        enums: Dict[str, List[str]] = getattr(agent, "enums", {}) or {}
-
-        for target in getattr(agent, "decision_targets", []) or []:
-            field_id = target.get("id")
-            if not field_id or field_id not in active_set:
-                continue
-
-            label = target.get("label", field_id)
-            result_key = result_key_map.get(field_id, field_id)
-
-            min_selected = int(target.get("min_selected", 1))
-            max_selected = int(target.get("max_selected", 1))
-
-            lines.append(f"Field '{label}' (JSON key: '{result_key}')")
-
-            if max_selected > 1:
-                lines.append(f"- Select between {min_selected} and {max_selected} option ids.")
-            else:
-                lines.append("- Select exactly one option id.")
-
-            for opt_id in enums.get(field_id, []):
-                opt_label = (option_labels.get(field_id, {}).get(opt_id) or "").strip()
-                opt_desc = (option_descriptions.get(field_id, {}).get(opt_id) or "").strip()
-
-                if opt_label and opt_desc:
-                    lines.append(f"  * {opt_id}: {opt_label} — {opt_desc}")
-                elif opt_label:
-                    lines.append(f"  * {opt_id}: {opt_label}")
-                elif opt_desc:
-                    lines.append(f"  * {opt_id}: {opt_desc}")
-                else:
-                    lines.append(f"  * {opt_id}")
-
-            lines.append("")
-
-        return "\n".join(lines).strip()
 
     def _build_required_output_text(self, agent: Any, active_fields: List[str]) -> str:
         """

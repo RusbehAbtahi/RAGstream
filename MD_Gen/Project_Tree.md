@@ -26,6 +26,8 @@
 │   │   ├── agents.py
 │   │   ├── controller.py
 │   │   ├── controller_legacy.py
+│   │   ├── ui_actions.py
+│   │   ├── ui_layout.py
 │   │   ├── ui_streamlit.py
 │   │   └── ui_streamlit_demo.py
 │   ├── config
@@ -104,19 +106,33 @@
     │   │   └── a2_catalogs
     │   │       ├── 003_option_catalogs_rest.json
     │   │       └── 003_option_catalogs_system.json
-    │   └── a3_nli_gate
-    │       ├── 001.json
-    │       └── a3_catalogs
-    │           └── 001_option_catalogs_labels.json
+    │   ├── a3_nli_gate
+    │   │   ├── 001.json
+    │   │   ├── 002.json
+    │   │   └── a3_catalogs
+    │   │       ├── 001_option_catalogs_labels.json
+    │   │       └── 002_option_catalogs_labels.json
+    │   └── a4_condenser
+    │       ├── chunk_classifier
+    │       │   └── a4_1_001.json
+    │       ├── chunk_phraser
+    │       │   └── a4_2_001.json
+    │       └── final_condenser
+    │           └── a4_3_001.json
     ├── chroma_db
-    │   └── TEST1
-    │       ├── 7d1b9acf-cab6-4940-a157-075a9750a3b6
+    │   ├── TEST1
+    │   │   ├── 7d1b9acf-cab6-4940-a157-075a9750a3b6
+    │   │   └── file_manifest.json
+    │   └── TEST2
+    │       ├── 7db632b2-b157-46cc-99ab-f97431e72fd6
     │       └── file_manifest.json
     ├── doc_raw
-    │   └── TEST1
+    │   ├── TEST1
+    │   └── TEST2
     ├── np_store
     │   └── project1
     ├── project1
     └── splade_db
-        └── TEST1
+        ├── TEST1
+        └── TEST2
 ```

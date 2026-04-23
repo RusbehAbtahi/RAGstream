@@ -16,6 +16,7 @@ from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
 from ragstream.agents.a2_promptshaper import A2PromptShaper
 from ragstream.agents.a3_nli_gate import A3NLIGate
+from ragstream.agents.a4_condenser import A4Condenser
 
 # Added on 10.03.2026:
 # Project-based document ingestion is wired here only at controller level.
@@ -46,6 +47,7 @@ class AppController:
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
         - Creates the A3NLIGate agent.
+        - Creates the A4Condenser agent.
         - Prepares project/data paths.
         """
         # PreProcessing schema (OLD, working behaviour)
@@ -66,6 +68,11 @@ class AppController:
         # A3 agent
         self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
+            llm_client=self.llm_client,
+        )
+
+        # A4 agent
+        self.a4_condenser = A4Condenser(
             llm_client=self.llm_client,
         )
 
@@ -138,6 +145,34 @@ class AppController:
             - stage / history_of_stages
         """
         return self.a3_nli_gate.run(sp)
+
+    def run_a4(
+        self,
+        sp: SuperPrompt,
+        *,
+        effective_output_token_limit: int | None = None,
+    ) -> SuperPrompt:
+        """
+        Run A4 on the current SuperPrompt.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt, typically after A3.
+            effective_output_token_limit:
+                Optional external override for the final condenser output allowance.
+
+        Returns:
+            Updated SuperPrompt after A4 has populated:
+            - S_CTX_MD
+            - views_by_stage["a4"]
+            - final_selection_ids
+            - extras["a4_*"]
+            - stage / history_of_stages
+        """
+        return self.a4_condenser.run(
+            sp,
+            effective_output_token_limit=effective_output_token_limit,
+        )
 
     # Added on 18.03.2026:
     # Small demo helper for the future memory view in the GUI.

@@ -1,6 +1,6 @@
-# Architecture – RAGstream (14.04.2026)
+# Architecture – RAGstream (21.04.2026)
 
-Last sync: 14.04.2026
+Last sync: 21.04.2026
 
 Note for future maintenance:
 - When new implementation-aligned decisions or features are added here, they should be date-stamped inline so the chronology stays visible.
@@ -72,7 +72,7 @@ Conceptually, RAGstream runs as a loop over “sessions” in the GUI:
 1. The user selects a project (which fixes the active `data/chroma_db/<project>/`, `data/splade_db/<project>/`, and the project FileManifest).
 2. The GUI creates or reuses a controller instance with an associated SuperPrompt.
 3. The user writes a free-form prompt and either steps through the pipeline or runs it automatically.
-4. The controller calls deterministic functions (preprocessing, retrieval, reranking) and LLM-based agents (A2, A3, A4, A5) in the order defined in Requirements_RAG_Pipeline.md.
+4. The controller calls deterministic functions (preprocessing, retrieval, reranking) and the currently live LLM-based agents (A2, A3) in the order defined in Requirements_RAG_Pipeline.md. A4 Condenser and Prompt Builder are the next immediate implementation targets; A5 is intentionally postponed for a later phase.
 5. The GUI displays the evolving SuperPrompt; optionally, the user sends an external reply and marks it for history ingestion.
 
 The core data carriers from the requirements:
@@ -104,26 +104,33 @@ GUI / Controller
       ReRanker             (deterministic: current bounded reranking stage; immediate next direction is ColBERT)
       │
       ▼
-  A3  NLI Gate             (LLM agent: chunk labeling and duplicate marking on reranked candidates)
+  A3  NLI Gate             (LLM agent: usefulness-only classification over reranked candidates)
       │
       ▼
-  A4  Condenser            (LLM agent: compress kept context into SuperPrompt.S_CTX_MD)
+  A4  Condenser            (LLM agent: condense the selected set into SuperPrompt.S_CTX_MD)
       │
       ▼
-  A5  Format Enforcer      (LLM agent: ensure final prompt obeys schema / format contract)
+  A5  Format Enforcer      (LLM agent: postponed for a later phase; future action may be revised)
       │
       ▼
-      Prompt Builder       (deterministic: build final prompt text from SuperPrompt fields)
+      Prompt Builder       (deterministic: final prompt assembly from SuperPrompt fields)
       │
       ▼
  (optional external LLM call)
 ```
 
-Each LLM-based stage (A0 when it uses an agent, A2, A3, A4, A5) is implemented using the Agent Stack defined in Requirements_AgentStack.md:
+The Agent Stack used by the LLM-based stages is defined in Requirements_AgentStack.md. In the current implementation-aligned architecture this means:
 
-* AgentFactory — stateless builder that takes a JSON config and returns a concrete agent callable.
-* AgentPrompt — helper that assembles the LLM messages (system / user / tool) plus JSON response schema.
-* llm_client — thin wrapper around the LLM API (model, messages, response_format, parameters).
+* AgentFactory — neutral config loader/resolver with `load_config(...)`, `get_agent(...)`, and transparent config-level caching.
+* AgentPrompt — neutral prompt engine created via `from_config(...)`, with `compose(...)` and `parse(...)` as the current live public methods.
+* llm_client — thin wrapper around the LLM API via `LLMClient.chat(...)`.
+
+Current operational truth on 21.04.2026:
+
+* A2 and A3 are the live Agent Stack consumers in the code path.
+* A3 is usefulness-only; duplicate marking was intentionally removed.
+* A4 Condenser is the next immediate Agent Stack consumer to be implemented.
+* A5 remains in the long-range pipeline contract, but it is postponed and its future action may still change before implementation.
 
 The architecture relies on these properties from the requirements:
 
@@ -137,22 +144,21 @@ The architecture relies on these properties from the requirements:
 
 The controller and GUI work together as the orchestrator and human-facing surface.
 
-Controller (AppController in controller.py, see Requirements_Orchestration_Controller.md):
+Controller (AppController in `controller.py`, see Requirements_Orchestration_Controller.md):
 
 * Owns the current SuperPrompt instance and controls its lifecycle.
-* Provides methods like `preprocess()`, `run_a2()`, `run_retrieval()`, `run_reranker()`, `run_a3()`, `run_a4()`, `run_a5()`, `build_final_prompt()`.
-* Each method applies a single stage to the active SuperPrompt (or runs multiple stages in auto-mode) and returns the updated SuperPrompt to the GUI.
-* Manages project configuration (which dense store, which sparse store, which FileManifest, which agent configs).
-* Manages session state such as: last_error, history_profile, and any debug handles.
-* May keep shared long-lived helper instances (e.g. AgentFactory, LLMClient, A2 agent wrapper, Retriever) as controller-owned infrastructure objects.
+* Uses a light `__init__()` plus `initialize_heavy_components()` so Retrieval / ReRanker resources can warm in the background instead of blocking first paint.
+* Currently exposes live stage methods for `preprocess(...)`, `run_a2_promptshaper(...)`, `run_retrieval(...)`, `run_reranker(...)`, and `run_a3(...)`, plus project-ingestion helpers.
+* Keeps shared helper instances such as AgentFactory, LLMClient, A2PromptShaper, A3NLIGate, Retriever, and Reranker as controller-owned infrastructure objects.
+* Owns project/data-root decisions (`doc_raw`, `chroma_db`, `splade_db`) and keeps the GUI thin.
 
-GUI (ui_streamlit.py, see Requirements_GUI.md):
+GUI (Generation-1 Streamlit GUI split across `ui_streamlit.py`, `ui_layout.py`, and `ui_actions.py`, see Requirements_GUI.md):
 
-* Holds the Streamlit session_state and a reference to the controller.
-* Presents the 8 buttons for the pipeline stages and displays the current SuperPrompt in a structured view.
-* Provides views for ingestion status (which project DBs exist, how many docs/chunks, last update).
-* Provides controls for history persistence (UI-11) and clearing persisted history (UI-12).
-* In later generations, will manage tags, profiles, and model selection, but architecture stays the same: GUI → controller → pipeline.
+* `ui_streamlit.py` handles bootstrap, session setup, controller creation, and background heavy-init startup.
+* `ui_layout.py` owns page geometry and widget placement.
+* `ui_actions.py` owns button callbacks and session-state mutations after controller calls.
+* The current layout is two-sided: Prompt + Super-Prompt on the left; Memory Demo, pipeline buttons, Retrieval/ReRanker controls, and project controls on the right.
+* The GUI currently includes `Retrieval Top-K`, `use Retrieval Splade`, and `use Reranking Colbert` controls, and it keeps downstream stage contracts stable even when the slow components are bypassed.
 
 The architecture viewpoint here is that the GUI is thin: it never implements business logic or data invariants; it only forwards user actions to the controller and renders data it receives.
 
@@ -209,7 +215,7 @@ From the controller’s point of view, ConversationMemory is a read-only, querya
 Details of how G and E are built and updated live in Requirements_Ingestion_Memory.md. The architecture only fixes:
 
 * The controller and agents see G/E as read-only inputs.
-* History persistence and clearing are controlled by explicit GUI actions (UI-11, UI-12).
+* History persistence and clearing remain explicit user-controlled actions in the future history layer; they are not silent background behaviors.
 * Retrieval from history uses the same deterministic principles as document retrieval (filters + tags + top-k, not opaque black boxes).
 
 ---
@@ -220,7 +226,7 @@ The architecture assumes a strong emphasis on determinism and debuggability, as 
 
 * Eligibility Pool — a set of candidate chunks (from documents and history) that are eligible for a given stage, subject to per-file ON/OFF switches and tag rules. The Eligibility Pool concept appears in Requirements_RAG_Pipeline.md and Requirements_Orchestration_Controller.md; architecture only fixes that all RAG-related decisions run over an explicit, inspectable candidate set.
 * No silent deletions — vector stores and history stores do not silently lose data; removals or deactivations are expressed via FileManifest status fields, tags, or explicit “ignore” rules.
-* Explainability — every stage decision (especially Retrieval ranking, ReRanker fusion, and A3 chunk labeling / duplicate marking) is traceable via logs and, where appropriate, via structured fields in SuperPrompt (e.g. `views_by_stage`, `history_of_stages`).
+* Explainability — every stage decision (especially Retrieval ranking, ReRanker fusion, and A3 usefulness labeling / post-selection) is traceable via logs and, where appropriate, via structured fields in SuperPrompt (e.g. `views_by_stage`, `history_of_stages`).
 
 These principles are enforced by the controller and Agent Stack orchestration but belong to the requirements as the ultimate behavioral contract.
 
@@ -270,10 +276,11 @@ The non-functional targets (performance, cost, robustness, extensibility) are sp
 * Deterministic where possible: ingestion, retrieval, reranking, and selection logic are deterministic functions over FileManifest and the aligned dense/sparse stores.
 * Agentic but controlled: LLM-based stages are stateless, small, and driven by explicit JSON configs rather than ad-hoc prompts.
 * Extensible: new agents or stages can be added without breaking existing ones, as long as they respect the SuperPrompt and Agent Stack contracts.
+* [21.04.2026] Late-stage implementation priority is now explicit: after the current Retrieval / ReRanker / A3 base, the next immediate implementation targets are A4 Condenser and Prompt Builder, while A5 remains postponed.
 
 ---
 
-# Sync Report (14.04.2026 update)
+# Sync Report (21.04.2026 update)
 
 **Precisely applied changes (minimal edits only):**
 

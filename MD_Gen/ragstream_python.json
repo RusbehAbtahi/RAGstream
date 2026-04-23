@@ -4,6 +4,8 @@
   "~\\ragstream\\app\\controller_legacy.py",
   "~\\ragstream\\app\\Hook_ChatGTP.py",
   "~\\ragstream\\app\\Hook_ChatGTP2.py",
+  "~\\ragstream\\app\\ui_actions.py",
+  "~\\ragstream\\app\\ui_layout.py",
   "~\\ragstream\\app\\ui_streamlit.py",
   "~\\ragstream\\app\\ui_streamlit_demo.py",
   "~\\ragstream\\config\\settings.py",

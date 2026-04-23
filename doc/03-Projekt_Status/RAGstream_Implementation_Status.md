@@ -1,6 +1,6 @@
 # RAGstream_Implementation_Status.md
 
-Last update: 14.04.2026
+Last update: 21.04.2026
 
 Purpose:
 - This file is a compact implementation status snapshot.
@@ -16,24 +16,28 @@ Purpose:
 RAGstream already has a stable foundation in five major layers:
 
 1. foundational prompt processing and GUI/controller structure,
-2. JSON-based agent architecture with a working A2 PromptShaper stage,
+2. JSON-based agent architecture with working A2 and A3 stages,
 3. project-based document ingestion with manifest-based file tracking,
 4. hybrid document retrieval with dense first-pass selection + SPLADE scoring on the same candidate IDs + weighted RRF,
 5. a working AWS Phase-1 deployment with persistent runtime data outside the image.
 
-The pipeline now reaches from prompt input and A2 shaping to project-aware hybrid chunk selection from the active document database, and it also includes a deterministic ReRanker stage.
+The pipeline now reaches from prompt input and A2 shaping to project-aware hybrid chunk selection from the active document database, and it also includes a deterministic ReRanker stage plus a real A3 stage.
 
 Current practical truth:
 - Retrieval is implemented and working.
 - Retrieval is no longer dense-only; it now includes a real SPLADE scoring branch and weighted RRF fusion.
 - ReRanker is implemented and working in code.
+- A3 is implemented and working in code as a real usefulness-classification stage over reranked candidates.
 - However, the current BERT-style reranker direction is not accepted as the long-term solution, because in practical tests it often worsened ranking quality instead of improving it.
 
 The currently agreed next implementation direction is:
 - keep the existing Retrieval / ReRanker stage structure,
 - keep the new hybrid Retrieval backbone,
-- replace the current reranking strategy with a stronger future direction,
-- immediate next step: ColBERT.
+- keep A3 as the current semantic usefulness gate,
+- implement A4 Condenser next,
+- implement Prompt Builder immediately after A4,
+- postpone A5 to a later phase because its action may still change before implementation,
+- keep ColBERT as the agreed immediate next reranking direction.
 
 ---
 
@@ -63,7 +67,7 @@ The currently agreed next implementation direction is:
 
 - JSON-based agent infrastructure is implemented.
   - `AgentFactory` exists.
-  - JSON agent loading and caching exist.
+  - JSON agent loading and transparent config-level caching exist.
   - `LLMClient` exists.
   - `AgentPrompt` architecture exists.
 - A2 PromptShaper is implemented and already wired.
@@ -72,7 +76,12 @@ The currently agreed next implementation direction is:
   - It calls the LLM.
   - It writes selected values back into `SuperPrompt`.
   - It updates stage/history.
-- A2 PromptShaper is implemented, wired into the app, and updates SuperPrompt through the JSON-based agent stack.
+- A3 NLI Gate is implemented and already wired.
+  - It reads the reranked candidate set from the current `SuperPrompt`.
+  - It uses the JSON-configured neutral Agent Stack.
+  - It performs usefulness-only classification.
+  - It writes `views_by_stage["a3"]`, `extras["a3_selection_band"]`, `extras["a3_item_decisions"]`, and `final_selection_ids`.
+- [21.04.2026] Current immediate next implementation targets in the Agent Stack pipeline are A4 Condenser and Prompt Builder. A5 is intentionally postponed for a later phase because its final action is still open to revision.
 
 ### 2.4 SuperPrompt as shared state
 
@@ -137,10 +146,15 @@ The currently agreed next implementation direction is:
 
 - The Retrieval Top-K field exists in the GUI.
 - The active project selector exists in the GUI.
-- Snapshot keys such as `sp_pre`, `sp_a2`, `sp_rtv`, and `sp_rrk` exist so that stage-specific prompt states can be preserved as snapshots rather than overwritten mentally.
+- Snapshot keys such as `sp_pre`, `sp_a2`, `sp_rtv`, `sp_rrk`, and `sp_a3` exist so that stage-specific prompt states can be preserved as snapshots rather than overwritten mentally.
 - Retrieval is already a live button path after PreProcessing and A2.
 - ReRanker is also already wired as a live stage after Retrieval.
+- A3 is already wired as a live stage after ReRanker.
 - The current Super-Prompt rendering path can now show Retrieval-related score information in the GUI.
+- [17.04.2026] The GUI/controller startup path is split into light startup plus background heavy initialization so the page appears before Retrieval / ReRanker warm-up is complete.
+- [17.04.2026] Optional slow-component bypass controls are already live in Generation-1:
+  - `use Retrieval Splade`
+  - `use Reranking Colbert`
 
 ### 2.9 ReRanker is implemented
 
@@ -163,7 +177,23 @@ The currently agreed next implementation direction is:
   - write the reranked view back into `SuperPrompt`.
 - ReRanker reranks Retrieval candidates and writes the reranked view back into `SuperPrompt`.
 
-### 2.10 Why the current ReRanker direction is not accepted as final
+### 2.10 A3 is implemented as a real stage
+
+- A3 is implemented as a real semantic stage.
+- It is no longer only a placeholder or abstract future idea.
+- The current implemented A3 direction is:
+  - usefulness-only classification over reranked candidates,
+  - one global `selection_band`,
+  - one usefulness decision per candidate chunk,
+  - deterministic useful-first selection with borderline fallback.
+- Important current A3 truth:
+  - long real chunk ids are not shown to the LLM,
+  - local chunk ids `1..N` are used in the prompt and mapped back internally,
+  - chunk-internal heading markers are sanitized to avoid prompt-structure conflicts,
+  - duplicate marking has been intentionally removed.
+- A3 already performs meaningful semantic filtering and is considered good enough to keep as the current stage truth while the next work moves to A4 and Prompt Builder.
+
+### 2.11 Why the current ReRanker direction is not accepted as final
 
 - Practical evaluation showed that the current BERT-style reranker often did not improve the already good Retrieval ranking.
 - In important real examples, it made the ranking worse:
@@ -172,7 +202,7 @@ The currently agreed next implementation direction is:
   - and the final ranking became less trustworthy than dense Retrieval alone.
 - Therefore the current BERT-style reranking direction is considered unsatisfactory as the future production direction.
 
-### 2.11 AWS Phase-1 deployment
+### 2.12 AWS Phase-1 deployment
 
 - AWS Phase-1 deployment is implemented and working.
 - The current live deployment already provides:
@@ -184,331 +214,72 @@ The currently agreed next implementation direction is:
   - SSM secret loading is working,
   - persistent runtime data on EC2/EBS is working.
 - The public network path is already stable:
-  - Route53 → AWS public IPv4 → EC2 Ubuntu host → nginx → Docker → Streamlit.
-- nginx is the public entry point, TLS terminates at nginx, and Streamlit runs behind it on port 8501.
-
-### 2.12 AWS runtime data separation
-
-- The AWS runtime model is already correctly separated.
-- The Docker image is code-focused.
-- Runtime project data remains outside the image on EC2/EBS under:
-  - `/home/ubuntu/ragstream_data`
-- Inside the container, this is mounted as:
-  - `/app/data`
-- The logical structure stays the same locally and on AWS:
-  - `data/doc_raw/<project>`
-  - `data/chroma_db/<project>`
-  - `data/splade_db/<project>`
-- This means project raw files, Chroma databases, and SPLADE stores are persistent and survive container replacement.
+  - Route53 → AWS public IPv4 → EC2 → nginx → Docker → Streamlit.
 
 ---
 
-## 3. What exists only partially or as scaffold
+## 3. What is intentionally not complete yet
 
-### 3.1 A3 / A4 / A5 / Prompt Builder
+### 3.1 A4 Condenser
 
-- A3 NLI Gate is still at placeholder/scaffold level.
-- A4 Condenser is still at placeholder/scaffold level.
-- A5 Format Enforcer is not yet an active working stage.
-- Prompt Builder is still not the final authoritative assembly stage in practical code execution.
-- This means the late pipeline still remains to be implemented after the Retrieval / ReRanker direction is stabilized.
+- A4 exists as a project module (`ragstream/agents/a4_condenser.py`) and as a pipeline contract, but it is not yet a live, completed operational stage in the current GUI/controller path.
+- [21.04.2026] A4 is now the next immediate implementation target.
 
-### 3.2 Memory / conversation memory
+### 3.2 Prompt Builder
 
-- Memory files and architecture references exist.
-- Real history ingestion, episodic retrieval, and the two-layer memory model are not implemented yet as a working production path.
-- Conversation memory is still one of the largest remaining planned subsystems.
+- `prompt_builder.py` exists as a project module and the deterministic final-assembly concept is defined in the requirements.
+- It is not yet the completed final operational stage in the current Generation-1 GUI flow.
+- [21.04.2026] Prompt Builder is the immediate follow-up target after A4.
 
-### 3.3 Selected older structural items
+### 3.3 A5 Format Enforcer
 
-- Some older requirement/UML concepts still exist in documents at a higher level than the current code.
-- This is especially relevant where older wording still reflects:
-  - earlier ingestion assumptions,
-  - earlier retrieval scoring wording,
-  - older reranker assumptions,
-  - earlier rendering ownership assumptions,
-  - or earlier retrieval-backend assumptions.
-- The current implementation direction is already more concrete than those older placeholders.
+- A5 exists in the long-range 8-stage contract, but it is not a live completed operational stage.
+- [21.04.2026] A5 is intentionally postponed to a later phase.
+- [21.04.2026] Its future action may be revised before implementation, so the current requirement contract should be treated as provisional rather than implementation-locked.
+
+### 3.4 History ingestion and tagging
+
+- Conversation history ingestion remains future / partial.
+- Append-only memory direction exists conceptually, but it is not yet the current working production path for the pipeline.
+- Tag-governed retrieval and cross-chat import remain backlog/future work.
 
 ---
 
-## 4. Current implemented Retrieval details
+## 4. Current immediate implementation plan
 
-This section records the Retrieval stage more precisely because it is already implemented and forms the current backbone.
+### 4.1 Immediate next work order
 
-### 4.1 Retrieval inputs
+[21.04.2026] The agreed immediate work order is:
 
-- Input object: current evolving `SuperPrompt`
-- Retrieval text source:
-  - `task`
-  - `purpose`
-  - `context`
-- Runtime parameters:
-  - active project
-  - Retrieval Top-K from GUI
+1. keep current Retrieval / ReRanker / A3 truth stable,
+2. implement A4 Condenser,
+3. implement Prompt Builder,
+4. postpone A5,
+5. revisit ReRanker improvement with ColBERT after the pipeline is stable through A4 and Prompt Builder.
 
-### 4.2 Retrieval chunking and embedding
+### 4.2 Why this order is now preferred
 
-- Retrieval query splitting reuses the same deterministic chunking culture as ingestion.
-- Current values:
-  - `chunk_size = 1200`
-  - `overlap = 120`
-- Important:
-  - in the current codebase, this chunking is character-based, not token-based
-- Dense embedding model:
-  - `text-embedding-3-large`
-- SPLADE branch:
-  - active and implemented
-
-### 4.3 Retrieval scoring
-
-- Retrieval is no longer dense-only.
-- Current implemented Retrieval structure:
-  - dense ranking branch
-  - SPLADE rescoring branch over the dense-selected candidate IDs
-  - weighted RRF fusion
-- Dense branch scoring:
-  - similarity is computed between each stored chunk embedding and all query-piece embeddings
-  - aggregation is not a simple max
-  - current implemented dense retrieval score:
-    - p-norm averaging
-    - `p = 10`
-- SPLADE branch scoring:
-  - SPLADE computes its score only on the same top-k candidate IDs already selected by the dense branch
-  - it does not run an independent competing top-k selection anymore in the current code path
-- Final fused Retrieval score:
-  - weighted reciprocal-rank fusion
-  - current weighting:
-    - dense branch weight = `5.9`
-    - SPLADE branch weight = `0.0`
-
-### 4.4 Retrieval output and write-back
-
-- Selected chunk objects are written into `base_context_chunks`.
-- Stage-specific retrieval output is written into `views_by_stage["retrieval"]`.
-- The currently selected order is written into `final_selection_ids`.
-- `stage` and `history_of_stages` are updated.
-- The GUI-visible Super-Prompt then shows a `## Related Context` section built from the selected chunks.
-- Retrieval-specific metadata needed by the projector is currently mapped in `Retriever` after neutral RRF merge and before hydration/write-back.
-- Because SPLADE now scores the same dense-selected candidate IDs, the intended GUI/debug behavior is that each final Retrieval chunk can carry both dense and SPLADE score fields.
-
-### 4.5 Retrieval robustness
-
-- Retrieval already includes robustness work for stale/broken DB rows.
-- Bad/stale entries are skipped instead of crashing the stage.
-- This matters because runtime databases can outlive raw-file changes and the retrieval stage must not fail because of one stale entry.
+- Retrieval is already strong enough to continue development.
+- ReRanker is live enough to keep the stage contract while its long-term replacement is still open.
+- A3 is already good enough to be treated as a real stage.
+- The biggest missing operational gap in the end-to-end pipeline is now downstream of A3:
+  - condensed context generation,
+  - final deterministic prompt assembly.
+- Therefore the highest leverage is no longer more A3 redesign, but implementation of A4 and Prompt Builder.
 
 ---
 
-## 5. Current implemented ReRanker details
+## 5. Compact bottom-line statement
 
-This section records the ReRanker stage more precisely because it is already implemented, even though the direction is not accepted as final.
+RAGstream is no longer only an ingestion + retrieval prototype.
+It already has:
+- working preprocessing,
+- working JSON-based Agent Stack,
+- working A2,
+- working project-based ingestion,
+- working hybrid Retrieval,
+- working deterministic ReRanker,
+- working A3 usefulness filtering,
+- and working AWS Phase-1 deployment.
 
-### 5.1 ReRanker inputs
-
-- Input object: current evolving `SuperPrompt`
-- ReRanking query source:
-  - `task`
-  - `purpose`
-  - `context`
-- Candidate source:
-  - Retrieval candidates already stored in `views_by_stage["retrieval"]`
-  - hydrated chunks already stored in `base_context_chunks`
-
-### 5.2 ReRanker model and runtime
-
-- Current model:
-  - `cross-encoder/ms-marco-MiniLM-L-12-v2`
-- Current runtime direction:
-  - CPU-only deterministic stage
-
-### 5.3 ReRanker behavior
-
-- Build one semantic reranking query from:
-  - `task`
-  - `purpose`
-  - `context`
-- Dynamically clean chunk text before scoring.
-- Score each `(query, chunk)` pair.
-- Sort by reranker score.
-- Write:
-  - `views_by_stage["reranked"]`
-  - `final_selection_ids`
-  - updated `stage`
-  - updated `history_of_stages`
-
-### 5.4 Current practical conclusion
-
-- ReRanker is implemented.
-- ReRanker is usable for experimentation and analysis.
-- But the current BERT-style reranker is not accepted as the future stable strategy.
-
----
-
-## 6. Session decisions added on 14.04.2026
-
-### 6.1 Ingestion direction finalized on 14.04.2026
-
-- Parallel dense + SPLADE ingestion is now part of the real implementation direction, not only a future idea.
-- The current agreed structural rule is:
-  - one canonical chunking pass,
-  - one canonical chunk ID scheme,
-  - same chunk IDs and metadata in both dense and sparse stores.
-- The SPLADE store is persisted separately under:
-  - `data/splade_db/<project>`
-
-### 6.2 Retrieval fusion decision on 14.04.2026
-
-- Weighted RRF was accepted as the current Retrieval fusion strategy.
-- Current decision:
-  - dense branch weight = `0.75`
-  - SPLADE branch weight = `0.25`
-- Current practical conclusion:
-  - results look acceptable enough to keep this weighting for now.
-
-### 6.3 Architectural separation decision on 14.04.2026
-
-- The neutral merger principle was clarified.
-- Current agreed separation:
-  - `rrf_merger.py` stays neutral and branch-agnostic,
-  - `retriever.py` is the higher-level place that knows:
-    - branch A = dense
-    - branch B = SPLADE
-  - retrieval-specific metadata names needed by rendering are created in `Retriever`, not inside the neutral merger.
-
-### 6.4 Immediate next step decided on 14.04.2026
-
-- Immediate next step:
-  - ColBERT
-- The next phase is therefore not another large Retrieval redesign from zero.
-- The next phase is:
-  - keep the current hybrid Retrieval backbone,
-  - move the reranking direction toward ColBERT.
-
-### 6.5 Candidate-set alignment decision on 14.04.2026
-
-- Retrieval candidate-set alignment was clarified.
-- The current agreed rule is:
-  - dense Retrieval selects the active top-k candidate IDs first,
-  - SPLADE must then score exactly those same candidate IDs,
-  - SPLADE must not run an independent top-k search for different chunk IDs inside the Retrieval stage.
-- Practical consequence:
-  - the Retrieval-stage final display can now be expected to carry both dense and SPLADE score information for the same chunk set.
-
-### 6.6 Current code-path weighting on 14.04.2026
-
-- The current code-path weighting is now:
-  - dense branch weight = `5.9`
-  - SPLADE branch weight = `0.0`
-- Practical consequence:
-  - the final Retrieval order currently follows the dense ranking order,
-  - while SPLADE scores can still be attached to the same candidate IDs for inspection/debugging.
-
----
-
-## 7. Current agreed next implementation direction
-
-The next implementation direction is no longer "implement ReRanker from zero".
-The next implementation direction is to improve the current Retrieval / ReRanker design.
-
-### 7.1 Retrieval direction
-
-- Keep the new hybrid Retrieval backbone:
-  - dense Retrieval
-  - SPLADE scoring on the same dense-selected candidate IDs
-  - weighted RRF fusion
-- Keep the current weighting unless later practical evaluation shows a better weighting.
-
-### 7.2 ReRanker direction
-
-- The current BERT-style cross-encoder reranker should not remain the main long-term strategy.
-- The agreed future direction is:
-  - ColBERT instead of the current BERT-style reranker
-
-### 7.3 Query splitting helper direction
-
-- The current `smart_query_splitter.py` still uses deterministic linear windowing.
-- A future smart splitter direction remains open.
-- A likely next refinement later is:
-  - meaning-based splitting under a bounded size limit
-- But this is not the immediate next step.
-- Immediate next step remains ColBERT.
-
-### 7.4 A3 direction
-
-- A3 should become a selection stage after ReRanking.
-- A3 should classify chunks with labels such as:
-  - `Must_Keep`
-  - `Useful`
-  - `BorderLine`
-  - `Discarded`
-- A3 should also detect duplicates / near-duplicates.
-- Detailed A3 behavior belongs in the requirement files, not here.
-
----
-
-## 8. Current AWS compute decision for the next phase
-
-The current AWS deployment stays in place structurally.
-
-### 8.1 What remains unchanged
-
-- ECR workflow remains unchanged.
-- Docker deployment model remains unchanged.
-- nginx reverse proxy remains unchanged.
-- HTTPS/TLS remains unchanged.
-- Route53 remains unchanged.
-- SSM secret handling remains unchanged.
-- EBS-backed runtime data remains unchanged.
-- The persistent runtime path model remains unchanged.
-
-### 8.2 What is planned to change
-
-- The current EC2 instance type is planned to be upgraded.
-- Direction:
-  - from `t3.small`
-  - to `m7i-flex.xlarge`
-
-### 8.3 Why this change is planned
-
-- Retrieval is already working on the current deployment model.
-- ReRanking experiments and future ColBERT-related work will be more CPU/RAM-demanding than Retrieval alone.
-- The selected instance is intended to bring AWS runtime performance much closer to the local laptop class.
-- The goal is to make the next retrieval/reranking phase practically usable on AWS without changing the surrounding deployment architecture.
-
----
-
-## 9. What this means operationally now
-
-RAGstream now includes working prompt processing, ingestion, retrieval, reranking, and AWS deployment layers.
-
-The system now has:
-- a working prompt entry path,
-- a working A2 shaping path,
-- a working project-based ingestion path,
-- a working dense + SPLADE document persistence path,
-- a working active-project GUI path,
-- a working AWS public deployment,
-- a working hybrid Retrieval stage,
-- and a working ReRanker stage.
-
-The project now includes controller-driven prompt processing, ingestion, retrieval, and reranking in code.
-The system now has context retrieval and reranking stages in code.
-
-The immediate development focus is now clear:
-- keep the current hybrid Retrieval backbone,
-- replace the current unsatisfactory reranking direction,
-- move toward ColBERT,
-- then continue with A3 / A4 / A5 / Prompt Builder,
-- while keeping the AWS deployment architecture stable and only increasing compute capacity where needed.
-
----
-
-## 10. Important note
-
-- This file is an implementation status snapshot.
-- It records the current working system and the currently agreed next direction.
-- It is intentionally more practical than the requirement files.
-- Future-direction sections here stay shorter on purpose.
-- The detailed behavioral design belongs in the requirement files.
-- If the implementation changes again, this file should be updated again accordingly.
+[21.04.2026] The immediate next milestone is to complete the pipeline after A3 by implementing A4 Condenser and Prompt Builder. A5 is postponed and may be redefined before it is built.

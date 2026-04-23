@@ -26,6 +26,7 @@ def do_preprocess() -> None:
     st.session_state.sp_rtv = SuperPrompt()
     st.session_state.sp_rrk = SuperPrompt()
     st.session_state.sp_a3 = SuperPrompt()
+    st.session_state.sp_a4 = SuperPrompt()
 
     sp: SuperPrompt = st.session_state.sp
     sp = ctrl.preprocess(user_text, sp)
@@ -126,6 +127,23 @@ def do_a3_nli_gate() -> None:
 
         st.session_state.sp = sp
         st.session_state.sp_a3 = copy.deepcopy(sp)
+        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+    except Exception as e:
+        st.error(str(e))
+
+
+def do_a4_condenser() -> None:
+    """A4 button callback."""
+    try:
+        ctrl: AppController = st.session_state.controller
+        sp: SuperPrompt = st.session_state.sp
+
+        sp = ctrl.run_a4(sp)
+        sp.compose_prompt_ready()
+
+        st.session_state.sp = sp
+        st.session_state.sp_a4 = copy.deepcopy(sp)
         st.session_state["super_prompt_text"] = sp.prompt_ready
 
     except Exception as e:

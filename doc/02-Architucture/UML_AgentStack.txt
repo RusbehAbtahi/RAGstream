@@ -14,68 +14,53 @@ hide empty members
 package "Agent Stack" {
 
     class AgentFactory {
-        + get(agent_name:str) : Any
-        + list_agents() : List[str]
-        - registry : Dict[str,Any]      ' maps agent name → callable/class
-        - default_model : str
+        + load_config(agent_id:str, version:str="001") : Dict
+        + get_agent(agent_id:str, version:str="001") : AgentPrompt
+        + clear_cache() : None
+        - _cache : Dict[str,AgentPrompt]
+        - _root  : Path
     }
 
     class AgentPrompt {
-        + compose_messages(
-            agent_name:str,
-            config:Dict,
-            system:str,
-            user:str,
-            s_ctx:List[str]
-        ) : List[Dict]
-        + envelope_for_call(
-            agent_name:str,
-            goal:str,
-            payload:Dict,
-            meta:Dict
-        ) : JSONEnvelope
-        - default_system : str
-        - default_temperature : float
+        + from_config(config:Dict) : AgentPrompt
+        + compose(
+            input_payload:Dict,
+            active_fields:List[str]=None
+        ) : tuple[List[Dict], Dict]
+        + parse(
+            raw_output:Any,
+            active_fields:List[str]=None
+        ) : Dict
+        + model_name : str
+        + max_output_tokens : int
+        - mode : str
+        - static_prompt : Dict
+        - dynamic_bindings : List[Dict]
+        - decision_targets : List[Dict]
     }
 
     class LLMClient {
-        + complete(
+        + chat(
             messages:List[Dict],
-            model:str=None,
-            response_format:Dict=None,
-            temperature:float=0.2
-        ) : JSONEnvelope
-        + estimate_cost(num_tokens:int, model:str=None) : float
-        - model : str
-    }
-
-    class JSONEnvelope {
-        + agent : str
-        + goal : str
-        + timestamp : str
-        + request_id : str
-        + turn_id : int
-        + source : str
-        + version : str
-        + escalate : bool
-        + reason : str
-        + provenance : Dict
-        + payload : Dict
+            model_name:str,
+            temperature:float,
+            max_output_tokens:int,
+            response_format:Dict=None
+        ) : str
+        - client : OpenAI
     }
 }
 
 '──────────────────────────────────────────────────────────────
 '  2) AGENTS (context only)
 '──────────────────────────────────────────────────────────────
-package "Agents (app/agents)" {
+package "Agents (context only)" {
 
-    class A0_FileScopeSelector
-    class A1_DCI
     class A2_PromptShaper
-    class NLP_Splitter
     class A3_NLIGate
     class A4_Condenser
     class A5_SchemaEnforcer
+    class NLP_Splitter
 }
 
 '──────────────────────────────────────────────────────────────
@@ -87,63 +72,93 @@ package "Application Layer" {
 
 package "Config & Utils" {
     class Settings
-    class DebugLogger
+    class SimpleLogger
 }
 
 '──────────────────────────────────────────────────────────────
 '  4) DEPENDENCIES & FLOW
 '──────────────────────────────────────────────────────────────
 
-' Controller asks factory for agents
-AppController --> AgentFactory : get(agent_name)
+' Controller/agents obtain configured prompts from factory
+AppController --> AgentFactory : get_agent(agent_id, version)
+A2_PromptShaper ..> AgentFactory : get_agent(...)
+A3_NLIGate ..> AgentFactory : get_agent(...)
+A4_Condenser ..> AgentFactory : get_agent(...)
+A5_SchemaEnforcer ..> AgentFactory : get_agent(...)
+NLP_Splitter ..> AgentFactory : get_agent(...)
 
-' Agents use AgentPrompt to build messages/envelopes
-A2_PromptShaper ..> AgentPrompt : compose_messages()
-NLP_Splitter ..> AgentPrompt : compose_messages()
-A3_NLIGate ..> AgentPrompt : compose_messages()
-A4_Condenser ..> AgentPrompt : compose_messages()
-A5_SchemaEnforcer ..> AgentPrompt : envelope_for_call()
+' AgentPrompt lifecycle
+AgentFactory --> AgentPrompt : from_config(config)
 
-' AgentPrompt uses LLMClient; LLMClient returns JSONEnvelope
-AgentPrompt --> LLMClient : complete()
-LLMClient --> JSONEnvelope : returns
+' Agents use AgentPrompt to compose + parse
+A2_PromptShaper ..> AgentPrompt : compose() / parse()
+A3_NLIGate ..> AgentPrompt : compose() / parse()
+A4_Condenser ..> AgentPrompt : compose() / parse()
+A5_SchemaEnforcer ..> AgentPrompt : compose() / parse()
+NLP_Splitter ..> AgentPrompt : compose() / parse()
+
+' AgentPrompt uses LLMClient
+AgentPrompt --> LLMClient : chat()
 
 ' Config wiring
 Settings .> LLMClient : model/api config
-DebugLogger .> LLMClient : log errors/latency
-DebugLogger .> AgentPrompt : log composed messages
+SimpleLogger .> AgentPrompt : log composed messages
+SimpleLogger .> LLMClient : log errors/latency
 
 note right of AgentFactory
-  Neutral, stateless registry:
-  - maps agent_name → implementation
-  - no business logic, no UI
+  Neutral config loader / resolver:
+  - resolves data/agents/{agent_id}/{version}.json
+  - may inline catalog-backed decision targets
+  - transparent config-level cache only
+  - no agent business logic, no UI logic
 end note
 
 note right of AgentPrompt
-  Stateless prompt composer:
-  - merges SYSTEM/USER + S_ctx
-  - builds JSONEnvelope payload/meta
-  - supports Chooser / Writer /
-    Extractor / Multi-Chooser
-  - never calls the LLM directly
+  Neutral prompt engine:
+  - built from JSON config
+  - current runtime modes: selector / classifier
+  - compose() builds SYSTEM + USER + response_format
+  - parse() validates structured JSON output
+  - no A2/A3-specific business rules inside
 end note
 
 note right of LLMClient
-  Thin wrapper around LLM API:
-  - knows model/messages/response_format
-  - no knowledge of agents or Controller
+  Thin LLM wrapper:
+  - knows messages / model_name /
+    temperature / max_output_tokens /
+    response_format
+  - no knowledge of controller,
+    retrieval, or agent semantics
 end note
 
 note bottom of A3_NLIGate
-  Current agreed future role:
-  - Multi-Chooser-style chunk labeling
-  - Must_Keep / Useful / BorderLine /
-    Discarded
-  - duplicate marking against higher-ranked chunk_id
+  Current live role:
+  - usefulness-only classification over
+    reranked candidates
+  - global selection_band
+  - item_decisions with
+    useful / borderline / discarded
+  - no duplicate marking in current contract
+end note
+
+note bottom of A4_Condenser
+  Immediate next implementation target:
+  - consume final_selection_ids
+  - generate S_CTX_MD
+  - enforce context-budgeted
+    condensed working set
+end note
+
+note bottom of A5_SchemaEnforcer
+  Postponed:
+  - future action may change before
+    implementation
+  - keep as context only, not current
+    active runtime behavior
 end note
 
 note bottom of NLP_Splitter
-  Current agreed future role:
+  Future helper role:
   - split long prompt into meaning-based
     query parts
   - enforce upper token limit per part
