@@ -16,7 +16,9 @@
 │   │   ├── a1_dci.py
 │   │   ├── a2_promptshaper.py
 │   │   ├── a3_nli_gate.py
-│   │   └── a4_condenser.py
+│   │   ├── a4_condenser.py
+│   │   ├── a4_det_processing.py
+│   │   └── a4_llm_helper.py
 │   ├── app
 │   │   ├── Hook_ChatGTP.py
 │   │   ├── Hook_ChatGTP2.py
@@ -114,9 +116,9 @@
     │   │       └── 002_option_catalogs_labels.json
     │   └── a4_condenser
     │       ├── chunk_classifier
-    │       │   └── a4_1_001.json
-    │       ├── chunk_phraser
     │       │   └── a4_2_001.json
+    │       ├── chunk_phraser
+    │       │   └── a4_1_001.json
     │       └── final_condenser
     │           └── a4_3_001.json
     ├── chroma_db

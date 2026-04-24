@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Tuple
 import re
 
 from ragstream.orchestration.super_prompt import SuperPrompt, A3ChunkStatus
+from ragstream.utils.logging import SimpleLogger
 
 
 JsonDict = Dict[str, Any]
@@ -102,7 +103,13 @@ def prepare_active_class_definitions(
 ) -> JsonDict:
     """
     Read phraser output, keep only the active IDs actually returned,
-    and restrict the classifier AgentPrompt to that active subset.
+    and mutate the classifier AgentPrompt so the visible class options are
+    the real class phrases, not ID1 / ID2 / ...
+
+    Important:
+    - internal deterministic regrouping still uses the original IDs
+    - classifier output is allowed to return class phrases
+    - step 5 will map phrase -> original ID
     """
     raw_classes = list(phraser_result.get("class_definitions", []) or [])
     if not raw_classes:
@@ -136,26 +143,44 @@ def prepare_active_class_definitions(
     if not active_classes:
         raise RuntimeError("prepare_active_class_definitions: no valid active classes")
 
-    # Mutate the classifier AgentPrompt locally for this A4 run only.
     active_ids = [item["class_id"] for item in active_classes]
+    active_class_phrases = [item["class_phrase"] for item in active_classes]
 
+    phrase_to_id: Dict[str, str] = {}
+    normalized_phrase_to_id: Dict[str, str] = {}
+    for item in active_classes:
+        phrase = item["class_phrase"]
+        class_id = item["class_id"]
+        phrase_to_id[phrase] = class_id
+        normalized_phrase_to_id[_normalize_phrase_key(phrase)] = class_id
+
+    # Mutate the classifier AgentPrompt locally for this A4 run only.
+    # Goal: the model sees class phrases as the allowed labels, not ID1/ID2/...
     for target in getattr(classifier_agent_prompt, "decision_targets", []) or []:
         if str(target.get("id", "") or "").strip() == "class_id":
-            target["options"] = list(active_ids)
+            target["options"] = list(active_class_phrases)
             target["min_selected"] = 1
             target["max_selected"] = 1
 
     if hasattr(classifier_agent_prompt, "enums"):
-        classifier_agent_prompt.enums["class_id"] = list(active_ids)
+        classifier_agent_prompt.enums["class_id"] = list(active_class_phrases)
 
     if hasattr(classifier_agent_prompt, "defaults"):
-        classifier_agent_prompt.defaults["class_id"] = active_ids[0]
+        classifier_agent_prompt.defaults["class_id"] = active_class_phrases[0]
+
+    # Make the classifier prompt lighter:
+    # suppress the generic Decision Targets block entirely for this run.
+    if hasattr(classifier_agent_prompt, "decision_targets"):
+        classifier_agent_prompt.decision_targets = []
 
     active_class_definitions_text = _build_active_class_definitions_text(active_classes)
 
     return {
         "active_ids": active_ids,
         "active_classes": active_classes,
+        "active_class_phrases": active_class_phrases,
+        "phrase_to_id": phrase_to_id,
+        "normalized_phrase_to_id": normalized_phrase_to_id,
         "active_class_definitions_text": active_class_definitions_text,
     }
 
@@ -170,10 +195,18 @@ def build_grouped_chunk_package(
     """
     Regroup chunk ids deterministically by class, apply a simple budget profile,
     and build the final class-group text for the last A4 call.
+
+    If classifier output is missing / unusable, continue in fallback mode:
+    - keep all chunks in original order
+    - provide only the global class overview to the final condenser
+    - log a warning in CLI
     """
     selected_items = list(selected_payload.get("selected_items", []) or [])
     active_classes = list(active_class_payload.get("active_classes", []) or [])
     active_ids = [item["class_id"] for item in active_classes]
+
+    phrase_to_id = dict(active_class_payload.get("phrase_to_id", {}) or {})
+    normalized_phrase_to_id = dict(active_class_payload.get("normalized_phrase_to_id", {}) or {})
 
     raw_item_decisions = list(classifier_result.get("item_decisions", []) or [])
     class_by_local_chunk_id: Dict[str, str] = {}
@@ -181,11 +214,38 @@ def build_grouped_chunk_package(
     for item in raw_item_decisions:
         if not isinstance(item, dict):
             continue
+
         local_chunk_id = str(item.get("chunk_id", "") or "").strip()
-        class_id = str(item.get("class_id", "") or "").strip()
-        if not local_chunk_id or class_id not in active_ids:
+        raw_class_value = str(item.get("class_id", "") or "").strip()
+
+        if not local_chunk_id or not raw_class_value:
             continue
-        class_by_local_chunk_id[local_chunk_id] = class_id
+
+        mapped_class_id = _resolve_classifier_class_value(
+            raw_class_value=raw_class_value,
+            active_ids=active_ids,
+            phrase_to_id=phrase_to_id,
+            normalized_phrase_to_id=normalized_phrase_to_id,
+        )
+        if not mapped_class_id:
+            continue
+
+        class_by_local_chunk_id[local_chunk_id] = mapped_class_id
+
+    token_limit = int(effective_output_token_limit)
+    if token_limit <= 0:
+        token_limit = 3000
+
+    if len(class_by_local_chunk_id) < len(selected_items):
+        SimpleLogger.warning(
+            "A4 build_grouped_chunk_package: classifier output incomplete or unusable; "
+            "continuing with fallback no-grouping mode."
+        )
+        return _build_fallback_chunk_package(
+            selected_items=selected_items,
+            active_classes=active_classes,
+            token_limit=token_limit,
+        )
 
     groups: List[Dict[str, Any]] = []
     group_by_class_id: Dict[str, Dict[str, Any]] = {}
@@ -205,23 +265,40 @@ def build_grouped_chunk_package(
         local_chunk_id = str(item["local_chunk_id"])
         class_id = class_by_local_chunk_id.get(local_chunk_id)
         if not class_id:
-            raise RuntimeError(
-                f"build_grouped_chunk_package: no classifier class_id for local chunk {local_chunk_id}"
+            SimpleLogger.warning(
+                "A4 build_grouped_chunk_package: missing class after validation; "
+                "continuing with fallback no-grouping mode."
             )
+            return _build_fallback_chunk_package(
+                selected_items=selected_items,
+                active_classes=active_classes,
+                token_limit=token_limit,
+            )
+
         if class_id not in group_by_class_id:
-            raise RuntimeError(
-                f"build_grouped_chunk_package: classifier returned inactive class_id {class_id}"
+            SimpleLogger.warning(
+                "A4 build_grouped_chunk_package: classifier returned inactive class after validation; "
+                "continuing with fallback no-grouping mode."
             )
+            return _build_fallback_chunk_package(
+                selected_items=selected_items,
+                active_classes=active_classes,
+                token_limit=token_limit,
+            )
+
         group_by_class_id[class_id]["items"].append(item)
 
     non_empty_groups = [group for group in groups if group["items"]]
-
     if not non_empty_groups:
-        raise RuntimeError("build_grouped_chunk_package: all groups are empty")
-
-    token_limit = int(effective_output_token_limit)
-    if token_limit <= 0:
-        token_limit = 3000
+        SimpleLogger.warning(
+            "A4 build_grouped_chunk_package: all groups are empty after regrouping; "
+            "continuing with fallback no-grouping mode."
+        )
+        return _build_fallback_chunk_package(
+            selected_items=selected_items,
+            active_classes=active_classes,
+            token_limit=token_limit,
+        )
 
     if token_limit < 1200:
         max_group_count = 1
@@ -380,13 +457,16 @@ def _build_evidence_chunks_text(selected_items: List[Dict[str, Any]]) -> str:
 
 
 def _build_active_class_definitions_text(active_classes: List[Dict[str, str]]) -> str:
+    """
+    Important:
+    For the classifier prompt, keep the visible class view free of ID1/ID2...
+    The model should mainly see the real class phrases + their meanings.
+    """
     lines: List[str] = []
     lines.append("<active_class_definitions>")
 
     for priority_rank, item in enumerate(active_classes, start=1):
-        lines.append(
-            f'  <class priority_rank="{priority_rank}" class_id="{item["class_id"]}">'
-        )
+        lines.append(f'  <class priority_rank="{priority_rank}">')
         lines.append(f"    <class_phrase>{item['class_phrase']}</class_phrase>")
         lines.append(f"    <class_context_text>{item['class_context_text']}</class_context_text>")
         lines.append("  </class>")
@@ -411,15 +491,114 @@ def _build_class_groups_text(
         local_chunk_ids_text = ", ".join(local_chunk_ids)
 
         lines.append(
-            f'  <group priority_rank="{group["priority_rank"]}" class_id="{group["class_id"]}">'
+            f'  <group priority_rank="{group["priority_rank"]}" class_phrase="{group["class_phrase"]}">'
         )
-        lines.append(f"    <class_phrase>{group['class_phrase']}</class_phrase>")
         lines.append(f"    <class_context_text>{group['class_context_text']}</class_context_text>")
         lines.append(f"    <local_chunk_ids>{local_chunk_ids_text}</local_chunk_ids>")
         lines.append("  </group>")
 
     lines.append("</class_groups>")
     return "\n".join(lines).strip()
+
+
+def _build_fallback_chunk_package(
+    *,
+    selected_items: List[Dict[str, Any]],
+    active_classes: List[Dict[str, str]],
+    token_limit: int,
+) -> JsonDict:
+    """
+    Fallback mode when classifier output is missing / unusable.
+
+    Behavior agreed in chat:
+    - continue instead of failing
+    - no per-chunk grouping
+    - send all chunks as they are to the final condenser
+    - expose only the overall class phrases as collective lenses
+    """
+    budget_profile = "fallback_no_grouping"
+
+    class_groups_text = _build_fallback_class_groups_text(
+        active_classes=active_classes,
+        selected_items=selected_items,
+        token_limit=token_limit,
+    )
+
+    decision_targets_text = (
+        f"Effective output token allowance: {token_limit}.\n"
+        "Classifier grouping failed or was unusable.\n"
+        "Do not assume per-chunk class assignment.\n"
+        "Use the class phrases only as collective high-level lenses over the full evidence set.\n"
+        "Condense the evidence chunks directly, in their current order, while staying loyal to the text."
+    )
+
+    selected_real_ids_after_budget = [str(item["real_chunk_id"]) for item in selected_items]
+
+    return {
+        "active_classes": active_classes,
+        "groups": [],
+        "budget_profile": budget_profile,
+        "effective_output_token_limit": token_limit,
+        "class_groups_text": class_groups_text,
+        "decision_targets_text": decision_targets_text,
+        "selected_real_ids_after_budget": selected_real_ids_after_budget,
+    }
+
+
+def _build_fallback_class_groups_text(
+    *,
+    active_classes: List[Dict[str, str]],
+    selected_items: List[Dict[str, Any]],
+    token_limit: int,
+) -> str:
+    lines: List[str] = []
+    lines.append("<class_groups>")
+    lines.append("  <mode>fallback_no_grouping</mode>")
+    lines.append(f"  <effective_output_token_limit>{token_limit}</effective_output_token_limit>")
+    lines.append("  <overall_class_overview>")
+
+    for priority_rank, item in enumerate(active_classes, start=1):
+        lines.append(f'    <class priority_rank="{priority_rank}">')
+        lines.append(f"      <class_phrase>{item['class_phrase']}</class_phrase>")
+        lines.append(f"      <class_context_text>{item['class_context_text']}</class_context_text>")
+        lines.append("    </class>")
+
+    lines.append("  </overall_class_overview>")
+    local_chunk_ids_text = ", ".join(str(item["local_chunk_id"]) for item in selected_items)
+    lines.append(f"  <all_selected_local_chunk_ids>{local_chunk_ids_text}</all_selected_local_chunk_ids>")
+    lines.append("</class_groups>")
+    return "\n".join(lines).strip()
+
+
+def _resolve_classifier_class_value(
+    *,
+    raw_class_value: str,
+    active_ids: List[str],
+    phrase_to_id: Dict[str, str],
+    normalized_phrase_to_id: Dict[str, str],
+) -> str:
+    """
+    Resolve classifier output into the canonical internal class_id.
+    Supports:
+    - old style: ID1 / ID2 / ...
+    - new style: actual class phrase
+    """
+    value = str(raw_class_value or "").strip()
+    if not value:
+        return ""
+
+    if value in active_ids:
+        return value
+
+    if value in phrase_to_id:
+        return phrase_to_id[value]
+
+    normalized_value = _normalize_phrase_key(value)
+    return normalized_phrase_to_id.get(normalized_value, "")
+
+
+def _normalize_phrase_key(text: str) -> str:
+    return " ".join(str(text or "").strip().lower().split())
 
 
 def _sanitize_chunk_text(text: str) -> str:

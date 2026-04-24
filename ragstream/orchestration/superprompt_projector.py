@@ -84,15 +84,12 @@ class SuperPromptProjector:
         if self.sp.Prompt_MD:
             parts.append(self.sp.Prompt_MD)
 
-        if self.sp.S_CTX_MD:
-            parts.append(self.sp.S_CTX_MD)
+        retrieved_context_md = self._render_retrieved_context_md()
+        if retrieved_context_md:
+            parts.append(retrieved_context_md)
 
         if self.sp.Attachments_MD:
             parts.append(self.sp.Attachments_MD)
-        else:
-            related_context_md = self._render_related_context_md()
-            if related_context_md:
-                parts.append(related_context_md)
 
         self.sp.prompt_ready = "\n\n".join(parts).strip()
         return self.sp.prompt_ready
@@ -105,10 +102,13 @@ class SuperPromptProjector:
         audience_value = (self.sp.body.get("audience") or "").strip()
         tone_value = (self.sp.body.get("tone") or "").strip()
         depth_value = (self.sp.body.get("depth") or "").strip()
+        confidence_value = (self.sp.body.get("confidence") or "").strip()
 
+        lines.append("## System")
         if system_value:
-            lines.append("## System")
             lines.append(system_value)
+        else:
+            lines.append("")
 
         config_lines: List[str] = []
 
@@ -120,12 +120,12 @@ class SuperPromptProjector:
             config_lines.append(f"- Tone: {tone_value}")
         if depth_value:
             config_lines.append(f"- Depth: {depth_value}")
+        if confidence_value:
+            config_lines.append(f"- Confidence: {confidence_value}")
 
-        if config_lines:
-            if lines:
-                lines.append("")
-            lines.append("## Configuration")
-            lines.extend(config_lines)
+        lines.append("")
+        lines.append("## Configuration")
+        lines.extend(config_lines)
 
         return "\n".join(lines).strip()
 
@@ -138,43 +138,75 @@ class SuperPromptProjector:
         format_value = (self.sp.body.get("format") or "").strip()
         text_value = (self.sp.body.get("text") or "").strip()
 
-        if task_value:
-            lines.append("## Task")
-            lines.append(task_value)
-            lines.append("")
+        lines.append("## User")
+        lines.append("")
+
+        lines.append("### Task")
+        lines.append(task_value)
+        lines.append("")
 
         if purpose_value:
-            lines.append("## Purpose")
+            lines.append("### Purpose")
             lines.append(purpose_value)
             lines.append("")
 
         if context_value:
-            lines.append("## Context")
+            lines.append("### Context")
             lines.append(context_value)
             lines.append("")
 
         if format_value:
-            lines.append("## Format")
+            lines.append("### Format")
             lines.append(format_value)
             lines.append("")
 
         if text_value:
-            lines.append("## Text")
+            lines.append("### Text")
             lines.append(text_value)
             lines.append("")
 
         return "\n".join(lines).strip()
 
-    def _format_score(self, score: float) -> str:
-        return f"{float(score):.8f}".rstrip("0").rstrip(".")
-
-    def _render_related_context_md(self) -> str:
+    def _render_retrieved_context_md(self) -> str:
         """
-        Render a chunk-based context preview from the current selected chunks.
+        Render retrieved/condensed context for GUI-visible SuperPrompt preview.
 
-        During A3, show:
-            selection_band at block level
-            usefulness judgment per chunk
+        This is intentionally neutral and reusable:
+        - A4 only produces S_CTX_MD.
+        - This projector decides how S_CTX_MD is displayed.
+        - Later PromptBuilder can reuse the same structure.
+        """
+        lines: List[str] = []
+
+        lines.append("## Retrieved Context")
+        lines.append("")
+
+        lines.append("### Retrieved Context Summary")
+        lines.append(
+            "The following summary is retrieved from selected project files or memory. "
+            "It is supporting context for the task, not part of the task itself."
+        )
+        lines.append("")
+
+        summary_text = (self.sp.S_CTX_MD or "").strip()
+        if summary_text:
+            lines.append(summary_text)
+        lines.append("")
+
+        lines.append("### Raw Retrieved Evidence")
+        raw_evidence_md = self._render_raw_retrieved_evidence_md()
+        if raw_evidence_md:
+            lines.append(raw_evidence_md)
+
+        return "\n".join(lines).strip()
+
+    def _render_raw_retrieved_evidence_md(self) -> str:
+        """
+        Render raw retrieved chunks as nested evidence.
+
+        Important:
+        Source Markdown headings inside chunks are converted to [H1]/[H2]/[H3]
+        so they do not compete with the visible SuperPrompt structure.
         """
         ordered_chunks = self._get_ordered_context_chunks()
         if not ordered_chunks:
@@ -198,72 +230,147 @@ class SuperPromptProjector:
         selection_band = str(self.sp.extras.get("a3_selection_band", "") or "").strip()
 
         lines: List[str] = []
-        lines.append("## Related Context")
-        lines.append("")
+        lines.append("<retrieved_chunks>")
 
         if self.sp.stage == "a3" and selection_band:
-            lines.append(f"Selection band: {selection_band}")
-            lines.append("")
+            lines.append(f'  <selection_band>{selection_band}</selection_band>')
 
         chunk_counter = 1
         for chunk_obj in ordered_chunks:
-            header = f"### Chunk {chunk_counter}"
+            attributes: List[str] = [
+                f'index="{chunk_counter}"',
+                f'chunk_id="{self._escape_attr(str(chunk_obj.id))}"',
+            ]
 
-            emb_score = self._get_meta_float(chunk_obj.meta, "emb_score")
-            splade_score = self._get_meta_float(chunk_obj.meta, "splade_score")
+            source_value = ""
+            meta = getattr(chunk_obj, "meta", None)
+            if isinstance(meta, dict):
+                source_value = str(meta.get("source") or meta.get("path") or meta.get("file") or "").strip()
+            if source_value:
+                attributes.append(f'source="{self._escape_attr(source_value)}"')
 
-            if self.sp.stage == "retrieval":
-                score_parts: List[str] = []
+            score_label = self._build_chunk_score_label(
+                chunk_obj=chunk_obj,
+                retrieval_score_map=retrieval_score_map,
+                reranked_score_map=reranked_score_map,
+                a3_decision_map=a3_decision_map,
+            )
+            if score_label:
+                attributes.append(f'info="{self._escape_attr(score_label)}"')
 
-                rt_score = retrieval_score_map.get(chunk_obj.id)
-                if rt_score is not None:
-                    score_parts.append(f"Rt={self._format_score(rt_score)}")
-                if emb_score is not None:
-                    score_parts.append(f"Emb={self._format_score(emb_score)}")
-                if splade_score is not None:
-                    score_parts.append(f"Splade={self._format_score(splade_score)}")
+            lines.append(f"  <chunk {' '.join(attributes)}>")
+            lines.append("    <chunk_text>")
 
-                if score_parts:
-                    header = f"{header} [{', '.join(score_parts)}]"
+            snippet = self._sanitize_chunk_text(chunk_obj.snippet.strip())
+            if snippet:
+                for snippet_line in snippet.splitlines():
+                    lines.append(f"      {snippet_line}")
 
-            elif self.sp.stage == "reranked":
-                score_parts = []
-
-                rnk_score = reranked_score_map.get(chunk_obj.id)
-                if rnk_score is None:
-                    rnk_score = self._get_meta_float(chunk_obj.meta, "rerank_rrf_score")
-
-                rcolb_score = self._get_meta_float(chunk_obj.meta, "colbert_score")
-
-                rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_rrf_score")
-                if rt_score is None:
-                    rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_score")
-                if rt_score is None:
-                    rt_score = retrieval_score_map.get(chunk_obj.id)
-
-                if rnk_score is not None:
-                    score_parts.append(f"Rnk={self._format_score(rnk_score)}")
-                if rcolb_score is not None:
-                    score_parts.append(f"RcolB={self._format_score(rcolb_score)}")
-                if rt_score is not None:
-                    score_parts.append(f"Rt={self._format_score(rt_score)}")
-
-                if score_parts:
-                    header = f"{header} [{', '.join(score_parts)}]"
-
-            elif self.sp.stage == "a3":
-                decision = a3_decision_map.get(chunk_obj.id, {})
-                usefulness = str(decision.get("usefulness_label", "") or "").strip()
-                if usefulness:
-                    header = f"{header} [Use={usefulness}]"
-
-            lines.append(header)
-            lines.append("")
-            lines.append(chunk_obj.snippet.strip())
-            lines.append("")
+            lines.append("    </chunk_text>")
+            lines.append("  </chunk>")
             chunk_counter += 1
 
+        lines.append("</retrieved_chunks>")
+
         return "\n".join(lines).strip()
+
+    def _build_chunk_score_label(
+        self,
+        *,
+        chunk_obj: Any,
+        retrieval_score_map: Dict[str, float],
+        reranked_score_map: Dict[str, float],
+        a3_decision_map: Dict[str, Dict[str, Any]],
+    ) -> str:
+        score_parts: List[str] = []
+
+        emb_score = self._get_meta_float(chunk_obj.meta, "emb_score")
+        splade_score = self._get_meta_float(chunk_obj.meta, "splade_score")
+
+        if self.sp.stage == "retrieval":
+            rt_score = retrieval_score_map.get(chunk_obj.id)
+            if rt_score is not None:
+                score_parts.append(f"Rt={self._format_score(rt_score)}")
+            if emb_score is not None:
+                score_parts.append(f"Emb={self._format_score(emb_score)}")
+            if splade_score is not None:
+                score_parts.append(f"Splade={self._format_score(splade_score)}")
+
+        elif self.sp.stage == "reranked":
+            rnk_score = reranked_score_map.get(chunk_obj.id)
+            if rnk_score is None:
+                rnk_score = self._get_meta_float(chunk_obj.meta, "rerank_rrf_score")
+
+            rcolb_score = self._get_meta_float(chunk_obj.meta, "colbert_score")
+
+            rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_rrf_score")
+            if rt_score is None:
+                rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_score")
+            if rt_score is None:
+                rt_score = retrieval_score_map.get(chunk_obj.id)
+
+            if rnk_score is not None:
+                score_parts.append(f"Rnk={self._format_score(rnk_score)}")
+            if rcolb_score is not None:
+                score_parts.append(f"RcolB={self._format_score(rcolb_score)}")
+            if rt_score is not None:
+                score_parts.append(f"Rt={self._format_score(rt_score)}")
+
+        elif self.sp.stage == "a3":
+            decision = a3_decision_map.get(chunk_obj.id, {})
+            usefulness = str(decision.get("usefulness_label", "") or "").strip()
+            if usefulness:
+                score_parts.append(f"Use={usefulness}")
+
+        return ", ".join(score_parts).strip()
+
+    @staticmethod
+    def _sanitize_chunk_text(text: str) -> str:
+        """
+        Prevent source Markdown headings from becoming real prompt headings.
+        """
+        if not text:
+            return ""
+
+        sanitized_lines: List[str] = []
+
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            indent = line[: len(line) - len(stripped)]
+
+            if stripped.startswith("### "):
+                sanitized_lines.append(f"{indent}[H3] {stripped[4:].strip()}")
+            elif stripped.startswith("## "):
+                sanitized_lines.append(f"{indent}[H2] {stripped[3:].strip()}")
+            elif stripped.startswith("# "):
+                sanitized_lines.append(f"{indent}[H1] {stripped[2:].strip()}")
+            else:
+                sanitized_lines.append(line)
+
+        return "\n".join(sanitized_lines).strip()
+
+    @staticmethod
+    def _escape_attr(value: str) -> str:
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace('"', "&quot;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _format_score(self, score: float) -> str:
+        return f"{float(score):.8f}".rstrip("0").rstrip(".")
+
+    def _render_related_context_md(self) -> str:
+        """
+        Backward-compatible wrapper.
+
+        Older callers may still refer to _render_related_context_md().
+        The visible GUI format now uses Raw Retrieved Evidence instead of
+        the older Related Context block.
+        """
+        return self._render_raw_retrieved_evidence_md()
 
     @staticmethod
     def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:

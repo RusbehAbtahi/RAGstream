@@ -10,7 +10,7 @@ Responsibilities:
 - compose prompts,
 - log the exact prompts/messages to CLI,
 - call LLMClient,
-- log cache-token usage after each call,
+- log model name + token usage after each call,
 - parse the result back into Python.
 """
 
@@ -68,6 +68,7 @@ class A4LLMHelper:
             call_name="A4 Chunk Phraser",
             agent_prompt=agent_prompt,
             input_payload=inputs,
+            prompt_cache_key="a4_condenser_shared_prefix",  # Added: one stable cache key for the shared A4 prefix family across all 3 calls.
         )
 
     def run_chunk_classifier(
@@ -87,7 +88,7 @@ class A4LLMHelper:
                 '  "item_decisions": [\n'
                 '    {\n'
                 '      "chunk_id": "1",\n'
-                '      "class_id": "ID1"\n'
+                '      "class_id": "one visible class phrase from Active Class Definitions"\n'
                 '    }\n'
                 '  ]\n'
                 '}'
@@ -98,6 +99,7 @@ class A4LLMHelper:
             call_name="A4 Chunk Classifier",
             agent_prompt=agent_prompt,
             input_payload=inputs,
+            prompt_cache_key="a4_condenser_shared_prefix",  # Added: same stable cache key to keep the shared A4 prefix on the same cache-routing family.
         )
 
     def run_final_condenser(
@@ -127,6 +129,7 @@ class A4LLMHelper:
             call_name="A4 Final Condenser",
             agent_prompt=agent_prompt,
             input_payload=inputs,
+            prompt_cache_key="a4_condenser_shared_prefix",  # Added: same stable cache key to maximize hit rate for the identical A4 prefix family.
         )
 
     def _run_agent_call(
@@ -135,9 +138,12 @@ class A4LLMHelper:
         call_name: str,
         agent_prompt: AgentPrompt,
         input_payload: Dict[str, Any],
+        prompt_cache_key: str,
     ) -> JsonDict:
         """
         Shared LLM path for all 3 A4 calls.
+
+        Uses the Responses API with minimal reasoning effort.
         """
         messages, response_format = agent_prompt.compose(input_payload=input_payload)
 
@@ -147,17 +153,21 @@ class A4LLMHelper:
         except Exception:
             SimpleLogger.info(repr(messages))
 
-        response = self._llm_client.chat(
+        response = self._llm_client.responses(
             messages=messages,
             model_name=agent_prompt.model_name,
-            temperature=agent_prompt.temperature,
             max_output_tokens=agent_prompt.max_output_tokens,
-            response_format=response_format,
+            reasoning_effort="minimal",
             return_metadata=True,
+            prompt_cache_key=prompt_cache_key,  # Added: explicit cache-routing key for shared A4 prefix family.
+          #  prompt_cache_retention="in_memory",  # Added: explicit short-lived cache retention for near-term chained A4 calls.
         )
 
         raw_content = str(response.get("content", "") or "")
         usage = response.get("usage", {}) or {}
+        model_name = str(response.get("model_name", "") or agent_prompt.model_name)
+        status = str(response.get("status", "") or "")
+        incomplete_reason = str(response.get("incomplete_reason", "") or "")
 
         SimpleLogger.info(f"{call_name} ← LLM raw result:")
         try:
@@ -165,16 +175,23 @@ class A4LLMHelper:
         except Exception:
             SimpleLogger.info(repr(raw_content))
 
-        cached_tokens = int(usage.get("cached_tokens", 0) or 0)
-        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-        uncached_tokens = max(0, prompt_tokens - cached_tokens)
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        cached_input_tokens = int(usage.get("cached_input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+        uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
 
         SimpleLogger.info(
-            f"{call_name} | token usage | prompt={prompt_tokens} | "
-            f"cached={cached_tokens} | uncached={uncached_tokens} | "
-            f"completion={completion_tokens}"
+            f"{call_name} | model={model_name} | status={status} | "
+            f"input={input_tokens} | cached_input={cached_input_tokens} | "
+            f"uncached_input={uncached_input_tokens} | output={output_tokens} | "
+            f"reasoning={reasoning_tokens}"
         )
+
+        if incomplete_reason:
+            SimpleLogger.warning(
+                f"{call_name} | incomplete_reason={incomplete_reason}"
+            )
 
         parsed = agent_prompt.parse(raw_content)
 

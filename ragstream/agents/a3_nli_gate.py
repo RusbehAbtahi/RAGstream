@@ -1,3 +1,4 @@
+# ragstream/agents/a3_nli_gate.py
 # -*- coding: utf-8 -*-
 """
 A3 NLI Gate agent.
@@ -104,6 +105,8 @@ class A3NLIGate:
             temperature=agent.temperature,
             max_output_tokens=agent.max_output_tokens,
             response_format=response_format,
+            prompt_cache_key=f"{agent_id}_{version}",  # Added: stable cache key for repeated A3 prompts of the same agent/version.
+          #  prompt_cache_retention="in_memory",  # Added: explicit short-lived cache retention for repeated near-term A3 calls.
         )
 
         SimpleLogger.info("A3NLIGate ← LLM raw result:")

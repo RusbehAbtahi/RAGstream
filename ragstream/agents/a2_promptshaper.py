@@ -97,6 +97,8 @@ class A2PromptShaper:
             temperature=agent.temperature,
             max_output_tokens=agent.max_output_tokens,
             response_format=response_format,
+            prompt_cache_key=f"{agent_id}_{version}",  # Added: stable cache key for repeated A2 prompts of the same agent/version.
+           # prompt_cache_retention="in_memory",  # Added: explicit short-lived cache retention for repeated near-term A2 calls.
         )
 
         SimpleLogger.info("A2PromptShaper ← LLM raw result:")
@@ -109,6 +111,16 @@ class A2PromptShaper:
             SimpleLogger.info(repr(raw_result))
 
         parsed_result = agent.parse(raw_result, active_fields=active_fields)
+
+        # Deterministic A2 safety layer:
+        # - remove every selected id that does not belong to the corresponding field catalog
+        # - if a field becomes empty after removal, do NOT use catalog defaults here
+        # - preserve the existing preprocessing value by simply not overwriting that field
+        parsed_result = self._sanitize_selector_result(
+            agent=agent,
+            parsed_result=parsed_result,
+            active_fields=active_fields,
+        )
 
         selected_ids: Dict[str, Any] = {}
         labels_map: Dict[str, Dict[str, str]] = getattr(agent, "option_labels", {}) or {}
@@ -143,6 +155,116 @@ class A2PromptShaper:
         sp.compose_prompt_ready()
 
         return sp
+
+    def _sanitize_selector_result(
+        self,
+        *,
+        agent: Any,
+        parsed_result: JsonDict,
+        active_fields: List[str],
+    ) -> JsonDict:
+        """
+        Deterministically sanitize A2 selector output.
+
+        Rules:
+        - Each field may only use ids from its own enum/catalog.
+        - Invalid ids are removed.
+        - Cross-field ids are removed.
+        - Duplicate ids are removed while preserving order.
+        - max_selected is enforced.
+        - If a field becomes empty, the field is omitted from the sanitized result.
+          This preserves the existing preprocessing value in sp.body.
+        - Catalog defaults are intentionally NOT applied here.
+        """
+        sanitized: JsonDict = {}
+
+        enums: Dict[str, List[str]] = getattr(agent, "enums", {}) or {}
+
+        target_by_id: Dict[str, Dict[str, Any]] = {}
+        for target in getattr(agent, "decision_targets", []) or []:
+            field_id = str(target.get("id", "") or "").strip()
+            if field_id:
+                target_by_id[field_id] = target
+
+        for field_id in active_fields:
+            if field_id not in parsed_result:
+                continue
+
+            target = target_by_id.get(field_id, {}) or {}
+            max_selected = int(target.get("max_selected", 1) or 1)
+
+            allowed_values = enums.get(field_id, []) or []
+            allowed_ids = [str(item).strip() for item in allowed_values if str(item).strip()]
+            allowed_set = set(allowed_ids)
+
+            if not allowed_set:
+                SimpleLogger.warning(
+                    f"A2PromptShaper: no enum/catalog values available for field '{field_id}'; "
+                    "preserving preprocessing value."
+                )
+                continue
+
+            raw_value = parsed_result.get(field_id)
+            raw_items = self._normalize_selector_items(raw_value)
+
+            valid_items: List[str] = []
+            removed_items: List[str] = []
+
+            for item in raw_items:
+                if item in allowed_set:
+                    if item not in valid_items:
+                        valid_items.append(item)
+                else:
+                    removed_items.append(item)
+
+            if removed_items:
+                SimpleLogger.warning(
+                    f"A2PromptShaper: removed invalid option(s) for field '{field_id}': "
+                    f"{removed_items}"
+                )
+
+            if not valid_items:
+                SimpleLogger.warning(
+                    f"A2PromptShaper: field '{field_id}' became empty after sanitization; "
+                    "preserving preprocessing value."
+                )
+                continue
+
+            if len(valid_items) > max_selected:
+                SimpleLogger.warning(
+                    f"A2PromptShaper: field '{field_id}' returned too many valid options; "
+                    f"keeping first {max_selected}: {valid_items[:max_selected]}"
+                )
+                valid_items = valid_items[:max_selected]
+
+            if max_selected > 1:
+                sanitized[field_id] = valid_items
+            else:
+                sanitized[field_id] = valid_items[0]
+
+        return sanitized
+
+    @staticmethod
+    def _normalize_selector_items(value: Any) -> List[str]:
+        """
+        Normalize one selector output value into a clean list of string ids.
+        """
+        if value is None:
+            return []
+
+        if isinstance(value, list):
+            result: List[str] = []
+            for item in value:
+                text = str(item or "").strip()
+                if text:
+                    result.append(text)
+            return result
+
+        text = str(value or "").strip()
+        if not text:
+            return []
+
+        return [text]
 
     def _build_prompt_under_evaluation(self, sp: SuperPrompt) -> str:
         """
