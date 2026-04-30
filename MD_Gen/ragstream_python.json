@@ -7,7 +7,6 @@
   "~\\ragstream\\app\\ui_actions.py",
   "~\\ragstream\\app\\ui_layout.py",
   "~\\ragstream\\app\\ui_streamlit.py",
-  "~\\ragstream\\app\\ui_streamlit_demo.py",
   "~\\ragstream\\config\\settings.py",
   "~\\ragstream\\ingestion\\chroma_vector_store_base.py",
   "~\\ragstream\\ingestion\\chunker.py",
@@ -39,7 +38,9 @@
   "~\\ragstream\\retrieval\\retriever_splade.py",
   "~\\ragstream\\retrieval\\rrf_merger.py",
   "~\\ragstream\\retrieval\\smart_query_splitter.py",
-  "~\\ragstream\\memory\\conversation_memory.py",
+  "~\\ragstream\\memory\\memory_actions.py",
+  "~\\ragstream\\memory\\memory_manager.py",
+  "~\\ragstream\\memory\\memory_record.py",
   "~\\ragstream\\utils\\logging.py",
   "~\\ragstream\\utils\\paths.py"
 ]

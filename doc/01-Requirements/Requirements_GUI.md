@@ -1,6 +1,6 @@
 # Requirements_GUI.md
 
-Last update: 14.04.2026
+Last update: 24.04.2026
 
 Note for future maintenance:
 - When new implementation-aligned GUI features or behavior changes are added here, they should be date-stamped inline so the chronology stays visible.
@@ -235,6 +235,10 @@ The intermediate GUI must provide at least the following UI elements:
    * heavy Retrieval / ReRanker component warm-up in the background,
    * readiness-gated behavior so buttons that depend on heavy components do not behave as if those components are ready before they actually are.
 
+6. [24.04.2026] The A4 Condenser button is now connected to the live controller path. When pressed, it runs `ctrl.run_a4(sp)`, stores `sp_a4`, and refreshes the SuperPrompt view from the updated `sp.prompt_ready`.
+
+7. [24.04.2026] The GUI-visible SuperPrompt rendering after A4 is owned by `SuperPromptProjector.compose_prompt_ready()`. The GUI remains thin and only displays the rendered `prompt_ready`.
+
 3.3 Stage-specific behavior and state machine
 
 3.3.1 Global state machine
@@ -276,46 +280,85 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
 
 3. After “Retrieval”
 
-   * In addition to the prompt text, the resulting `prompt_ready` should include a simple textual list of all retrieved raw chunks (RAG context) at the bottom or in a clearly separated block.
+   * In addition to the prompt text, the resulting `prompt_ready` should include the retrieved raw chunks in a clearly separated retrieved-context block.
 
    * The displayed order must reflect the final Retrieval ranking used by the stage.
    * [14.04.2026] In the current implementation, the GUI-compatible projection may show component Retrieval values such as fused Retrieval score, dense branch score, and SPLADE branch score for debugging.
+   * [24.04.2026] The current GUI-visible projector should place raw retrieved chunks under `## Retrieved Context / ### Raw Retrieved Evidence` rather than merging them with the user task.
 
-   * For the intermediate GUI, this can be a minimal debug list, e.g.:
-
-     ```
-     --- RAG Context (Retrieval) ---
-     [chunk_id_1] <snippet1...>
-     [chunk_id_2] <snippet2...>
-     ...
-     ```
-
-   * This is primarily for human inspection, not the final format.
+   * This is primarily for human inspection, not the final production-send format.
 
 4. After “ReRanker”
 
-   * `prompt_ready` is updated so that the RAG context block now lists the reranked chunks in their new order, e.g.:
-
-     ```
-     --- RAG Context (ReRanked) ---
-     [chunk_id_7] <snippet7...>
-     [chunk_id_3] <snippet3...>
-     ...
-     ```
-
+   * `prompt_ready` is updated so that the raw retrieved evidence block lists the reranked chunks in their new order.
    * The displayed order must reflect the final fused ReRanker result used by the stage.
    * [14.04.2026] In the current implementation, the GUI-compatible projection may show ReRanker score together with the previous fused Retrieval score and the dense/SPLADE component signals for debugging.
+   * [24.04.2026] The ReRanker view must still use the same retrieved-context separation as Retrieval; reranked evidence must not be rendered as part of `### Task`.
 
 5. After “A3 – NLI Gate”
 
-   * `prompt_ready` is updated so the RAG context block now contains only the chunks that survive A3 usefulness filtering. Discarded chunks are removed; borderline chunks may still survive if the deterministic A3 post-processing promotes them to satisfy the working-set floor.
+   * `prompt_ready` is updated so the raw retrieved evidence block now contains only the chunks that survive A3 usefulness filtering. Discarded chunks are removed; borderline chunks may still survive if the deterministic A3 post-processing promotes them to satisfy the working-set floor.
 
 6. After “A4 – Condenser”
 
-   * `prompt_ready` is close to its final form:
+   * [24.04.2026] `prompt_ready` must show the A4 condensed context as retrieved support material, not as part of the user task.
+   * [24.04.2026] The GUI-visible structure after A4 must be:
 
-     * It includes `S_CTX_MD` (the condensed context block) in the correct place.
-     * The raw chunk list can remain visible as a debug block under S_CTX for the intermediate GUI, but S_CTX is the main thing.
+     ```markdown
+     ## System
+     <system roles / system instruction>
+
+     ## Configuration
+     - Audience: ...
+     - Tone: ...
+     - Depth: ...
+     - Confidence: ...   <!-- if available -->
+
+     ## User
+
+     ### Task
+     <always present>
+
+     ### Purpose
+     <only if present>
+
+     ### Context
+     <only if present>
+
+     ## Retrieved Context
+
+     ### Retrieved Context Summary
+     The following summary is retrieved from selected project files or memory. It is supporting context for the task, not part of the task itself.
+
+     <S_CTX_MD if available>
+
+     ### Raw Retrieved Evidence
+     <raw retrieved chunks if available>
+     ```
+
+   * [24.04.2026] Raw retrieved chunks may remain visible in Generation 1 for development, audit, and debugging, but `S_CTX_MD` is the main condensed context block after A4.
+
+6.1. [24.04.2026] Raw retrieved evidence rendering rules
+
+1. Raw retrieved chunks must be nested under an XML-like wrapper, for example:
+
+   ```xml
+   <retrieved_chunks>
+     <chunk index="1" chunk_id="..." source="...">
+       <chunk_text>
+         ...
+       </chunk_text>
+     </chunk>
+   </retrieved_chunks>
+   ```
+
+2. Source Markdown headings inside retrieved chunks must not remain active markdown headings in the GUI-visible SuperPrompt. They must be neutralized as markers such as:
+
+   * `# Heading` -> `[H1] Heading`
+   * `## Heading` -> `[H2] Heading`
+   * `### Heading` -> `[H3] Heading`
+
+3. The purpose of this rule is to prevent source-document headings from competing with the main prompt structure (`## System`, `## Configuration`, `## User`, `## Retrieved Context`).
 
 7. After “A5 – Format Enforcer”
 
@@ -326,10 +369,12 @@ The SuperPrompt view always shows the current `SuperPrompt.prompt_ready`. Intern
    * `prompt_ready` is the true final SuperPrompt as it would be sent to the answering LLM:
 
      * System block,
-     * Prompt block,
-     * S_CTX block,
-     * Attachments block (raw chunks),
+     * Prompt/User block,
+     * Retrieved Context / S_CTX block,
+     * Attachments or raw evidence block when enabled,
      * Optional recent conversation block.
+
+   * [24.04.2026] Prompt Builder should reuse or stay aligned with the same high-level section separation already used by `SuperPromptProjector` so GUI preview and final-send assembly do not diverge.
 
 3.3.3 Project-based ingestion routing and manifest placement
 

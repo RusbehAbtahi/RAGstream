@@ -234,3 +234,15 @@ training/*
 ragstream/app/Hook_ChatGTP.py
 ragstream/app/Hook_ChatGTP2.py
 ragstream/app/Hook_ChatGTP_TO_DO.txt
+
+
+data/logs/**
+!data/logs/
+!data/logs/public_run/
+!data/logs/archive/
+!data/logs/sqlite/
+!data/logs/backups/
+!data/logs/public_run/.gitkeep
+!data/logs/archive/.gitkeep
+!data/logs/sqlite/.gitkeep
+!data/logs/backups/.gitkeep

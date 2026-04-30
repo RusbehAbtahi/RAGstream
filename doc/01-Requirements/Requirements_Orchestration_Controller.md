@@ -1,5 +1,7 @@
 # Requirements_Orchestration_Controller.md
 
+Last update: 24.04.2026
+
 1. Purpose and scope
 
 This document specifies the orchestration and controller layer for RAGstream. It describes how the controller coordinates the eight-stage RAG pipeline, integrates with the GUI, and remains compatible with the current stateless agent design (AgentFactory, AgentPrompt, llm_client) and the SuperPrompt data model.
@@ -38,7 +40,7 @@ It does not implement LLM logic or vector math itself. Instead, it:
 * Updates SuperPrompt.stage, history_of_stages, prompt_ready, and the GUI snapshot.
 * Manages global choices like active project / active vector store.
 
-All heavy work (PreProcessing normalization, agents, retrieval, reranking) lives in their own modules.
+All heavy work (PreProcessing normalization, agents, retrieval, reranking, A3 filtering, and A4 condensation) lives in their own modules.
 
 3. Controller responsibilities (high-level)
 
@@ -96,7 +98,7 @@ Optional fields (depending on current implementation stage):
 At GUI start:
 
 * ui_streamlit.py checks st.session_state; if no controller exists, it creates AppController().
-* AppController.**init** creates a fresh SuperPrompt (stage = "raw") and sets default config.
+* AppController.**init** creates the shared controller infrastructure. [24.04.2026] In the current implementation this includes a shared `AgentFactory`, shared `LLMClient`, `A2PromptShaper`, `A3NLIGate`, and `A4Condenser`; Streamlit session state owns the active `SuperPrompt` objects used by the GUI.
 
 On each button click:
 
@@ -158,11 +160,11 @@ Behavior:
 
 * Require stage >= "preprocessed".
 * Call A2 agent module (for example ragstream/app/agents/a2_prompt_shaper.py) with the current SuperPrompt.
-* A2 uses its own AgentFactory, AgentPrompt, and llm_client to query the chosen SLM and returns structured headers (system, audience, tone, confidence, depth) plus any meta info, following its own requirements. 
+* A2 uses the shared AgentFactory, AgentPrompt, and llm_client to query the configured model and returns structured headers (system, audience, tone, confidence, depth) plus any meta info, following its own requirements. [24.04.2026] A2 also applies deterministic selector sanitization before updating `SuperPrompt`. 
 * The controller receives an updated SuperPrompt from A2 with:
 
-  * body fields updated or filled (system, tone, depth, audience, confidence).
-  * extras updated (A2 decisions, confidence scores).
+  * body fields updated or filled only where sanitized A2 output remains valid (system, tone, depth, audience, confidence).
+  * extras updated with sanitized selected ids and A2 diagnostics.
   * stage set to "a2".
   * history_of_stages appended with "a2".
   * prompt_ready regenerated for the GUI (from the updated body).
@@ -245,7 +247,7 @@ Behavior:
 
   * updated final_selection_ids (only chunks that pass the gate or remain eligible under the active policy).
   * optionally a view list `views_by_stage["a3"]`.
-  * optional label and duplicate metadata per chunk.
+  * usefulness labels and selection-band metadata per chunk. Duplicate metadata is not part of the current A3 contract.
 * Controller updates sp:
 
   * final_selection_ids set to A3’s decision.
@@ -258,27 +260,34 @@ Behavior:
 
 Signature (conceptual):
 
-* run_a4() -> SuperPrompt
+* run_a4(sp: SuperPrompt, *, effective_output_token_limit: int | None = None) -> SuperPrompt
 
 Behavior:
 
-* Require stage >= "a3" or at least "reranked" with final_selection_ids present.
-* Call A4 agent module with:
+* Require stage >= "a3" with A3 rows available and useful chunks present.
+* [24.04.2026] Call the live `A4Condenser` module with:
 
-  * SuperPrompt
-  * chunks corresponding to final_selection_ids.
-* A4 uses its own AgentFactory and llm_client to produce:
+  * SuperPrompt,
+  * optional `effective_output_token_limit`.
+* [24.04.2026] A4 does not use normal `AgentFactory.get_agent(...)` lookup. `A4Condenser` loads the three exact A4 JSON configs, creates the three `AgentPrompt` objects at the beginning of the run, and delegates:
 
-  * S_CTX_MD: condensed facts/constraints/open-issues summary from final_selection_ids.
-  * Possibly updated final_selection_ids if token budgeting requires dropping some chunks. 
+  * deterministic preparation / grouping / finalization to `a4_det_processing.py`,
+  * repeated LLM-call mechanics to `A4LLMHelper`,
+  * OpenAI Responses API calls to `LLMClient.responses(...)`.
+* [24.04.2026] A4 produces:
+
+  * `S_CTX_MD`: neutral condensed retrieved context from A3-useful evidence,
+  * updated `final_selection_ids`,
+  * `views_by_stage["a4"]`,
+  * A4 diagnostic fields in `sp.extras`.
 * Controller updates sp:
 
   * S_CTX_MD set.
-  * final_selection_ids adjusted (if A4 dropped anything).
+  * final_selection_ids adjusted to the A4 retained ids.
   * views_by_stage["a4"] set to the final list.
   * stage set to "a4".
   * history_of_stages appended with "a4".
-  * prompt_ready updated to include S_CTX_MD in a dedicated block in the GUI snapshot.
+  * prompt_ready updated via `sp.compose_prompt_ready()` / `SuperPromptProjector` so `S_CTX_MD` appears under Retrieved Context Summary, not under the user task.
 
 5.7 A5 Format Enforcer
 
@@ -339,7 +348,7 @@ Prompt Builder itself remains deterministic; it just renders strings from SuperP
   * A4 Condenser → run_a4()
   * A5 Format Enforcer → run_a5()
   * Prompt Builder → build_prompt()
-* After each call, the GUI updates the SuperPrompt text area from sp.prompt_ready. 
+* After each call, the GUI updates the SuperPrompt text area from sp.prompt_ready. [24.04.2026] After A4, this visible prompt is rendered with explicit separation between System, Configuration, User, Retrieved Context Summary, and Raw Retrieved Evidence. 
 * Stage gating is enforced by the controller; buttons may be visually enabled/disabled in the GUI later, but logic must not rely on UI alone.
 
 6.2 Auto mode (future)
@@ -453,6 +462,7 @@ Future advanced orchestrations (multiple retrieval passes, planner agents, diffe
     * stage and history_of_stages are updated correctly.
     * views_by_stage and final_selection_ids are updated as expected.
     * prompt_ready contains expected markers (for example S_CTX_MD present after A4).
+    * [24.04.2026] A4 tests must verify that A4 writes `S_CTX_MD`, `views_by_stage["a4"]`, `final_selection_ids`, stage/history, and A4 extras without corrupting previous retrieval/A3 state.
 * For run_full_pipeline, write tests that:
 
   * Simulate the same steps as the GUI and ensure that the final SuperPrompt is identical.

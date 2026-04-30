@@ -1,0 +1,493 @@
+@startuml TextForge_Logger_Subsystem
+
+'──────────────────────────────────────────────────────────────
+' TEXTFORGE LOGGER SUBSYSTEM
+' Current design baseline
+'──────────────────────────────────────────────────────────────
+
+top to bottom direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+' 1) CORE FACADE
+'──────────────────────────────────────────────────────────────
+
+package "TextForge Core" {
+
+    class TextForge {
+        + id : str
+        + text : str
+        + type : str
+        + sensitivity : str
+        + sinks : list<TextSink>
+        + b_enable : list<bool>
+
+        + __init__(
+            text: str = "",
+            type: str = "INFO",
+            sensitivity: str = "PUBLIC",
+            sinks: list<TextSink> = None,
+            b_enable: list<bool> = None
+          ) : None
+
+        + __call__(
+            text: str = None,
+            type: str = None,
+            sensitivity: str = None
+          ) : None
+
+        + log(
+            text: str = None,
+            type: str = None,
+            sensitivity: str = None
+          ) : None
+
+        - _generate_id() : str
+    }
+
+    note right of TextForge
+      Role:
+      - Main facade used by application code.
+      - Keeps current/default text, type, sensitivity.
+      - Generates one unique id per emitted log entry.
+      - Loops over sinks.
+      - Uses b_enable[i] to decide whether sinks[i] is called.
+      - Does not know file, GUI, CLI, SQLite, or thread details.
+
+      Usage:
+      logger("text")
+      logger("text", "INFO")
+      logger("text", "INFO", "CONFIDENTIAL")
+    end note
+}
+
+'──────────────────────────────────────────────────────────────
+' 2) COMMON SINK BASE
+'──────────────────────────────────────────────────────────────
+
+package "TextSink Base" {
+
+    abstract class TextSink {
+        + sink_kind : str
+        + accept_types : list<str>
+        + accept_sensitivities : list<str>
+        + LOG_TYPE_CATALOG : dict<str, dict<str, str>>
+        + SENSITIVITY_CATALOG : dict<str, dict<str, str>>
+        + b_timestamp : bool
+        + b_prefix : bool
+        + b_suffix : bool
+
+        + __init__(
+            sink_kind: str,
+            accept_types: list<str>,
+            accept_sensitivities: list<str>,
+            b_timestamp: bool = True,
+            b_prefix: bool = True,
+            b_suffix: bool = False
+          ) : None
+
+        + accepts(
+            type: str,
+            sensitivity: str
+          ) : bool
+
+        - _format_text(
+            id: str,
+            text: str,
+            type: str,
+            sensitivity: str
+          ) : str
+
+        {abstract} + log(
+            id: str,
+            text: str,
+            type: str,
+            sensitivity: str
+          ) : None
+    }
+
+    note right of TextSink
+      Role:
+      - Common sink contract.
+      - Owns filtering by type and sensitivity.
+      - Owns common formatting.
+      - Uses sink_kind to choose correct prefix/suffix:
+          "file" -> file_prefix/file_suffix
+          "gui"  -> gui_prefix/gui_suffix
+          "cli"  -> cli_prefix/cli_suffix
+
+      Important:
+      - Formatting happens here.
+      - Real output happens in concrete sinks.
+    end note
+}
+
+'──────────────────────────────────────────────────────────────
+' 3) CONCRETE SINKS
+'──────────────────────────────────────────────────────────────
+
+package "Concrete Sinks" {
+
+    class FileSink {
+        + path : str
+        + rotation_size : int
+        + split_flag : bool
+        + b_sqlite : bool
+        + sqlite_path : str
+        + b_async : bool
+
+        + __init__(
+            path: str,
+            accept_types: list<str>,
+            accept_sensitivities: list<str>,
+            rotation_size: int,
+            split_flag: bool,
+            b_sqlite: bool = False,
+            sqlite_path: str = None,
+            b_async: bool = False,
+            b_timestamp: bool = True,
+            b_prefix: bool = True,
+            b_suffix: bool = False
+          ) : None
+
+        + log(
+            id: str,
+            text: str,
+            type: str,
+            sensitivity: str
+          ) : None
+
+        + close() : None
+    }
+
+    note right of FileSink
+      Role:
+      - Concrete file output sink.
+      - Sets sink_kind = "file".
+      - If accepted, formats final text via TextSink.
+      - Writes final text to log file.
+      - If b_sqlite is True, writes SQLite metadata after file write.
+      - If b_async is True, FileSink.log uses async worker/thread behavior internally.
+      - TextForge does not manage SQLite or async behavior.
+
+      SQLite stores metadata/index, not full log text.
+      Full log text stays in log files.
+    end note
+
+
+    class GuiSink {
+        + session_state : object
+        + key : str
+
+        + __init__(
+            session_state: object,
+            key: str,
+            accept_types: list<str>,
+            accept_sensitivities: list<str>,
+            b_timestamp: bool = True,
+            b_prefix: bool = True,
+            b_suffix: bool = False
+          ) : None
+
+        + log(
+            id: str,
+            text: str,
+            type: str,
+            sensitivity: str
+          ) : None
+    }
+
+    note right of GuiSink
+      Role:
+      - Concrete Streamlit GUI sink.
+      - Sets sink_kind = "gui".
+      - If accepted, formats final text via TextSink.
+      - Writes final text into session_state[key].
+      - Intended mainly for PUBLIC high-level user-visible messages.
+    end note
+
+
+    class CliSink {
+        + stream : str
+
+        + __init__(
+            stream: str,
+            accept_types: list<str>,
+            accept_sensitivities: list<str>,
+            b_timestamp: bool = True,
+            b_prefix: bool = True,
+            b_suffix: bool = False
+          ) : None
+
+        + log(
+            id: str,
+            text: str,
+            type: str,
+            sensitivity: str
+          ) : None
+    }
+
+    note right of CliSink
+      Role:
+      - Concrete CLI/terminal sink.
+      - Sets sink_kind = "cli".
+      - If accepted, formats final text via TextSink.
+      - Writes final text to selected stream:
+          stdout or stderr.
+      - Runtime mode is configured by RagLog, not by log call sites.
+    end note
+}
+
+'──────────────────────────────────────────────────────────────
+' 4) RAGLOG PRESET / BUILDER LAYER
+'──────────────────────────────────────────────────────────────
+
+package "RagLog Presets" {
+
+    class RagLog {
+        + create_default_logger(
+            mode: str = "normal",
+            session_state: object = None
+          ) : TextForge
+
+        + create_gui_public_sink(
+            session_state: object,
+            key: str
+          ) : GuiSink
+
+        + create_cli_runtime_sink(
+            mode: str = "normal"
+          ) : CliSink
+
+        + create_public_run_file_sink() : FileSink
+
+        + create_archive_sink() : FileSink
+
+        + create_default_sinks(
+            mode: str = "normal",
+            session_state: object = None
+          ) : list<TextSink>
+
+        + create_default_enable_map() : list<bool>
+    }
+
+    note right of RagLog
+      Role:
+      - Initialization/helper layer.
+      - Builds ready-to-use TextForge configurations.
+      - Decides which sinks exist.
+      - Decides which sink accepts which type/sensitivity.
+      - Decides b_sqlite and b_async values.
+      - Decides startup mode:
+          normal
+          developer
+
+      Important:
+      - No hard-coded sink policy inside TextForge.
+      - No hard-coded sink policy inside FileSink/GuiSink/CliSink.
+      - RagLog configures them.
+    end note
+}
+
+'──────────────────────────────────────────────────────────────
+' 5) CATALOGS
+'──────────────────────────────────────────────────────────────
+
+package "Catalogs" {
+
+    class LogTypeCatalog <<constant>> {
+        + TRACE : dict
+        + DEBUG : dict
+        + INFO : dict
+        + WARN : dict
+        + ERROR : dict
+        + FATAL : dict
+    }
+
+    note right of LogTypeCatalog
+      Severity types:
+      - TRACE
+      - DEBUG
+      - INFO
+      - WARN
+      - ERROR
+      - FATAL
+
+      Each entry may define:
+      - file_prefix
+      - file_suffix
+      - gui_prefix
+      - gui_suffix
+      - cli_prefix
+      - cli_suffix
+
+      Suffix is normally empty.
+    end note
+
+
+    class SensitivityCatalog <<constant>> {
+        + PUBLIC : dict
+        + INTERNAL : dict
+        + CONFIDENTIAL : dict
+        + HIGHLY_CONFIDENTIAL : dict
+    }
+
+    note right of SensitivityCatalog
+      Sensitivity flags:
+      - PUBLIC
+      - INTERNAL
+      - CONFIDENTIAL
+      - HIGHLY_CONFIDENTIAL
+
+      Default:
+      - PUBLIC
+
+      Normal rule:
+      - PUBLIC/INTERNAL may be logged normally.
+      - CONFIDENTIAL only goes to protected sinks.
+      - HIGHLY_CONFIDENTIAL is normally not accepted by any sink.
+    end note
+}
+
+'──────────────────────────────────────────────────────────────
+' 6) FILE / DATA LAYOUT
+'──────────────────────────────────────────────────────────────
+
+package "Runtime Log Storage" {
+
+    class LogStorageLayout <<filesystem>> {
+        + data/logs/public_run/
+        + data/logs/archive/
+        + data/logs/sqlite/
+        + data/logs/backups/
+    }
+
+    note right of LogStorageLayout
+      Suggested runtime layout:
+
+      data/logs/
+        public_run/
+          public_run_YYYY-MM-DD.log
+          public_run_YYYY-MM-DD_part001.log
+
+        archive/
+          archive_YYYY-MM-DD.log
+          archive_YYYY-MM-DD_part001.log
+
+        sqlite/
+          textforge_index.sqlite3
+
+        backups/
+          YYYY-MM-DD/
+            public_run.zip
+            archive.zip
+            textforge_index.sqlite3.bak
+
+      Policy:
+      - One log file per date.
+      - Split only if file becomes too large.
+      - One long-lived SQLite metadata index.
+      - Weekly backup is enough.
+    end note
+}
+
+'──────────────────────────────────────────────────────────────
+' 7) RELATIONSHIPS
+'──────────────────────────────────────────────────────────────
+
+TextForge "1" o-- "0..*" TextSink : owns sinks
+TextForge ..> TextSink : calls sink.log(id,text,type,sensitivity)
+
+TextSink <|-- FileSink
+TextSink <|-- GuiSink
+TextSink <|-- CliSink
+
+TextSink ..> LogTypeCatalog : reads prefixes/suffixes
+TextSink ..> SensitivityCatalog : validates sensitivity
+
+FileSink ..> LogStorageLayout : writes log files
+FileSink ..> LogStorageLayout : writes SQLite metadata if enabled
+
+RagLog ..> TextForge : creates
+RagLog ..> FileSink : creates/configures
+RagLog ..> GuiSink : creates/configures
+RagLog ..> CliSink : creates/configures
+RagLog ..> LogStorageLayout : uses paths
+
+'──────────────────────────────────────────────────────────────
+' 8) DEFAULT SINK SET
+'──────────────────────────────────────────────────────────────
+
+note bottom of RagLog
+  Current default sink set:
+
+  1. GuiPublicSink
+     - types:
+         INFO, WARN, ERROR, FATAL
+     - sensitivities:
+         PUBLIC
+
+  2. CliRuntimeSink
+     - normal mode:
+         types:
+           INFO, WARN, ERROR, FATAL
+         sensitivities:
+           PUBLIC, INTERNAL
+     - developer mode:
+         types:
+           TRACE, DEBUG, INFO, WARN, ERROR, FATAL
+         sensitivities:
+           PUBLIC, INTERNAL, CONFIDENTIAL
+
+  3. File_PublicRun
+     - clean readable runtime log
+     - types:
+         INFO, WARN, ERROR, FATAL
+     - sensitivities:
+         PUBLIC
+
+  4. Sink0_Archive
+     - complete archive + SQLite metadata index
+     - types:
+         TRACE, DEBUG, INFO, WARN, ERROR, FATAL
+     - sensitivities:
+         PUBLIC, INTERNAL, CONFIDENTIAL
+     - b_sqlite = True
+     - b_async = True
+
+  HIGHLY_CONFIDENTIAL:
+     - not accepted by default.
+     - better rule: do not log it.
+end note
+
+'──────────────────────────────────────────────────────────────
+' 9) MAIN PIPELINE
+'──────────────────────────────────────────────────────────────
+
+note bottom of TextForge
+  Main runtime flow:
+
+  Application code:
+    logger(text)
+    logger(text, type)
+    logger(text, type, sensitivity)
+
+  TextForge.log:
+    1. update text/type/sensitivity if provided
+    2. generate new id
+    3. loop over sinks
+    4. if b_enable[i] is True:
+         call sinks[i].log(id, text, type, sensitivity)
+
+  Concrete sink.log:
+    1. accepts(type, sensitivity)
+    2. if rejected: do nothing
+    3. if accepted:
+         final_text = _format_text(...)
+    4. write final_text to its target
+end note
+
+@enduml

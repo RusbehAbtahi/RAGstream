@@ -1,0 +1,201 @@
+@startuml RAGstream_Memory_Recording
+
+left to right direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+'  STREAMLIT GUI / ACTION LAYER
+'──────────────────────────────────────────────────────────────
+package "Streamlit GUI / Action Layer" {
+
+    class StreamlitUI {
+        + prompt_text : str
+        + manual_memory_feed_text : str
+        + active_project : str
+        + embedded_files_view : List[str]
+        + memory_cards_state : List[Dict]
+    }
+
+    class MemoryActions {
+        + capture_memory_pair(...) : Dict
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  MEMORY RECORDING CORE
+'──────────────────────────────────────────────────────────────
+package "Memory Recording Core" {
+
+    class MemoryManager {
+        + file_id : str
+        + title : str
+        + filename_ragmem : str
+        + filename_meta : str
+        + memory_root : Path
+        + sqlite_path : Path
+        + records : List[MemoryRecord]
+        + metainfo : Dict
+        + tag_catalog : List[str]
+        + b_file_created : bool
+
+        + __init__(...) : None
+        + start_new_history(...) : None
+        + load_history(...) : None
+        + list_histories() : List[Dict]
+        + capture_pair(...) : MemoryRecord
+        + sync_gui_edits(...) : None
+        + save_metainfo() : None
+        + refresh_sqlite_index() : None
+        - _build_metainfo() : Dict
+        + close() : None
+    }
+
+    class MemoryRecord {
+        + record_id : str
+        + parent_id : str
+        + created_at_utc : str
+        + input_text : str
+        + output_text : str
+        + source : str
+        + tag : str
+        + auto_keywords : List[str]
+        + user_keywords : List[str]
+        + active_project_name : str
+        + embedded_files_snapshot : List[str]
+        + input_hash : str
+        + output_hash : str
+
+        + __init__(...) : None
+        + generate_auto_keywords() : List[str]
+        + update_editable_metadata(...) : None
+        + to_ragmem_block() : str
+        + to_index_dict() : Dict
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  PERSISTENCE RESOURCES
+'──────────────────────────────────────────────────────────────
+package "Memory Persistence" {
+
+    class RagMemFile {
+        + path : Path
+        + append_record_block(...) : None
+    }
+
+    class RagMetaJson {
+        + path : Path
+        + rewrite_metainfo(...) : None
+    }
+
+    class MemorySQLite {
+        + path : Path
+        + upsert_file_row(...) : None
+        + upsert_record_rows(...) : None
+        + list_histories(...) : List[Dict]
+        + lookup_file(...) : Dict
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  EXISTING PROJECT CONTEXT
+'──────────────────────────────────────────────────────────────
+package "Existing Project Context" {
+
+    class AppController {
+        + active_project : str
+        + get_embedded_files(...) : Dict
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  RELATIONSHIPS / FLOW
+'──────────────────────────────────────────────────────────────
+
+StreamlitUI --> MemoryActions : button calls
+StreamlitUI --> AppController : reads project context
+
+MemoryActions --> MemoryManager : sync + capture
+
+MemoryManager "1" *-- "0..*" MemoryRecord : owns records
+
+MemoryManager --> RagMemFile : append .ragmem
+MemoryManager --> RagMetaJson : rewrite .ragmeta.json
+MemoryManager --> MemorySQLite : refresh active file_id
+
+MemoryRecord --> MemoryRecord : parent_id
+MemoryManager ..> MemoryRecord : creates
+
+MemoryRecord ..> RagMemFile : to_ragmem_block()
+MemoryRecord ..> MemorySQLite : to_index_dict()
+
+'──────────────────────────────────────────────────────────────
+'  NOTES
+'──────────────────────────────────────────────────────────────
+
+note right of StreamlitUI
+  GUI is view/editor only.
+
+  It provides:
+  - raw prompt text
+  - manual response text
+  - current tag/user-keyword edits
+  - active project name
+  - embedded files snapshot
+
+  It does not own memory truth.
+end note
+
+note right of MemoryActions
+  Reusable capture workflow.
+
+  Used by:
+  - manual memory feed now
+  - later LLM response capture
+  - later tool result capture
+
+  Keeps button callbacks thin.
+end note
+
+note right of MemoryManager
+  Represents one active memory history.
+
+  Owns:
+  - file_id
+  - filenames
+  - records list
+  - MetaInfo
+  - persistence synchronization
+
+  No MemorySession class.
+end note
+
+note bottom of MemoryRecord
+  Atomic memory unit:
+  one accepted input/output pair.
+
+  input_text is raw Prompt,
+  not SuperPrompt.
+end note
+
+note bottom of RagMetaJson
+  .ragmeta.json is rebuilt from
+  MemoryManager.records.
+
+  This keeps GUI tag/user-keyword
+  edits synchronized without
+  per-widget persistence callbacks.
+end note
+
+note bottom of MemorySQLite
+  SQLite refresh is scoped to
+  the active file_id.
+
+  Records are upserted by:
+  file_id + record_id.
+end note
+
+@enduml

@@ -24,3 +24,5 @@ pylate>=1.4.0           # For ColBERT
 # ─────────── Optional helpers ───────
 colorama>=0.4            # nicer console output on Windows
 python-dotenv>=1.0       # `.env` loader for Settings
+
+yake>=0.4.8              # local automatic keyword extraction for MemoryRecord

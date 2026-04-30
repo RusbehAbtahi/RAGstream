@@ -51,6 +51,8 @@ package "RAG Pipeline & Retrieval" {
     class A2_PromptShaper
     class A3_NLIGate
     class A4_Condenser
+    class A4DetProcessing
+    class A4LLMHelper
     class A5_SchemaEnforcer
 
     class PromptBuilder
@@ -76,6 +78,7 @@ package "Agent Stack" {
 '──────────────────────────────────────────────────────────────
 package "SuperPrompt Model" {
     class SuperPrompt
+    class SuperPromptProjector
 }
 
 '──────────────────────────────────────────────────────────────
@@ -141,8 +144,12 @@ A1_DCI              --> FileManifest
 A2_PromptShaper     --> SuperPrompt
 A3_NLIGate          --> SuperPrompt
 A4_Condenser        --> SuperPrompt
+A4_Condenser        --> A4DetProcessing
+A4_Condenser        --> A4LLMHelper
 A5_SchemaEnforcer   --> SuperPrompt
 PromptBuilder       --> SuperPrompt
+
+SuperPrompt         --> SuperPromptProjector
 
 '──────────────────────────────────────────────────────────────
 ' AGENT STACK – FLOWS
@@ -151,9 +158,11 @@ PromptBuilder       --> SuperPrompt
 AgentFactory --> AgentConfig
 AgentFactory --> AgentPrompt
 
-AgentPrompt  --> LLMClient
 AgentPrompt  --> JSONEnvelope
 AgentPrompt  --> AgentPromptValidationError
+
+A4LLMHelper  --> AgentPrompt
+A4LLMHelper  --> LLMClient
 
 LLMClient --> JSONEnvelope
 
@@ -178,6 +187,22 @@ note right of Reranker
   - NLP_Splitter
   - ColBERT rerank
   - fused final ranking
+end note
+
+note right of A4_Condenser
+  A4 is now a live condenser stage:
+  - consumes A3-useful chunks
+  - runs phraser / classifier /
+    final condenser
+  - writes S_CTX_MD into SuperPrompt
+end note
+
+note right of SuperPromptProjector
+  GUI-visible rendering:
+  - System
+  - Configuration
+  - User
+  - Retrieved Context
 end note
 
 @enduml

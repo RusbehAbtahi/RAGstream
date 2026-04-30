@@ -47,6 +47,12 @@ package "Agent Stack" {
             max_output_tokens:int,
             response_format:Dict=None
         ) : str
+        + responses(
+            messages:List[Dict],
+            model_name:str,
+            max_output_tokens:int,
+            reasoning_effort:str=None
+        ) : str
         - client : OpenAI
     }
 }
@@ -59,6 +65,7 @@ package "Agents (context only)" {
     class A2_PromptShaper
     class A3_NLIGate
     class A4_Condenser
+    class A4LLMHelper
     class A5_SchemaEnforcer
     class NLP_Splitter
 }
@@ -83,7 +90,6 @@ package "Config & Utils" {
 AppController --> AgentFactory : get_agent(agent_id, version)
 A2_PromptShaper ..> AgentFactory : get_agent(...)
 A3_NLIGate ..> AgentFactory : get_agent(...)
-A4_Condenser ..> AgentFactory : get_agent(...)
 A5_SchemaEnforcer ..> AgentFactory : get_agent(...)
 NLP_Splitter ..> AgentFactory : get_agent(...)
 
@@ -93,17 +99,20 @@ AgentFactory --> AgentPrompt : from_config(config)
 ' Agents use AgentPrompt to compose + parse
 A2_PromptShaper ..> AgentPrompt : compose() / parse()
 A3_NLIGate ..> AgentPrompt : compose() / parse()
-A4_Condenser ..> AgentPrompt : compose() / parse()
+A4_Condenser ..> AgentPrompt : exact JSON paths
+A4LLMHelper   ..> AgentPrompt : compose() / parse()
 A5_SchemaEnforcer ..> AgentPrompt : compose() / parse()
 NLP_Splitter ..> AgentPrompt : compose() / parse()
 
-' AgentPrompt uses LLMClient
-AgentPrompt --> LLMClient : chat()
+' LLM calls
+A2_PromptShaper ..> LLMClient : chat()
+A3_NLIGate      ..> LLMClient : chat()
+A4LLMHelper     ..> LLMClient : responses()
 
 ' Config wiring
 Settings .> LLMClient : model/api config
 SimpleLogger .> AgentPrompt : log composed messages
-SimpleLogger .> LLMClient : log errors/latency
+SimpleLogger .> LLMClient : log usage/errors
 
 note right of AgentFactory
   Neutral config loader / resolver:
@@ -116,17 +125,19 @@ end note
 note right of AgentPrompt
   Neutral prompt engine:
   - built from JSON config
-  - current runtime modes: selector / classifier
+  - current runtime modes:
+    selector / classifier / synthesizer
   - compose() builds SYSTEM + USER + response_format
   - parse() validates structured JSON output
-  - no A2/A3-specific business rules inside
+  - no A2/A3/A4-specific business rules inside
 end note
 
 note right of LLMClient
   Thin LLM wrapper:
-  - knows messages / model_name /
-    temperature / max_output_tokens /
-    response_format
+  - chat() for current A2/A3 path
+  - responses() for A4 reasoning-style calls
+  - logs model, input, cached input,
+    output, and reasoning usage when available
   - no knowledge of controller,
     retrieval, or agent semantics
 end note
@@ -142,11 +153,19 @@ note bottom of A3_NLIGate
 end note
 
 note bottom of A4_Condenser
-  Immediate next implementation target:
-  - consume final_selection_ids
-  - generate S_CTX_MD
-  - enforce context-budgeted
-    condensed working set
+  Current live role:
+  - loads 3 exact A4 JSON configs
+  - runs chunk phraser / classifier /
+    final condenser
+  - consumes A3-useful chunks
+  - writes S_CTX_MD and final_selection_ids
+end note
+
+note bottom of A4LLMHelper
+  Shared A4 call helper:
+  - builds the 3 A4 LLM calls
+  - uses one stable prompt_cache_key
+  - calls LLMClient.responses()
 end note
 
 note bottom of A5_SchemaEnforcer

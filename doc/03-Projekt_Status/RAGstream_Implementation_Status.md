@@ -1,6 +1,6 @@
 # RAGstream_Implementation_Status.md
 
-Last update: 21.04.2026
+Last update: 24.04.2026
 
 Purpose:
 - This file is a compact implementation status snapshot.
@@ -13,31 +13,34 @@ Purpose:
 
 ## 1. High-level picture
 
-RAGstream already has a stable foundation in five major layers:
+RAGstream already has a stable foundation in six major layers:
 
 1. foundational prompt processing and GUI/controller structure,
-2. JSON-based agent architecture with working A2 and A3 stages,
+2. JSON-based agent architecture with working A2, A3, and A4 stages,
 3. project-based document ingestion with manifest-based file tracking,
 4. hybrid document retrieval with dense first-pass selection + SPLADE scoring on the same candidate IDs + weighted RRF,
-5. a working AWS Phase-1 deployment with persistent runtime data outside the image.
+5. GUI-visible SuperPrompt rendering through `SuperPromptProjector`,
+6. a working AWS Phase-1 deployment with persistent runtime data outside the image.
 
-The pipeline now reaches from prompt input and A2 shaping to project-aware hybrid chunk selection from the active document database, and it also includes a deterministic ReRanker stage plus a real A3 stage.
+The pipeline now reaches from prompt input and A2 shaping to project-aware hybrid chunk selection from the active document database, and it also includes a deterministic ReRanker stage, a real A3 stage, and a live A4 Condenser that writes `S_CTX_MD`.
 
 Current practical truth:
 - Retrieval is implemented and working.
 - Retrieval is no longer dense-only; it now includes a real SPLADE scoring branch and weighted RRF fusion.
 - ReRanker is implemented and working in code.
 - A3 is implemented and working in code as a real usefulness-classification stage over reranked candidates.
+- [24.04.2026] A4 Condenser is implemented and working in code as a real three-call evidence-condensation stage after A3.
+- [24.04.2026] `SuperPromptProjector` now renders the GUI-visible prompt with clear separation between System, Configuration, User, Retrieved Context Summary, and Raw Retrieved Evidence.
 - However, the current BERT-style reranker direction is not accepted as the long-term solution, because in practical tests it often worsened ranking quality instead of improving it.
 
 The currently agreed next implementation direction is:
 - keep the existing Retrieval / ReRanker stage structure,
 - keep the new hybrid Retrieval backbone,
 - keep A3 as the current semantic usefulness gate,
-- implement A4 Condenser next,
-- implement Prompt Builder immediately after A4,
+- keep A4 as the current live condenser stage,
+- implement Prompt Builder next,
 - postpone A5 to a later phase because its action may still change before implementation,
-- keep ColBERT as the agreed immediate next reranking direction.
+- keep ColBERT as the agreed later reranking improvement direction.
 
 ---
 
@@ -69,19 +72,23 @@ The currently agreed next implementation direction is:
   - `AgentFactory` exists.
   - JSON agent loading and transparent config-level caching exist.
   - `LLMClient` exists.
+  - [24.04.2026] `LLMClient.responses(...)` exists for A4 / reasoning-style calls, in addition to the existing `chat(...)` path.
   - `AgentPrompt` architecture exists.
 - A2 PromptShaper is implemented and already wired.
   - It reads the current `SuperPrompt`.
   - It uses a JSON-configured agent prompt.
   - It calls the LLM.
   - It writes selected values back into `SuperPrompt`.
+  - [24.04.2026] It now applies deterministic selector sanitization after parsing and before write-back; invalid, cross-field, invented, malformed, and duplicate ids are removed.
+  - [24.04.2026] If a field becomes empty after sanitization, A2 preserves the existing preprocessing value instead of applying catalog defaults.
   - It updates stage/history.
 - A3 NLI Gate is implemented and already wired.
   - It reads the reranked candidate set from the current `SuperPrompt`.
   - It uses the JSON-configured neutral Agent Stack.
   - It performs usefulness-only classification.
   - It writes `views_by_stage["a3"]`, `extras["a3_selection_band"]`, `extras["a3_item_decisions"]`, and `final_selection_ids`.
-- [21.04.2026] Current immediate next implementation targets in the Agent Stack pipeline are A4 Condenser and Prompt Builder. A5 is intentionally postponed for a later phase because its final action is still open to revision.
+- [24.04.2026] A4 Condenser is now implemented and wired as the next live LLM-based stage after A3.
+- [24.04.2026] The current immediate next implementation target is Prompt Builder. A5 is intentionally postponed for a later phase because its final action is still open to revision.
 
 ### 2.4 SuperPrompt as shared state
 
@@ -95,6 +102,12 @@ The currently agreed next implementation direction is:
   - rendered prompt fields.
 - In the current implementation direction, `SuperPrompt` is the evolving shared state object across the pipeline rather than a one-off prompt string.
 - A general `compose_prompt_ready()` path is part of the recent implementation direction so that later stages can reuse one central render logic instead of keeping rendering scattered across multiple modules.
+- [24.04.2026] `SuperPromptProjector` now renders the GUI-visible SuperPrompt into explicit sections:
+  - `## System`
+  - `## Configuration`
+  - `## User`
+  - `## Retrieved Context`
+- [24.04.2026] A4 condensed context is displayed under `## Retrieved Context / ### Retrieved Context Summary`; raw chunks are displayed under `### Raw Retrieved Evidence` for development/audit visibility.
 
 ### 2.5 Project-based ingestion
 
@@ -191,7 +204,7 @@ The currently agreed next implementation direction is:
   - local chunk ids `1..N` are used in the prompt and mapped back internally,
   - chunk-internal heading markers are sanitized to avoid prompt-structure conflicts,
   - duplicate marking has been intentionally removed.
-- A3 already performs meaningful semantic filtering and is considered good enough to keep as the current stage truth while the next work moves to A4 and Prompt Builder.
+- A3 already performs meaningful semantic filtering and is considered good enough to keep as the current stage truth while the next work moves to Prompt Builder.
 
 ### 2.11 Why the current ReRanker direction is not accepted as final
 
@@ -202,7 +215,49 @@ The currently agreed next implementation direction is:
   - and the final ranking became less trustworthy than dense Retrieval alone.
 - Therefore the current BERT-style reranking direction is considered unsatisfactory as the future production direction.
 
-### 2.12 AWS Phase-1 deployment
+### 2.12 A4 Condenser is implemented
+
+- [24.04.2026] A4 Condenser is implemented as a live stage after A3.
+- [24.04.2026] The implementation files are:
+  - `ragstream/agents/a4_condenser.py`
+  - `ragstream/agents/a4_det_processing.py`
+  - `ragstream/agents/a4_llm_helper.py`
+- [24.04.2026] A4 uses three exact JSON configurations:
+  - `data/agents/a4_condenser/chunk_phraser/a4_1_001.json`
+  - `data/agents/a4_condenser/chunk_classifier/a4_2_001.json`
+  - `data/agents/a4_condenser/final_condenser/a4_3_001.json`
+- [24.04.2026] The implemented workflow is:
+  - prepare selected A3-useful chunks,
+  - run Chunk Phraser,
+  - prepare active class definitions,
+  - run Chunk Classifier,
+  - build grouped chunk package,
+  - run Final Condenser,
+  - finalize A4 output into SuperPrompt.
+- [24.04.2026] A4 writes:
+  - `S_CTX_MD`,
+  - `views_by_stage["a4"]`,
+  - `final_selection_ids`,
+  - A4 diagnostic fields in `sp.extras`,
+  - `stage = "a4"` and stage history.
+- [24.04.2026] A4 uses `LLMClient.responses(...)` and stable `prompt_cache_key="a4_condenser_shared_prefix"` through `A4LLMHelper`.
+- [24.04.2026] The final condenser prompt was corrected so A4 produces neutral internal context, not a polished final answer to the user.
+- [24.04.2026] If classifier output is empty or unusable, A4 continues through fallback grouping instead of crashing; the warning belongs in logs/status, not inside the final SuperPrompt.
+
+### 2.13 GUI-visible SuperPrompt rendering hardening
+
+- [24.04.2026] `SuperPromptProjector.compose_prompt_ready()` now renders the GUI-visible SuperPrompt with stable top-level separation:
+  - `## System`
+  - `## Configuration`
+  - `## User`
+  - `## Retrieved Context`
+- [24.04.2026] The real user task appears only under `## User / ### Task`.
+- [24.04.2026] A4 `S_CTX_MD` appears under `## Retrieved Context / ### Retrieved Context Summary` with a neutral guard sentence explaining that it is supporting context, not part of the task.
+- [24.04.2026] Raw retrieved chunks appear under `## Retrieved Context / ### Raw Retrieved Evidence`.
+- [24.04.2026] Raw source Markdown headings inside retrieved chunks are neutralized to markers such as `[H1]`, `[H2]`, and `[H3]`.
+- [24.04.2026] This hardening prevents retrieved or condensed context from visually merging with the user task.
+
+### 2.14 AWS Phase-1 deployment
 
 - AWS Phase-1 deployment is implemented and working.
 - The current live deployment already provides:
@@ -220,24 +275,20 @@ The currently agreed next implementation direction is:
 
 ## 3. What is intentionally not complete yet
 
-### 3.1 A4 Condenser
-
-- A4 exists as a project module (`ragstream/agents/a4_condenser.py`) and as a pipeline contract, but it is not yet a live, completed operational stage in the current GUI/controller path.
-- [21.04.2026] A4 is now the next immediate implementation target.
-
-### 3.2 Prompt Builder
+### 3.1 Prompt Builder
 
 - `prompt_builder.py` exists as a project module and the deterministic final-assembly concept is defined in the requirements.
 - It is not yet the completed final operational stage in the current Generation-1 GUI flow.
-- [21.04.2026] Prompt Builder is the immediate follow-up target after A4.
+- [24.04.2026] Prompt Builder is now the immediate next target after the successful A4 implementation.
+- [24.04.2026] Prompt Builder should reuse or align with the current `SuperPromptProjector` structure so GUI preview and final-send prompt assembly do not diverge.
 
-### 3.3 A5 Format Enforcer
+### 3.2 A5 Format Enforcer
 
 - A5 exists in the long-range 8-stage contract, but it is not a live completed operational stage.
 - [21.04.2026] A5 is intentionally postponed to a later phase.
 - [21.04.2026] Its future action may be revised before implementation, so the current requirement contract should be treated as provisional rather than implementation-locked.
 
-### 3.4 History ingestion and tagging
+### 3.3 History ingestion and tagging
 
 - Conversation history ingestion remains future / partial.
 - Append-only memory direction exists conceptually, but it is not yet the current working production path for the pipeline.
@@ -249,23 +300,23 @@ The currently agreed next implementation direction is:
 
 ### 4.1 Immediate next work order
 
-[21.04.2026] The agreed immediate work order is:
+[24.04.2026] The agreed immediate work order is:
 
-1. keep current Retrieval / ReRanker / A3 truth stable,
-2. implement A4 Condenser,
-3. implement Prompt Builder,
-4. postpone A5,
-5. revisit ReRanker improvement with ColBERT after the pipeline is stable through A4 and Prompt Builder.
+1. keep current Retrieval / ReRanker / A3 / A4 truth stable,
+2. implement Prompt Builder,
+3. postpone A5,
+4. revisit ReRanker improvement with ColBERT after the pipeline is stable through A4 and Prompt Builder.
 
 ### 4.2 Why this order is now preferred
 
 - Retrieval is already strong enough to continue development.
 - ReRanker is live enough to keep the stage contract while its long-term replacement is still open.
 - A3 is already good enough to be treated as a real stage.
-- The biggest missing operational gap in the end-to-end pipeline is now downstream of A3:
-  - condensed context generation,
-  - final deterministic prompt assembly.
-- Therefore the highest leverage is no longer more A3 redesign, but implementation of A4 and Prompt Builder.
+- [24.04.2026] A4 is now implemented and good enough to be treated as the current condenser stage.
+- The biggest missing operational gap in the end-to-end pipeline is now downstream of A4:
+  - final deterministic prompt assembly,
+  - production decision on raw evidence vs. debug/audit evidence visibility.
+- Therefore the highest leverage is now Prompt Builder, not more A3/A4 redesign.
 
 ---
 
@@ -280,6 +331,8 @@ It already has:
 - working hybrid Retrieval,
 - working deterministic ReRanker,
 - working A3 usefulness filtering,
+- [24.04.2026] working A4 evidence condensation into `S_CTX_MD`,
+- [24.04.2026] hardened GUI-visible SuperPrompt rendering,
 - and working AWS Phase-1 deployment.
 
-[21.04.2026] The immediate next milestone is to complete the pipeline after A3 by implementing A4 Condenser and Prompt Builder. A5 is postponed and may be redefined before it is built.
+[24.04.2026] The immediate next milestone is now Prompt Builder. A4 Condenser is implemented and live; A5 is postponed and may be redefined before it is built.

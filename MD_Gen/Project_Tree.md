@@ -30,8 +30,7 @@
 │   │   ├── controller_legacy.py
 │   │   ├── ui_actions.py
 │   │   ├── ui_layout.py
-│   │   ├── ui_streamlit.py
-│   │   └── ui_streamlit_demo.py
+│   │   └── ui_streamlit.py
 │   ├── config
 │   │   ├── __init__.py
 │   │   ├── prompt_schema.json
@@ -51,7 +50,10 @@
 │   │   └── vector_store_splade.py
 │   ├── memory
 │   │   ├── __init__.py
-│   │   └── conversation_memory.py
+│   │   ├── __pycache__
+│   │   ├── memory_actions.py
+│   │   ├── memory_manager.py
+│   │   └── memory_record.py
 │   ├── orchestration
 │   │   ├── __init__.py
 │   │   ├── __pycache__
@@ -86,6 +88,15 @@
 │   │   ├── retriever_splade.py
 │   │   ├── rrf_merger.py
 │   │   └── smart_query_splitter.py
+│   ├── textforge
+│   │   ├── CliSink.py
+│   │   ├── FileSink.py
+│   │   ├── GUISink.py
+│   │   ├── RagLog.py
+│   │   ├── TextForge.py
+│   │   ├── TextSink.py
+│   │   ├── __init__.py
+│   │   └── __pycache__
 │   └── utils
 │       ├── __init__.py
 │       ├── __pycache__
@@ -131,6 +142,17 @@
     ├── doc_raw
     │   ├── TEST1
     │   └── TEST2
+    ├── logs
+    │   ├── archive
+    │   ├── backups
+    │   ├── public_run
+    │   └── sqlite
+    ├── memory
+    │   ├── files
+    │   │   ├── 2026-04-28-17-54-Music_TEST_RAG.ragmeta.json
+    │   │   ├── 2026-04-28-17-55-Music2.ragmeta.json
+    │   │   ├── 2026-04-28-18-12-MUSIC3.ragmeta.json
+    │   │   └── 2026-04-28-18-34-Another-Test.ragmeta.json
     ├── np_store
     │   └── project1
     ├── project1

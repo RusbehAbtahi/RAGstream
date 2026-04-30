@@ -1,6 +1,6 @@
 # Requirements_RAG_Pipeline.md
 
-Last update: 21.04.2026
+Last update: 24.04.2026
 
 Note for future maintenance:
 - When new implementation-aligned decisions or stage changes are added here, they should be date-stamped inline so the chronology stays visible.
@@ -58,7 +58,7 @@ Button sequence (manual mode), which is also the execution order in auto mode:
 | 3    | Retrieval          | `retrieval`    | Function       | No LLM                                | –                                    | Hybrid first-pass retrieval: dense branch selects the candidate IDs, SPLADE scores exactly those same candidate IDs, then weighted RRF populates `base_context_chunks` and `views_by_stage["retrieval"]`. |
 | 4    | ReRanker           | `reranked`     | Function       | No LLM in the current code path       | –                                    | Current bounded cross-encoder reranking of top Retrieval candidates; agreed immediate next direction is ColBERT.                                        |
 | 5    | A3_NLI_Gate        | `a3`           | Agent          | Hybrid                                | Multi-Chooser                        | LLM-based usefulness classification over the reranked candidates, write `views_by_stage["a3"]`, and update `final_selection_ids` with useful-first plus borderline fallback.            |
-| 6    | A4_Condenser       | `a4`           | Agent          | LLM-only                              | Writer                               | Condense selected chunks into `S_CTX_MD`, enforce token budget, finalize `final_selection_ids`.                                                         |
+| 6    | A4_Condenser       | `a4`           | Agent          | LLM-only                              | Writer / Synthesizer                 | Run the implemented three-call condenser over A3-useful chunks and write the resulting `S_CTX_MD`, `views_by_stage["a4"]`, and final retained ids.       |
 | 7    | A5_Format_Enforcer | `a5`           | Agent          | LLM-only                              | Writer/Extractor                     | Normalize instructions and output format rules in `sp.body`/`extras` so final answer obeys structure.                                                   |
 | 8    | Prompt_Builder     | (stays `a5`)   | Function       | No LLM                                | –                                    | Render `System_MD`, `Prompt_MD`, `S_CTX_MD`, `Attachments_MD`, final `prompt_ready` from `SuperPrompt`.                                                 |
 
@@ -73,6 +73,7 @@ All stages use the same `SuperPrompt` invariants:
 3. `final_selection_ids` always contains the current chosen `chunk_id`s for building `S_CTX_MD` and `Attachments_MD`. After A4 it reflects the token-budgeted subset that feeds the final LLM.
 4. `Chunk` objects are **immutable** after creation. Scores and keep/drop status live in `views_by_stage` (and optionally in other stage-local metadata), not inside `Chunk`.
 5. `System_MD`, `Prompt_MD`, `S_CTX_MD`, `Attachments_MD` remain the final rendered blocks for send-time use. `prompt_ready` may also be regenerated earlier for GUI preview purposes, either by stage-local helpers (A0/A2 current implementation) or by `SuperPrompt.compose_prompt_ready()` in later stages.
+6. [24.04.2026] `S_CTX_MD` is condensed retrieved context. It is supporting context for the task, not user task text and not the final answer. GUI-visible rendering must keep it under a retrieved-context block rather than directly below the task.
 
 ---
 
@@ -191,8 +192,10 @@ Behaviour
    * Build input payload from `sp.body["task"]`, `sp.body["context"]`, `sp.body["purpose"]`, and possibly the raw prompt text.
    * Through AgentFactory → AgentPrompt → llm_client, call the A2 model to get a JSON object:
      `{ "system": ..., "audience": ..., "tone": ..., "depth": ..., "confidence": ... }`.
-   * Enforce enums: if LLM output is outside the allowed sets, clamp to defaults.
-2. Update `sp.body` fields (`system`, `audience`, `tone`, `depth`, `confidence`) and write logs into `sp.extras["a2_decisions"]`.
+   * [24.04.2026] After `AgentPrompt.parse(...)`, run a deterministic selector sanitizer before writing anything back into `SuperPrompt`.
+   * [24.04.2026] The sanitizer removes invalid ids, cross-field ids, invented ids, malformed ids, and duplicate ids, while preserving the original selection order and enforcing each field's `max_selected` rule.
+   * [24.04.2026] If a field becomes empty after sanitization, A2 must not apply catalog defaults as semantic repair. It must preserve the existing preprocessing value by not overwriting that field.
+2. Update `sp.body` fields (`system`, `audience`, `tone`, `depth`, `confidence`) only for fields that still have valid sanitized output, and write selected ids into `sp.extras["a2_selected_ids"]`.
 3. Bookkeeping:
 
    * `sp.stage = "a2"`
@@ -373,45 +376,81 @@ A3 must **never** mutate `Chunk` contents; it only changes usefulness labels, st
 
 Purpose
 
-* Condense the selected context into a high-authority `S_CTX_MD` and enforce a hard context/token budget by trimming `final_selection_ids`.
+* Condense the selected context into a high-authority `S_CTX_MD` and enforce a context/output budget while preserving traceability back to the selected evidence.
+* [24.04.2026] A4 output is internal retrieved context for downstream prompt assembly. It must not be written as a final answer to the user and must not be rendered as part of the user task.
 
 Nature
 
 * Kind: Agent.
-* Type: LLM-only, Writer.
+* Type: LLM-only, Writer / Synthesizer.
+* [24.04.2026] Current implementation: three LLM calls plus deterministic pre/post-processing.
 
 Inputs
 
 * `sp: SuperPrompt` with `stage="a3"`.
-* Candidate ids: `sp.final_selection_ids` (initially from A3).
+* Candidate evidence: A3-useful chunks from `sp.views_by_stage["a3"]`, mapped back to hydrated chunks in `sp.base_context_chunks`.
+* Runtime limit: optional `effective_output_token_limit`, otherwise the A4 default output allowance.
+
+Implemented A4 structure
+
+1. [24.04.2026] A4 uses three exact JSON configurations under `data/agents/a4_condenser/`:
+
+   * `chunk_phraser/a4_1_001.json`
+   * `chunk_classifier/a4_2_001.json`
+   * `final_condenser/a4_3_001.json`
+
+2. [24.04.2026] `A4Condenser` loads these exact JSON paths directly and creates the three `AgentPrompt` objects at the beginning of the run.
+3. [24.04.2026] Deterministic A4 preparation and write-back logic lives in `ragstream/agents/a4_det_processing.py`.
+4. [24.04.2026] Shared A4 LLM-call mechanics live in `ragstream/agents/a4_llm_helper.py`.
 
 Behaviour
 
-1. Build an AgentPrompt for A4:
+1. Deterministic preparation:
 
-   * Input payload contains:
+   * Read A3 output.
+   * Keep only chunks whose A3 usefulness label is `useful`.
+   * Preserve the A3/reranked order.
+   * Assign local A4 chunk ids `1..N` while preserving mappings from local ids back to real chunk ids.
+   * Build the shared repeated evidence/query prefix for the A4 prompt family.
 
-     * `Prompt_MD` (user ask),
-     * a list of selected chunks (id, snippet, minimal provenance),
-     * instructions: summarize **facts**, **constraints**, and **open issues** relevant to the ask; do not invent new facts.
-   * Output contract:
+2. LLM call 1 — Chunk Phraser:
 
-     * `s_ctx_md` (markdown string),
-     * optionally per-id relevance scores or ranks.
-2. Call LLM; receive `S_CTX_MD` and any auxiliary scores.
-3. Apply token/size budgeting:
+   * Read the selected chunks and the user prompt under evaluation.
+   * Propose 1–4 active thematic class definitions with contiguous ids such as `ID1`, `ID2`, etc.
 
-   * If the set of chunks is too large, down-select to at most `N3_FINAL_SELECTION_MAX` ids, keeping those with highest relevance scores or best coverage.
-4. Write:
+3. Deterministic active-class preparation:
+
+   * Validate returned class definitions.
+   * Keep only valid active classes.
+   * Restrict the classifier's visible class options to the active class phrases for this A4 run.
+
+4. LLM call 2 — Chunk Classifier:
+
+   * Assign each selected local chunk to exactly one active class phrase.
+
+5. Deterministic grouping and budget preparation:
+
+   * Map classifier decisions back from class phrases to internal class ids.
+   * Group chunks by active class.
+   * Build the class-group package for the final condenser.
+   * If classifier output is empty or unusable, continue in fallback mode by passing all selected chunks in their original order, together with the class overview.
+
+6. LLM call 3 — Final Condenser:
+
+   * Produce one neutral internal markdown context block as `s_ctx_md`.
+   * Stay close to the evidence.
+   * Do not address the user directly.
+   * Do not add motivational framing, decorative introductions, or final-answer wording.
+
+7. Final write-back:
 
    * `sp.S_CTX_MD = <condensed markdown>`.
-   * `sp.final_selection_ids = [subset_of_ids]`.
+   * `sp.final_selection_ids = [ordered retained real ids]`.
    * `sp.views_by_stage["a4"] = [(chunk_id, 1.0, SELECTED), ...]` for the final retained subset.
-5. Update:
-
+   * `sp.extras["a4_selected_local_to_real"]`, `sp.extras["a4_class_definitions"]`, and related A4 diagnostic fields may be populated for traceability.
    * `sp.stage = "a4"`; append history.
 
-A4 is the stage where **S_CTX becomes the authoritative context block** for the final LLM call, based only on the final selection ids (not the entire retrieved set).
+A4 is the stage where **S_CTX becomes the authoritative condensed context block** for the final LLM call, based on the A3-selected useful evidence. In the current Generation-1 GUI, raw chunks may still remain visible for inspection, but production prompt assembly should later be able to prefer `S_CTX_MD` as the normal context payload and treat raw evidence as debug/audit material.
 
 ### 5.7 A5_Format_Enforcer
 
@@ -485,7 +524,8 @@ Behaviour
    4. `Attachments_MD`
    5. (optional) `Recent Conversation` block
 7. Current implementation note: `SuperPrompt.compose_prompt_ready()` may also be used earlier for intermediate GUI previews. Prompt_Builder remains the authoritative final assembly step for send-time use.
-8. `sp.stage` stays `"a5"`; Prompt_Builder **does not** change the lifecycle stage, it only prepares the final view/send-time representation.
+8. [24.04.2026] Prompt_Builder must align with the current `SuperPromptProjector` separation of System, Configuration, User, Retrieved Context Summary, and Raw Retrieved Evidence. It must treat `S_CTX_MD` as supporting retrieved context, not as user task text.
+9. `sp.stage` stays `"a5"`; Prompt_Builder **does not** change the lifecycle stage, it only prepares the final view/send-time representation.
 
 ---
 
@@ -533,4 +573,5 @@ The RAG pipeline is considered correctly implemented when:
    * a normalized Prompt block,
    * a condensed S_CTX block,
    * clearly fenced attachments for manual inspection.
-6. [14.04.2026] For the current Retrieval design, every chunk that survives into the Retrieval-stage final display is expected to carry both dense and SPLADE score metadata, because SPLADE scores the same dense-selected candidate IDs rather than an unrelated independent top-k set.
+6. [24.04.2026] The GUI-visible `prompt_ready` must clearly separate `## System`, `## Configuration`, `## User`, and `## Retrieved Context`. The real user task must appear only under `## User / ### Task`, while A4 condensed context must appear under `## Retrieved Context / ### Retrieved Context Summary`.
+7. [14.04.2026] For the current Retrieval design, every chunk that survives into the Retrieval-stage final display is expected to carry both dense and SPLADE score metadata, because SPLADE scores the same dense-selected candidate IDs rather than an unrelated independent top-k set.

@@ -46,6 +46,8 @@ package "Controller / UI (external)" {
     class AppController {
         + run_retrieval(...) : SuperPrompt
         + run_reranker(...) : SuperPrompt
+        + run_a3(...) : SuperPrompt
+        + run_a4(...) : SuperPrompt
     }
 
     StreamlitUI --> AppController
@@ -109,6 +111,14 @@ package "Retrieval Stage" {
 '──────────────────────────────────────────────────────────────
 package "SuperPrompt & Orchestration" {
 
+    class A3_NLIGate {
+        + run(...) : SuperPrompt
+    }
+
+    class A4_Condenser {
+        + run(...) : SuperPrompt
+    }
+
     class SuperPrompt {
         + stage : Stage
         + history_of_stages : List[str]
@@ -140,6 +150,8 @@ package "SuperPrompt & Orchestration" {
 
 AppController --> Retriever
 AppController --> Reranker
+AppController --> A3_NLIGate
+AppController --> A4_Condenser
 AppController --> SuperPrompt
 
 Retriever --> Embedder
@@ -161,7 +173,11 @@ Reranker --> RRFMerger
 Reranker --> SuperPrompt
 Reranker .> Chunk
 
+A3_NLIGate --> SuperPrompt
+A4_Condenser --> SuperPrompt
+
 PromptBuilder --> SuperPrompt
+SuperPrompt --> SuperPromptProjector
 SuperPrompt --> Chunk
 SuperPrompt ..> A3ChunkStatus
 
@@ -186,12 +202,32 @@ note right of Reranker
   - writes fused reranked order
 end note
 
+note right of A4_Condenser
+  A4 design:
+  - consumes useful chunks from A3
+  - condenses selected evidence
+  - writes S_CTX_MD
+end note
+
 note bottom of SuperPrompt
   views_by_stage["retrieval"] =
   fused Retrieval ranking
 
   views_by_stage["reranked"] =
   fused Retrieval + ColBERT ranking
+
+  views_by_stage["a3"] =
+  useful / borderline / discarded
+
+  S_CTX_MD =
+  A4 condensed retrieved context
+end note
+
+note bottom of SuperPromptProjector
+  GUI-visible prompt rendering separates:
+  System / Configuration / User /
+  Retrieved Context Summary /
+  Raw Retrieved Evidence
 end note
 
 @enduml

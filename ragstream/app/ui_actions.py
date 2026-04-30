@@ -8,11 +8,26 @@ Keep controller calls and session-state mutations here.
 from __future__ import annotations
 
 import copy
+import time
+
+from typing import Any
 
 import streamlit as st
 
 from ragstream.app.controller import AppController
+from ragstream.memory.memory_actions import capture_memory_pair
+from ragstream.memory.memory_manager import MemoryManager
 from ragstream.orchestration.super_prompt import SuperPrompt
+
+
+def _log_runtime(
+    text: str,
+    type: str = "INFO",
+    sensitivity: str = "PUBLIC",
+) -> None:
+    logger = st.session_state.get("raglog")
+    if logger is not None:
+        logger(text, type, sensitivity)
 
 
 def do_preprocess() -> None:
@@ -42,21 +57,164 @@ def do_a2_promptshaper() -> None:
     sp: SuperPrompt = st.session_state.sp
 
     sp = ctrl.run_a2_promptshaper(sp)
-    entry = ctrl.build_a2_memory_demo_entry(sp)
-
-    next_id = st.session_state.get("a2_memory_demo_counter", 0) + 1
-    st.session_state["a2_memory_demo_counter"] = next_id
-    entry["id"] = next_id
-
-    st.session_state[f"a2_memory_tag_{next_id}"] = "Green"
-    st.session_state["a2_memory_demo_entries"].append(entry)
 
     st.session_state.sp = sp
     st.session_state.sp_a2 = copy.deepcopy(sp)
     st.session_state["super_prompt_text"] = sp.prompt_ready
-    st.session_state["pending_a2_memory_refresh"] = True
 
-    #st.rerun()
+
+def do_feed_memory_manually() -> None:
+    """Manual memory feed button callback."""
+    prompt_text = st.session_state.get("prompt_text", "")
+    output_text = st.session_state.get("manual_memory_feed_text", "")
+
+    if not (prompt_text or "").strip():
+        _log_runtime("Prompt is empty. No memory record was created.", "WARN", "PUBLIC")
+        return
+
+    if not (output_text or "").strip():
+        _log_runtime("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
+        return
+
+    memory_manager: MemoryManager = st.session_state.memory_manager
+
+    if not memory_manager.title.strip():
+        st.session_state["pending_manual_memory_pair"] = {
+            "input_text": prompt_text,
+            "output_text": output_text,
+        }
+        st.session_state["memory_title_required"] = True
+        _log_runtime("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
+        st.session_state["runtime_log_flash_until"] = time.time() + 5
+        st.rerun()
+
+    _save_memory_pair(
+        input_text=prompt_text,
+        output_text=output_text,
+    )
+
+
+def do_confirm_memory_title_and_save() -> None:
+    """Confirm first memory title and save pending manual memory pair."""
+    title = (st.session_state.get("memory_title_input", "") or "").strip()
+    if not title:
+        _log_runtime("Memory title must not be empty.", "WARN", "PUBLIC")
+        return
+
+    memory_manager: MemoryManager = st.session_state.memory_manager
+
+    if not memory_manager.title.strip():
+        memory_manager.start_new_history(title)
+        _log_runtime(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
+
+    pending_pair = st.session_state.get("pending_manual_memory_pair")
+    if pending_pair:
+        input_text = pending_pair.get("input_text", "")
+        output_text = pending_pair.get("output_text", "")
+    else:
+        input_text = st.session_state.get("prompt_text", "")
+        output_text = st.session_state.get("manual_memory_feed_text", "")
+
+    _save_memory_pair(
+        input_text=input_text,
+        output_text=output_text,
+    )
+
+
+def _save_memory_pair(
+    input_text: str,
+    output_text: str,
+) -> None:
+    try:
+        ctrl: AppController = st.session_state.controller
+        memory_manager: MemoryManager = st.session_state.memory_manager
+
+        active_project_name, embedded_files_snapshot = _get_active_project_snapshot(ctrl)
+        gui_records_state = _collect_memory_gui_state(memory_manager)
+
+        result = capture_memory_pair(
+            memory_manager=memory_manager,
+            input_text=input_text,
+            output_text=output_text,
+            source="manual_memory_feed",
+            active_project_name=active_project_name,
+            embedded_files_snapshot=embedded_files_snapshot,
+            gui_records_state=gui_records_state,
+        )
+
+        if result.get("success"):
+            _log_runtime(result.get("message", "Memory record saved."), "INFO", "PUBLIC")
+            st.session_state["pending_manual_memory_pair"] = None
+            st.session_state["memory_title_required"] = False
+            st.session_state["manual_memory_feed_text"] = ""
+            st.rerun()
+        else:
+            _log_runtime(result.get("message", "Memory record was not saved."), "WARN", "PUBLIC")
+
+    except Exception as e:
+        _log_runtime(str(e), "ERROR", "PUBLIC")
+
+
+def _get_active_project_snapshot(ctrl: AppController) -> tuple[str | None, list[str]]:
+    active_project = st.session_state.get("active_project")
+
+    if not active_project or active_project == "(no projects yet)":
+        return None, []
+
+    try:
+        embedded_info = ctrl.get_embedded_files(active_project)
+    except Exception:
+        return active_project, []
+
+    if embedded_info.get("success"):
+        return active_project, list(embedded_info.get("files", []))
+
+    return active_project, []
+
+
+def _collect_memory_gui_state(memory_manager: MemoryManager) -> list[dict[str, Any]]:
+    gui_state: list[dict[str, Any]] = []
+
+    for record in memory_manager.records:
+        tag_key = f"memory_tag_{record.record_id}"
+        keywords_key = f"memory_user_keywords_{record.record_id}"
+
+        tag = st.session_state.get(tag_key, record.tag)
+        user_keywords_text = st.session_state.get(
+            keywords_key,
+            ", ".join(record.user_keywords),
+        )
+
+        gui_state.append(
+            {
+                "record_id": record.record_id,
+                "tag": tag,
+                "user_keywords": _parse_user_keywords(user_keywords_text),
+            }
+        )
+
+    return gui_state
+
+
+def _parse_user_keywords(text: str) -> list[str]:
+    raw_items = str(text or "").replace("\n", ",").split(",")
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for item in raw_items:
+        keyword = item.strip()
+        if not keyword:
+            continue
+
+        key = keyword.lower()
+        if key in seen:
+            continue
+
+        result.append(keyword)
+        seen.add(key)
+
+    return result
 
 
 def do_retrieval() -> None:

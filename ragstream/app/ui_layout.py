@@ -8,6 +8,7 @@ Keep columns, containers, labels and visual order here.
 from __future__ import annotations
 
 import html
+import time
 
 import streamlit as st
 
@@ -17,11 +18,22 @@ from ragstream.app.ui_actions import (
     do_a3_nli_gate,
     do_a4_condenser,
     do_add_files,
+    do_confirm_memory_title_and_save,
     do_create_project,
+    do_feed_memory_manually,
     do_preprocess,
     do_reranker,
     do_retrieval,
 )
+
+
+TAG_COLORS: dict[str, str] = {
+    "Gold": "#D4AF37",
+    "Silver": "#C0C7D2",
+    "Red": "#E0115F",
+    "Green": "#00A86B",
+    "Black": "#111111",
+}
 
 
 def inject_base_css() -> None:
@@ -90,6 +102,78 @@ def inject_base_css() -> None:
                 font-family: inherit;
             }
 
+            .memory-tag-indicator {
+                display: flex;
+                align-items: center;
+                gap: 0.35rem;
+                margin-bottom: 0.25rem;
+                min-height: 24px;
+            }
+
+            .memory-tag-square {
+                width: 18px;
+                height: 18px;
+                border-radius: 0.25rem;
+                border: 1px solid rgba(0, 0, 0, 0.25);
+                box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+                flex: 0 0 auto;
+            }
+
+            .memory-tag-name {
+                font-size: 0.78rem;
+                color: #374151;
+                line-height: 1.0;
+                white-space: nowrap;
+            }
+
+
+
+            /* Manual memory feed button */
+            div[data-testid="stButton"] > button[kind="primary"] {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+            }
+
+            div[data-testid="stButton"] > button[kind="primary"]:hover {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+            }
+
+            div[data-testid="stButton"] > button[kind="primary"]:focus {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+            }
+
+            div[data-testid="stButton"] > button[kind="primary"] p {
+                color: white !important;
+            }
+
+            /* Manual memory feed edit box */
+            textarea[aria-label="Manual Memory Feed (hidden)"] {
+                background-color: #EAF7FF !important;
+            }
+
+
+
+            /* TextForge GUI log box */
+            .textforge-log-box {
+                background-color: #EAFBEA;
+                border: 1px solid #B7E4B7;
+                border-radius: 0.45rem;
+                padding: 0.55rem 0.70rem;
+                min-height: 140px;
+                max-height: 180px;
+                overflow-y: auto;
+                white-space: normal;
+                word-break: break-word;
+                font-family: monospace;
+                font-size: 0.88rem;
+                line-height: 1.35;
+            }
+
             /* Make small select boxes look compact */
             div[data-baseweb="select"] > div {
                 min-height: 34px;
@@ -109,7 +193,7 @@ def render_page() -> None:
       Super-Prompt
 
     RIGHT:
-      Memory Demo
+      Memory
       Buttons / Top-K / project controls / status
     """
     # Main 2-column layout
@@ -155,14 +239,36 @@ def render_left_panel() -> None:
 
 
 def render_right_panel() -> None:
-    """Right panel: Memory Demo at top, all controls below."""
+    """Right panel: Memory at top, all controls below."""
     ctrl: AppController = st.session_state.controller
     retrieval_ready = getattr(ctrl, "retriever", None) is not None
     reranker_ready = getattr(ctrl, "reranker", None) is not None
 
-    # Memory Demo section
-    st.markdown('<div class="field-title">MEMORY DEMO</div>', unsafe_allow_html=True)
-    render_memory_demo(height=420)
+    # Memory section
+    render_memory_records(height=420)
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
+    # Manual memory feed row
+    manual_feed_c1, manual_feed_c2 = st.columns([1, 3], gap="small")
+
+    with manual_feed_c1:  # Manual memory feed button
+        if st.button(
+            "Feed Memory Manually",
+            key="btn_feed_memory_manually",
+            use_container_width=True,
+            type="primary",
+        ):
+            do_feed_memory_manually()
+
+    with manual_feed_c2:  # Manual memory feed edit box
+        st.text_area(
+            label="Manual Memory Feed (hidden)",
+            key="manual_memory_feed_text",
+            height=68,
+            label_visibility="collapsed",
+            placeholder="Paste LLM reply here for manual memory feed.",
+        )
 
     st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
 
@@ -241,13 +347,74 @@ def render_right_panel() -> None:
 
     st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
 
+    # TextForge GUI log / status log
+    render_textforge_gui_log(height=150)
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
     # Project controls / file ingestion
     render_project_area(ctrl)
 
 
-def render_memory_demo(height: int = 420) -> None:
-    """Memory Demo list."""
-    memory_entries = st.session_state["a2_memory_demo_entries"]
+def render_textforge_gui_log(height: int = 150) -> None:
+    """Render the TextForge GUI log box."""
+    st.markdown(
+        '<div class="field-title" style="font-size:1.05rem;">Runtime Log</div>',
+        unsafe_allow_html=True,
+    )
+
+    log_text = st.session_state.get("textforge_gui_log", "")
+    if not log_text:
+        log_text = "(no log messages yet)"
+
+    lines = log_text.splitlines()
+    if lines:
+        first_line = html.escape(lines[0])
+        older_lines = "<br>".join(
+            f"<i>{html.escape(line)}</i>"
+            for line in lines[1:]
+        )
+        if older_lines:
+            log_html = f"{first_line}<br>{older_lines}"
+        else:
+            log_html = first_line
+    else:
+        log_html = ""
+
+    flash_active = time.time() < st.session_state.get("runtime_log_flash_until", 0)
+
+    if flash_active:
+        log_box_style = (
+            f"min-height:{height}px; max-height:{height}px;"
+            "background-color:#FFE5E5; border-color:#FF9A9A;"
+        )
+    else:
+        log_box_style = f"min-height:{height}px; max-height:{height}px;"
+
+    st.markdown(
+        f'<div class="textforge-log-box" style="{log_box_style}">{log_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_memory_records(height: int = 420) -> None:
+    """Memory record list."""
+    memory_manager = st.session_state.memory_manager
+
+    if memory_manager.filename_ragmem:
+        memory_title = f"Memory — {memory_manager.filename_ragmem}"
+    else:
+        memory_title = "Memory"
+
+    st.markdown(
+        f'<div class="field-title">{html.escape(memory_title)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("memory_title_required"):
+        render_memory_title_form()
+
+    memory_entries = memory_manager.records
 
     try:
         memory_container = st.container(height=height)
@@ -256,19 +423,25 @@ def render_memory_demo(height: int = 420) -> None:
 
     with memory_container:  # Memory container
         if not memory_entries:
-            st.info("No memory entries yet.")
+            st.info("No memory records yet.")
         else:
-            for entry in memory_entries:
-                entry_id = entry["id"]
-                tag_key = f"a2_memory_tag_{entry_id}"
+            for record in memory_entries:
+                tag_key = f"memory_tag_{record.record_id}"
+                keywords_key = f"memory_user_keywords_{record.record_id}"
 
                 if tag_key not in st.session_state:
-                    st.session_state[tag_key] = entry.get("tag", "Green")
+                    st.session_state[tag_key] = record.tag
 
-                input_col, tag_col = st.columns([8.8, 1.0], gap="small")
+                if keywords_key not in st.session_state:
+                    st.session_state[keywords_key] = ", ".join(record.user_keywords)
+
+                selected_tag = st.session_state.get(tag_key, record.tag)
+                tag_color = TAG_COLORS.get(selected_tag, "#6B7280")
+
+                input_col, meta_col = st.columns([7.8, 2.0], gap="small")
 
                 with input_col:  # Memory INPUT box
-                    input_html = html.escape(entry.get("input_text", "")).replace("\n", "<br>")
+                    input_html = html.escape(record.input_text).replace("\n", "<br>")
                     st.markdown(
                         f"""
                         <div class="memory-box memory-input-box">
@@ -279,16 +452,32 @@ def render_memory_demo(height: int = 420) -> None:
                         unsafe_allow_html=True,
                     )
 
-                with tag_col:  # Memory TAG selectbox
-                    selected_tag = st.selectbox(
+                with meta_col:  # Memory metadata controls
+                    st.markdown(
+                        f"""
+                        <div class="memory-tag-indicator">
+                            <span class="memory-tag-square" style="background-color:{tag_color};"></span>
+                            <span class="memory-tag-name">{html.escape(selected_tag)}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    st.selectbox(
                         "Tag",
-                        options=["Platin", "GOLD", "SILVER", "Green", "Black"],
+                        options=memory_manager.tag_catalog,
                         key=tag_key,
                         label_visibility="collapsed",
                     )
-                    entry["tag"] = selected_tag
 
-                output_html = html.escape(entry.get("output_text", "")).replace("\n", "<br>")
+                    st.text_input(
+                        "User Keywords",
+                        key=keywords_key,
+                        label_visibility="collapsed",
+                        placeholder="keywords",
+                    )
+
+                output_html = html.escape(record.output_text).replace("\n", "<br>")
                 st.markdown(
                     f"""
                     <div class="memory-box memory-output-box">
@@ -300,6 +489,20 @@ def render_memory_demo(height: int = 420) -> None:
                 )
 
                 st.markdown("<div style='height:0.40rem'></div>", unsafe_allow_html=True)
+
+
+def render_memory_title_form() -> None:
+    """Ask for first memory title before creating the first .ragmem file."""
+    with st.form("memory_title_form", clear_on_submit=False):
+        st.text_input(
+            "Memory Title",
+            key="memory_title_input",
+            placeholder="Example: Memory Design",
+        )
+        submitted = st.form_submit_button("Create Memory File", use_container_width=True)
+
+        if submitted:
+            do_confirm_memory_title_and_save()
 
 
 def render_project_area(ctrl: AppController) -> None:

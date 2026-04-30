@@ -1,6 +1,6 @@
-# Architecture – RAGstream (21.04.2026)
+# Architecture – RAGstream (24.04.2026)
 
-Last sync: 21.04.2026
+Last sync: 24.04.2026
 
 Note for future maintenance:
 - When new implementation-aligned decisions or features are added here, they should be date-stamped inline so the chronology stays visible.
@@ -72,7 +72,7 @@ Conceptually, RAGstream runs as a loop over “sessions” in the GUI:
 1. The user selects a project (which fixes the active `data/chroma_db/<project>/`, `data/splade_db/<project>/`, and the project FileManifest).
 2. The GUI creates or reuses a controller instance with an associated SuperPrompt.
 3. The user writes a free-form prompt and either steps through the pipeline or runs it automatically.
-4. The controller calls deterministic functions (preprocessing, retrieval, reranking) and the currently live LLM-based agents (A2, A3) in the order defined in Requirements_RAG_Pipeline.md. A4 Condenser and Prompt Builder are the next immediate implementation targets; A5 is intentionally postponed for a later phase.
+4. The controller calls deterministic functions (preprocessing, retrieval, reranking) and the currently live LLM-based agents (A2, A3, A4) in the order defined in Requirements_RAG_Pipeline.md. [24.04.2026] A4 Condenser is now implemented as a live three-call condenser stage; Prompt Builder is the next immediate implementation target, and A5 is intentionally postponed for a later phase.
 5. The GUI displays the evolving SuperPrompt; optionally, the user sends an external reply and marks it for history ingestion.
 
 The core data carriers from the requirements:
@@ -123,20 +123,58 @@ The Agent Stack used by the LLM-based stages is defined in Requirements_AgentSta
 
 * AgentFactory — neutral config loader/resolver with `load_config(...)`, `get_agent(...)`, and transparent config-level caching.
 * AgentPrompt — neutral prompt engine created via `from_config(...)`, with `compose(...)` and `parse(...)` as the current live public methods.
-* llm_client — thin wrapper around the LLM API via `LLMClient.chat(...)`.
+* llm_client — thin wrapper around the LLM API via `LLMClient.chat(...)` and, for A4 reasoning-style calls, `LLMClient.responses(...)`.
 
-Current operational truth on 21.04.2026:
+Current operational truth on 24.04.2026:
 
-* A2 and A3 are the live Agent Stack consumers in the code path.
+* A2, A3, and A4 are the live LLM-based pipeline stages in the code path.
+* A2 includes deterministic post-parse selector sanitization before writing selected ids into SuperPrompt.
 * A3 is usefulness-only; duplicate marking was intentionally removed.
-* A4 Condenser is the next immediate Agent Stack consumer to be implemented.
+* A4 Condenser is implemented as a three-call workflow: chunk phraser, chunk classifier, and final condenser.
+* A4 loads three exact nested JSON configs directly and creates three `AgentPrompt` objects at the beginning of its run.
+* A4 uses deterministic helper functions in `a4_det_processing.py`, shared LLM-call mechanics in `a4_llm_helper.py`, and the Responses API path through `LLMClient.responses(...)`.
 * A5 remains in the long-range pipeline contract, but it is postponed and its future action may still change before implementation.
 
 The architecture relies on these properties from the requirements:
 
 * Agents are stateless; all persistent state is in SuperPrompt or in external stores (vector stores, logs, history).
 * Each pipeline stage takes a SuperPrompt and returns a new SuperPrompt (or the same object mutated in-place, but following the invariants from Requirements_RAG_Pipeline.md).
-* Deterministic stages never call the LLM; agent stages always go via AgentFactory + AgentPrompt + llm_client.
+* Deterministic stages never call the LLM. Standard agent stages go via AgentFactory + AgentPrompt + llm_client; [24.04.2026] A4 is the deliberate exception that uses exact JSON paths to create three AgentPrompt objects directly before calling llm_client through A4LLMHelper.
+
+---
+
+## A4 Condenser and GUI-visible SuperPrompt projection (24.04.2026)
+
+A4 Condenser is now a live pipeline stage after A3. Its architectural role is not to answer the user directly, but to transform A3-selected useful evidence into a compact internal retrieved-context block:
+
+```text
+A3 useful evidence
+      │
+      ▼
+A4 selected local chunks 1..N
+      │
+      ▼
+Chunk Phraser → Chunk Classifier → Final Condenser
+      │
+      ▼
+SuperPrompt.S_CTX_MD
+```
+
+The A4 implementation is intentionally split:
+
+* `A4Condenser` owns the high-level seven-step workflow and exact JSON path loading.
+* `a4_det_processing.py` owns deterministic selected-chunk preparation, active-class preparation, grouping/fallback, and final SuperPrompt write-back.
+* `a4_llm_helper.py` owns the repeated LLM-call mechanics for the three A4 calls.
+* `LLMClient.responses(...)` is used for the A4 reasoning-style call path and logs model, input, cached input, output, and reasoning/status fields where available.
+
+The GUI-visible SuperPrompt is separately projected by `SuperPromptProjector`. This separation is important:
+
+* `SuperPrompt` owns state.
+* A4 owns production of `S_CTX_MD`.
+* `SuperPromptProjector` owns the visible GUI rendering.
+* Prompt Builder will later own deterministic final-send assembly.
+
+The current projector renders the visible prompt as separate sections for System, Configuration, User, and Retrieved Context. Therefore `S_CTX_MD` is shown under `## Retrieved Context / ### Retrieved Context Summary`, and raw retrieved chunks are shown under `## Retrieved Context / ### Raw Retrieved Evidence`. This prevents retrieved or condensed context from visually merging with the actual user task.
 
 ---
 
@@ -148,8 +186,8 @@ Controller (AppController in `controller.py`, see Requirements_Orchestration_Con
 
 * Owns the current SuperPrompt instance and controls its lifecycle.
 * Uses a light `__init__()` plus `initialize_heavy_components()` so Retrieval / ReRanker resources can warm in the background instead of blocking first paint.
-* Currently exposes live stage methods for `preprocess(...)`, `run_a2_promptshaper(...)`, `run_retrieval(...)`, `run_reranker(...)`, and `run_a3(...)`, plus project-ingestion helpers.
-* Keeps shared helper instances such as AgentFactory, LLMClient, A2PromptShaper, A3NLIGate, Retriever, and Reranker as controller-owned infrastructure objects.
+* Currently exposes live stage methods for `preprocess(...)`, `run_a2_promptshaper(...)`, `run_retrieval(...)`, `run_reranker(...)`, `run_a3(...)`, and `run_a4(...)`, plus project-ingestion helpers.
+* Keeps shared helper instances such as AgentFactory, LLMClient, A2PromptShaper, A3NLIGate, A4Condenser, Retriever, and Reranker as controller-owned infrastructure objects.
 * Owns project/data-root decisions (`doc_raw`, `chroma_db`, `splade_db`) and keeps the GUI thin.
 
 GUI (Generation-1 Streamlit GUI split across `ui_streamlit.py`, `ui_layout.py`, and `ui_actions.py`, see Requirements_GUI.md):
@@ -159,6 +197,7 @@ GUI (Generation-1 Streamlit GUI split across `ui_streamlit.py`, `ui_layout.py`, 
 * `ui_actions.py` owns button callbacks and session-state mutations after controller calls.
 * The current layout is two-sided: Prompt + Super-Prompt on the left; Memory Demo, pipeline buttons, Retrieval/ReRanker controls, and project controls on the right.
 * The GUI currently includes `Retrieval Top-K`, `use Retrieval Splade`, and `use Reranking Colbert` controls, and it keeps downstream stage contracts stable even when the slow components are bypassed.
+* [24.04.2026] After A4, the GUI-visible SuperPrompt is rendered by `SuperPromptProjector` with explicit separation between `System`, `Configuration`, `User`, `Retrieved Context Summary`, and `Raw Retrieved Evidence`. A4 `S_CTX_MD` is displayed as retrieved support context, not as part of the user task.
 
 The architecture viewpoint here is that the GUI is thin: it never implements business logic or data invariants; it only forwards user actions to the controller and renders data it receives.
 
@@ -276,17 +315,17 @@ The non-functional targets (performance, cost, robustness, extensibility) are sp
 * Deterministic where possible: ingestion, retrieval, reranking, and selection logic are deterministic functions over FileManifest and the aligned dense/sparse stores.
 * Agentic but controlled: LLM-based stages are stateless, small, and driven by explicit JSON configs rather than ad-hoc prompts.
 * Extensible: new agents or stages can be added without breaking existing ones, as long as they respect the SuperPrompt and Agent Stack contracts.
-* [21.04.2026] Late-stage implementation priority is now explicit: after the current Retrieval / ReRanker / A3 base, the next immediate implementation targets are A4 Condenser and Prompt Builder, while A5 remains postponed.
+* [24.04.2026] Late-stage implementation priority is now updated: A4 Condenser is implemented and live; the next immediate implementation target is Prompt Builder, while A5 remains postponed.
 
 ---
 
-# Sync Report (21.04.2026 update)
+# Sync Report (24.04.2026 update)
 
 **Precisely applied changes (minimal edits only):**
 
-* Added a current sync date at the top and a small maintenance note for future inline date-stamps.
-* Updated the architecture narrative from dense-only document persistence to parallel dense + SPLADE document persistence.
-* Updated the high-level runtime wording so project selection now fixes both `chroma_db/<project>` and `splade_db/<project>`.
-* Updated Retrieval wording from generic RRF to weighted RRF.
-* Corrected the ReRanker wording so it no longer claims that ColBERT is already the active implementation; ColBERT remains the immediate next direction.
-* Updated persistence/modularity wording so dense Chroma and sparse SPLADE stores are both part of the architecture.
+* Updated the sync date to 24.04.2026.
+* Updated the live Agent Stack truth from A2/A3 to A2/A3/A4.
+* Changed A4 from immediate next implementation target to implemented live condenser stage.
+* Added the compact A4 architecture split: `A4Condenser`, `a4_det_processing.py`, `a4_llm_helper.py`, three exact JSON configs, and `LLMClient.responses(...)`.
+* Added the SuperPromptProjector separation rule for GUI-visible rendering of `S_CTX_MD` under Retrieved Context Summary.
+* Updated the late-stage priority: Prompt Builder is now the next immediate target; A5 remains postponed.

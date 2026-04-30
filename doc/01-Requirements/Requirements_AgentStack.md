@@ -29,17 +29,19 @@ Current implementation-aligned neutrality rule:
 
 * AgentFactory, AgentPrompt, and llm_client MUST remain neutral.
 * A3-specific evidence rendering, local chunk-id mapping, chunk-text sanitization, and A3-specific prompt assembly MUST live in `a3_nli_gate.py` and/or the A3 JSON config, not inside neutral Agent Stack files.
+* [24.04.2026] A4-specific evidence packaging, local chunk-id mapping, class grouping, fallback handling, and final write-back MUST live in `a4_condenser.py`, `a4_det_processing.py`, `a4_llm_helper.py`, and/or the A4 JSON configs, not inside neutral Agent Stack files.
 
 Current practical scope:
 
-* The current live Agent Stack consumers are A2 PromptShaper and A3 NLI Gate.
-* The stack is intended to remain reusable for later A4, A5, `NLP_Splitter`, and other agents, but those later consumers must not be described here as if they were already active runtime behavior where code does not yet show that.
+* [24.04.2026] The current live Agent Stack consumers are A2 PromptShaper, A3 NLI Gate, and A4 Condenser.
+* [24.04.2026] A4 is a special live consumer: it uses `AgentPrompt` objects loaded from exact nested JSON paths, not the normal `AgentFactory.get_agent(agent_id, version)` resolution path.
+* The stack is intended to remain reusable for later A5, `NLP_Splitter`, and other agents, but those later consumers must not be described here as if they were already active runtime behavior where code does not yet show that.
 
 Implementation note:
 
 * The current code keeps a transparent read-only cache of constructed `AgentPrompt` objects inside `AgentFactory`. This cache is configuration-level reuse, not agent business state.
 
-A2 PromptShaper is used as the running example, but the same neutral stack should remain reusable for A3 and later agents.
+A2 PromptShaper is used as the running example, but the same neutral stack is also used by A3 and by the A4 Condenser prompt objects.
 
 2. High-level data flow (A2 example)
 
@@ -147,10 +149,13 @@ The A2 data flow using the Agent Stack:
 
   * `data/agents/a2_promptshaper/003.json`
   * `data/agents/a3_nli_gate/001.json`
-  * `data/agents/a4_condenser/001.json`
+  * `data/agents/a4_condenser/chunk_phraser/a4_1_001.json`
+  * `data/agents/a4_condenser/chunk_classifier/a4_2_001.json`
+  * `data/agents/a4_condenser/final_condenser/a4_3_001.json`
 
-* The exact path construction is the responsibility of AgentFactory; calling agents (A2, etc.) must not hard-code file paths.
-* The current AgentFactory derives this base path from the repository root and treats it as the single source of truth for runtime agent configs.
+* For ordinary agents such as A2 and A3, the exact path construction is the responsibility of AgentFactory; calling agents must not hard-code file paths.
+* [24.04.2026] A4 is the explicit exception in the current implementation: `A4Condenser` loads its three nested JSON files by exact path because A4 is a fixed three-agent workflow rather than one normal `(agent_id, version)` lookup.
+* The current AgentFactory derives its ordinary base path from the repository root and treats it as the single source of truth for standard runtime agent configs.
 
 3.3. AgentConfig JSON schema (current implementation-aligned conceptual structure)
 
@@ -205,20 +210,21 @@ Requirements:
   * `chooser` -> runtime mode `selector`
   * `multi-chooser` / `multi_chooser` -> runtime mode `classifier`
 
-* The current live compose/parse path actively supports runtime modes `selector` and `classifier`.
-* The broader conceptual families Writer / Extractor / Scorer may appear in code comments or future config vocabulary, but they are not the current live compose/parse branches and must not be described here as if they were already active runtime support.
+* The current live compose/parse path actively supports runtime modes `selector`, `classifier`, and the A4 synthesizer-style path used by the condenser JSONs.
+* The broader conceptual families Writer / Extractor / Scorer may appear in code comments or future config vocabulary, but they must not be described as separate active runtime branches unless the code path explicitly supports them.
 * `static_prompt`, `dynamic_bindings`, `decision_targets`, `llm_config`, and `output_schema` are the current primary config blocks consumed by `AgentPrompt.from_config(...)`.
 * The current code still supports limited backward-compatible fallbacks when some configs use older names such as `prompt_profile` instead of `static_prompt`, or `fields` instead of `decision_targets`.
 * `output_schema` defines the structured response target. In the current code path the response format sent to the LLM is `{"type": "json_object"}`, while schema/enums/defaults are enforced during parse/validation.
 * `decision_targets` are the source of enums, defaults, cardinality, and option metadata for selector/classifier behavior.
-* `model_name` MUST match an OpenAI chat model name or fine-tuned model id.
-* `temperature` and `max_tokens` are basic numeric parameters; no further tuning knobs are required at this stage.
+* `model_name` MUST match an OpenAI model name or fine-tuned model id.
+* [24.04.2026] `model_name` is the required key used by `AgentPrompt.from_config(...)`. The older or incorrect key `model` must not be documented as the active model-name source.
+* `temperature` and `max_tokens` / `max_output_tokens` are basic numeric parameters. Additional per-agent runtime choices such as `prompt_cache_key` and `reasoning_effort` are handled by the calling agent/helper and `llm_client`, not by ad-hoc JSON fields unless explicitly introduced.
 
 Future extension: if you later need multiple providers (OpenAI, local TinyLlama, etc.), a `provider` field can be introduced, but it is not part of this current requirement.
 
-3.4. Agreed future agent additions
+3.4. Current and future agent additions
 
-The following agent additions are now part of the agreed future direction and must remain compatible with this Agent Stack:
+The following agent additions are part of the current or agreed future direction and must remain compatible with this Agent Stack:
 
 * `NLP_Splitter`
 
@@ -233,6 +239,13 @@ The following agent additions are now part of the agreed future direction and mu
   * Conceptual mode family: Multi-Chooser.
   * Current runtime mode mapping: `classifier`.
   * Expected output shape: one JSON object containing one global `selection_band` plus `item_decisions`, where each candidate chunk receives a usefulness label such as `useful`, `borderline`, or `discarded`.
+
+* `A4_Condenser`
+
+  * [24.04.2026] Current practical truth: A4 is already a live condenser stage built on `AgentPrompt` plus `LLMClient.responses(...)`.
+  * [24.04.2026] Current implemented direction: run three exact JSON-defined A4 prompt objects — chunk phraser, chunk classifier, and final condenser — through one high-level `A4Condenser` workflow.
+  * [24.04.2026] A4 does not use ordinary `AgentFactory.get_agent(...)` resolution for its three sub-agents; it loads exact JSON paths and creates the three `AgentPrompt` objects directly.
+  * Expected output shape of the final condenser: one JSON object containing `s_ctx_md`.
 
 4. AgentFactory (agent_factory.py)
 
@@ -340,7 +353,7 @@ An AgentPrompt instance MUST hold the following current implementation-aligned c
 
 * `agent_name: str`
 * `version: str`
-* `mode: str` (current runtime mode such as `selector` or `classifier`)
+* `mode: str` (current runtime mode such as `selector`, `classifier`, or A4 synthesizer-style mode)
 * `static_prompt: dict`
 * `dynamic_bindings: list[dict]`
 * `decision_targets: list[dict]`
@@ -381,9 +394,10 @@ Responsibilities:
   * In current live code:
 
     * runtime mode `selector` builds a chooser-style prompt over configured decision targets and active fields,
-    * runtime mode `classifier` builds a multi-item structured prompt over the configured decision targets and output schema.
+    * runtime mode `classifier` builds a multi-item structured prompt over the configured decision targets and output schema,
+    * the A4 synthesizer-style path builds a structured synthesis prompt from dynamic bindings and required output instructions.
 
-  * The current live compose path does not yet implement separate Writer / Extractor prompt composition as an active runtime branch.
+  * Separate Writer / Extractor / Scorer branches must not be treated as active requirements unless they are explicitly wired in code.
 
 * Validate required `dynamic_bindings` before prompt composition. Missing required bindings raise `AgentPromptValidationError`.
 * Return:
@@ -441,16 +455,19 @@ llm_client is the lowest-level LLM access layer.
 
 Responsibilities:
 
-* Provide a simple function to call the LLM with:
+* Provide simple functions to call the LLM with:
 
   * `messages`
   * `model_name`
-  * `temperature`
+  * `temperature` where supported
   * `max_output_tokens`
   * optional `response_format`
+  * optional `prompt_cache_key`
+  * optional `reasoning_effort` for the Responses path
 
 * Hide OpenAI API details from agents, AgentPrompt, and AgentFactory.
 * Return raw content that AgentPrompt can parse.
+* [24.04.2026] Extract and log token/cache usage metadata where the provider response exposes it.
 
 llm_client MUST NOT:
 
@@ -460,18 +477,19 @@ llm_client MUST NOT:
 
 6.2. Current provider and future-proofing
 
-* For now, llm_client MUST call **OpenAI chat models** (e.g. `gpt-4.1-mini`, or a fine-tuned model ID).
+* For now, llm_client MUST call OpenAI models through the OpenAI Python client.
 
 * It MUST support both:
 
-  * base models (e.g. `gpt-4.1-mini`)
+  * base models (e.g. `gpt-4.1-mini`, `gpt-5-mini`)
   * fine-tuned models (e.g. `ft:gpt-4.1-mini-2025-04-14:personal:a2-promptshaper-v1:XXXX`)
 
-* The interface MUST be designed so that, later, additional backends can be implemented behind the same function signature without changing A2, AgentFactory, or AgentPrompt.
+* [24.04.2026] It must support both the Chat Completions path (`chat(...)`) and the Responses API path (`responses(...)`).
+* The interface MUST be designed so that, later, additional backends can be implemented behind the same abstraction without changing A2, A3, A4, AgentFactory, or AgentPrompt.
 
 6.3. Public interface
 
-llm_client MUST provide at least one function with this conceptual signature aligned to the current code:
+llm_client MUST provide at least these functions with conceptual signatures aligned to the current code:
 
 ```python
 llm_client.chat(
@@ -481,21 +499,41 @@ llm_client.chat(
     temperature: float,
     max_output_tokens: int,
     response_format: dict | None = None,
+    return_metadata: bool = False,
+    prompt_cache_key: str | None = None,
+    prompt_cache_retention: str | None = None,
+) -> Any
+
+llm_client.responses(
+    *,
+    messages: list[dict],
+    model_name: str,
+    max_output_tokens: int,
+    reasoning_effort: str | None = None,
+    return_metadata: bool = False,
+    prompt_cache_key: str | None = None,
+    prompt_cache_retention: str | None = None,
 ) -> Any
 ```
 
 Behavior:
 
-* Build the appropriate payload for the OpenAI chat client, including:
+* Build the appropriate payload for the OpenAI Chat Completions or Responses API client, including:
 
   * `messages`
   * `model_name`
-  * `temperature`
+  * `temperature` where supported
   * `max_output_tokens`
-  * optional `response_format`
+  * optional `response_format` for the chat path
+  * optional `prompt_cache_key`
+  * optional `reasoning_effort` for the Responses path
 
 * In the current implementation, `gpt-5*` reasoning models are treated specially and temperature is not sent for those models.
+* [24.04.2026] `responses(...)` must only send the `reasoning` object if `reasoning_effort` is explicitly provided. If it is omitted or `None`, no `reasoning.effort` field is sent.
+* [24.04.2026] If a composed prompt contains only a system message, the Responses wrapper must still provide valid `input`; the implemented fix moves the instruction text into `input` and clears `instructions` for that call.
+* [24.04.2026] `prompt_cache_key` may be passed to improve cache routing. `prompt_cache_retention` must not be passed in the current runtime until the installed SDK/API path accepts it.
 * Send the request and return the raw response content as a string (or stringified content) so that `AgentPrompt.parse(...)` can validate it.
+* [24.04.2026] The client must log model name, input tokens, cached input tokens, output tokens, and reasoning/status fields where available.
 
 7. Non-functional requirements
 
@@ -526,7 +564,7 @@ Behavior:
   * raw LLM output and validated output
 
 * In the current code path, AgentPrompt already logs the composed SYSTEM and USER prompt text via `SimpleLogger`.
-* llm_client itself SHOULD at least log errors and basic metrics where available, but detailed logging requirements can be defined in a separate document.
+* llm_client itself SHOULD at least log errors and basic metrics where available. [24.04.2026] The current implementation logs model name, input tokens, cached input tokens, output tokens, and reasoning/status fields where available; fuller logging governance can still be defined in a separate document.
 
 ---
 

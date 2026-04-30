@@ -59,6 +59,7 @@ from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
 from ragstream.agents.a2_promptshaper import A2PromptShaper
 from ragstream.agents.a3_nli_gate import A3NLIGate
+from ragstream.agents.a4_condenser import A4Condenser
 
 # Added on 10.03.2026:
 # Project-based document ingestion is wired here only at controller level.
@@ -76,7 +77,7 @@ from ragstream.ingestion.vector_store_splade import VectorStoreSplade
 # Deterministic Retrieval stage.
 from ragstream.retrieval.retriever import Retriever
 from ragstream.retrieval.reranker import Reranker
-
+from ragstream.textforge.RagLog import LogALL
 
 class AppController:
     def __init__(self, schema_path: str = "ragstream/config/prompt_schema.json") -> None:
@@ -89,6 +90,7 @@ class AppController:
         - Creates a shared AgentFactory + LLMClient.
         - Creates the A2PromptShaper agent.
         - Creates the A3NLIGate agent.
+        - Creates the A4Condenser agent.
         - Prepares project/data paths.
         """
         # PreProcessing schema (OLD, working behaviour)
@@ -109,6 +111,11 @@ class AppController:
         # A3 agent
         self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
+            llm_client=self.llm_client,
+        )
+
+        # A4 agent
+        self.a4_condenser = A4Condenser(
             llm_client=self.llm_client,
         )
 
@@ -152,10 +159,13 @@ class AppController:
         - Ignore empty/whitespace-only input.
         - Otherwise run deterministic preprocessing, update sp in place.
         """
+        log = LogALL()
         text = (user_text or "").strip()
         if not text:
             return sp
+        log("PreProcessing started.", "INFO", "PUBLIC")
         preprocess(text, sp, self.schema)
+        log("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 
     def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:
@@ -181,6 +191,34 @@ class AppController:
             - stage / history_of_stages
         """
         return self.a3_nli_gate.run(sp)
+
+    def run_a4(
+        self,
+        sp: SuperPrompt,
+        *,
+        effective_output_token_limit: int | None = None,
+    ) -> SuperPrompt:
+        """
+        Run A4 on the current SuperPrompt.
+
+        Inputs:
+            sp:
+                Current evolving SuperPrompt, typically after A3.
+            effective_output_token_limit:
+                Optional external override for the final condenser output allowance.
+
+        Returns:
+            Updated SuperPrompt after A4 has populated:
+            - S_CTX_MD
+            - views_by_stage["a4"]
+            - final_selection_ids
+            - extras["a4_*"]
+            - stage / history_of_stages
+        """
+        return self.a4_condenser.run(
+            sp,
+            effective_output_token_limit=effective_output_token_limit,
+        )
 
     # Added on 18.03.2026:
     # Small demo helper for the future memory view in the GUI.
@@ -1070,11 +1108,26 @@ Keep controller calls and session-state mutations here.
 from __future__ import annotations
 
 import copy
+import time
+
+from typing import Any
 
 import streamlit as st
 
 from ragstream.app.controller import AppController
+from ragstream.memory.memory_actions import capture_memory_pair
+from ragstream.memory.memory_manager import MemoryManager
 from ragstream.orchestration.super_prompt import SuperPrompt
+
+
+def _log_runtime(
+    text: str,
+    type: str = "INFO",
+    sensitivity: str = "PUBLIC",
+) -> None:
+    logger = st.session_state.get("raglog")
+    if logger is not None:
+        logger(text, type, sensitivity)
 
 
 def do_preprocess() -> None:
@@ -1088,6 +1141,7 @@ def do_preprocess() -> None:
     st.session_state.sp_rtv = SuperPrompt()
     st.session_state.sp_rrk = SuperPrompt()
     st.session_state.sp_a3 = SuperPrompt()
+    st.session_state.sp_a4 = SuperPrompt()
 
     sp: SuperPrompt = st.session_state.sp
     sp = ctrl.preprocess(user_text, sp)
@@ -1103,21 +1157,164 @@ def do_a2_promptshaper() -> None:
     sp: SuperPrompt = st.session_state.sp
 
     sp = ctrl.run_a2_promptshaper(sp)
-    entry = ctrl.build_a2_memory_demo_entry(sp)
-
-    next_id = st.session_state.get("a2_memory_demo_counter", 0) + 1
-    st.session_state["a2_memory_demo_counter"] = next_id
-    entry["id"] = next_id
-
-    st.session_state[f"a2_memory_tag_{next_id}"] = "Green"
-    st.session_state["a2_memory_demo_entries"].append(entry)
 
     st.session_state.sp = sp
     st.session_state.sp_a2 = copy.deepcopy(sp)
     st.session_state["super_prompt_text"] = sp.prompt_ready
-    st.session_state["pending_a2_memory_refresh"] = True
 
-    #st.rerun()
+
+def do_feed_memory_manually() -> None:
+    """Manual memory feed button callback."""
+    prompt_text = st.session_state.get("prompt_text", "")
+    output_text = st.session_state.get("manual_memory_feed_text", "")
+
+    if not (prompt_text or "").strip():
+        _log_runtime("Prompt is empty. No memory record was created.", "WARN", "PUBLIC")
+        return
+
+    if not (output_text or "").strip():
+        _log_runtime("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
+        return
+
+    memory_manager: MemoryManager = st.session_state.memory_manager
+
+    if not memory_manager.title.strip():
+        st.session_state["pending_manual_memory_pair"] = {
+            "input_text": prompt_text,
+            "output_text": output_text,
+        }
+        st.session_state["memory_title_required"] = True
+        _log_runtime("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
+        st.session_state["runtime_log_flash_until"] = time.time() + 5
+        st.rerun()
+
+    _save_memory_pair(
+        input_text=prompt_text,
+        output_text=output_text,
+    )
+
+
+def do_confirm_memory_title_and_save() -> None:
+    """Confirm first memory title and save pending manual memory pair."""
+    title = (st.session_state.get("memory_title_input", "") or "").strip()
+    if not title:
+        _log_runtime("Memory title must not be empty.", "WARN", "PUBLIC")
+        return
+
+    memory_manager: MemoryManager = st.session_state.memory_manager
+
+    if not memory_manager.title.strip():
+        memory_manager.start_new_history(title)
+        _log_runtime(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
+
+    pending_pair = st.session_state.get("pending_manual_memory_pair")
+    if pending_pair:
+        input_text = pending_pair.get("input_text", "")
+        output_text = pending_pair.get("output_text", "")
+    else:
+        input_text = st.session_state.get("prompt_text", "")
+        output_text = st.session_state.get("manual_memory_feed_text", "")
+
+    _save_memory_pair(
+        input_text=input_text,
+        output_text=output_text,
+    )
+
+
+def _save_memory_pair(
+    input_text: str,
+    output_text: str,
+) -> None:
+    try:
+        ctrl: AppController = st.session_state.controller
+        memory_manager: MemoryManager = st.session_state.memory_manager
+
+        active_project_name, embedded_files_snapshot = _get_active_project_snapshot(ctrl)
+        gui_records_state = _collect_memory_gui_state(memory_manager)
+
+        result = capture_memory_pair(
+            memory_manager=memory_manager,
+            input_text=input_text,
+            output_text=output_text,
+            source="manual_memory_feed",
+            active_project_name=active_project_name,
+            embedded_files_snapshot=embedded_files_snapshot,
+            gui_records_state=gui_records_state,
+        )
+
+        if result.get("success"):
+            _log_runtime(result.get("message", "Memory record saved."), "INFO", "PUBLIC")
+            st.session_state["pending_manual_memory_pair"] = None
+            st.session_state["memory_title_required"] = False
+            st.session_state["manual_memory_feed_text"] = ""
+            st.rerun()
+        else:
+            _log_runtime(result.get("message", "Memory record was not saved."), "WARN", "PUBLIC")
+
+    except Exception as e:
+        _log_runtime(str(e), "ERROR", "PUBLIC")
+
+
+def _get_active_project_snapshot(ctrl: AppController) -> tuple[str | None, list[str]]:
+    active_project = st.session_state.get("active_project")
+
+    if not active_project or active_project == "(no projects yet)":
+        return None, []
+
+    try:
+        embedded_info = ctrl.get_embedded_files(active_project)
+    except Exception:
+        return active_project, []
+
+    if embedded_info.get("success"):
+        return active_project, list(embedded_info.get("files", []))
+
+    return active_project, []
+
+
+def _collect_memory_gui_state(memory_manager: MemoryManager) -> list[dict[str, Any]]:
+    gui_state: list[dict[str, Any]] = []
+
+    for record in memory_manager.records:
+        tag_key = f"memory_tag_{record.record_id}"
+        keywords_key = f"memory_user_keywords_{record.record_id}"
+
+        tag = st.session_state.get(tag_key, record.tag)
+        user_keywords_text = st.session_state.get(
+            keywords_key,
+            ", ".join(record.user_keywords),
+        )
+
+        gui_state.append(
+            {
+                "record_id": record.record_id,
+                "tag": tag,
+                "user_keywords": _parse_user_keywords(user_keywords_text),
+            }
+        )
+
+    return gui_state
+
+
+def _parse_user_keywords(text: str) -> list[str]:
+    raw_items = str(text or "").replace("\n", ",").split(",")
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for item in raw_items:
+        keyword = item.strip()
+        if not keyword:
+            continue
+
+        key = keyword.lower()
+        if key in seen:
+            continue
+
+        result.append(keyword)
+        seen.add(key)
+
+    return result
 
 
 def do_retrieval() -> None:
@@ -1188,6 +1385,23 @@ def do_a3_nli_gate() -> None:
 
         st.session_state.sp = sp
         st.session_state.sp_a3 = copy.deepcopy(sp)
+        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+    except Exception as e:
+        st.error(str(e))
+
+
+def do_a4_condenser() -> None:
+    """A4 button callback."""
+    try:
+        ctrl: AppController = st.session_state.controller
+        sp: SuperPrompt = st.session_state.sp
+
+        sp = ctrl.run_a4(sp)
+        sp.compose_prompt_ready()
+
+        st.session_state.sp = sp
+        st.session_state.sp_a4 = copy.deepcopy(sp)
         st.session_state["super_prompt_text"] = sp.prompt_ready
 
     except Exception as e:
@@ -1279,6 +1493,7 @@ Keep columns, containers, labels and visual order here.
 from __future__ import annotations
 
 import html
+import time
 
 import streamlit as st
 
@@ -1286,12 +1501,24 @@ from ragstream.app.controller import AppController
 from ragstream.app.ui_actions import (
     do_a2_promptshaper,
     do_a3_nli_gate,
+    do_a4_condenser,
     do_add_files,
+    do_confirm_memory_title_and_save,
     do_create_project,
+    do_feed_memory_manually,
     do_preprocess,
     do_reranker,
     do_retrieval,
 )
+
+
+TAG_COLORS: dict[str, str] = {
+    "Gold": "#D4AF37",
+    "Silver": "#C0C7D2",
+    "Red": "#E0115F",
+    "Green": "#00A86B",
+    "Black": "#111111",
+}
 
 
 def inject_base_css() -> None:
@@ -1360,6 +1587,78 @@ def inject_base_css() -> None:
                 font-family: inherit;
             }
 
+            .memory-tag-indicator {
+                display: flex;
+                align-items: center;
+                gap: 0.35rem;
+                margin-bottom: 0.25rem;
+                min-height: 24px;
+            }
+
+            .memory-tag-square {
+                width: 18px;
+                height: 18px;
+                border-radius: 0.25rem;
+                border: 1px solid rgba(0, 0, 0, 0.25);
+                box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+                flex: 0 0 auto;
+            }
+
+            .memory-tag-name {
+                font-size: 0.78rem;
+                color: #374151;
+                line-height: 1.0;
+                white-space: nowrap;
+            }
+
+
+
+            /* Manual memory feed button */
+            div[data-testid="stButton"] > button[kind="primary"] {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+            }
+
+            div[data-testid="stButton"] > button[kind="primary"]:hover {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+            }
+
+            div[data-testid="stButton"] > button[kind="primary"]:focus {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+            }
+
+            div[data-testid="stButton"] > button[kind="primary"] p {
+                color: white !important;
+            }
+
+            /* Manual memory feed edit box */
+            textarea[aria-label="Manual Memory Feed (hidden)"] {
+                background-color: #EAF7FF !important;
+            }
+
+
+
+            /* TextForge GUI log box */
+            .textforge-log-box {
+                background-color: #EAFBEA;
+                border: 1px solid #B7E4B7;
+                border-radius: 0.45rem;
+                padding: 0.55rem 0.70rem;
+                min-height: 140px;
+                max-height: 180px;
+                overflow-y: auto;
+                white-space: normal;
+                word-break: break-word;
+                font-family: monospace;
+                font-size: 0.88rem;
+                line-height: 1.35;
+            }
+
             /* Make small select boxes look compact */
             div[data-baseweb="select"] > div {
                 min-height: 34px;
@@ -1379,7 +1678,7 @@ def render_page() -> None:
       Super-Prompt
 
     RIGHT:
-      Memory Demo
+      Memory
       Buttons / Top-K / project controls / status
     """
     # Main 2-column layout
@@ -1425,14 +1724,36 @@ def render_left_panel() -> None:
 
 
 def render_right_panel() -> None:
-    """Right panel: Memory Demo at top, all controls below."""
+    """Right panel: Memory at top, all controls below."""
     ctrl: AppController = st.session_state.controller
     retrieval_ready = getattr(ctrl, "retriever", None) is not None
     reranker_ready = getattr(ctrl, "reranker", None) is not None
 
-    # Memory Demo section
-    st.markdown('<div class="field-title">MEMORY DEMO</div>', unsafe_allow_html=True)
-    render_memory_demo(height=420)
+    # Memory section
+    render_memory_records(height=420)
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
+    # Manual memory feed row
+    manual_feed_c1, manual_feed_c2 = st.columns([1, 3], gap="small")
+
+    with manual_feed_c1:  # Manual memory feed button
+        if st.button(
+            "Feed Memory Manually",
+            key="btn_feed_memory_manually",
+            use_container_width=True,
+            type="primary",
+        ):
+            do_feed_memory_manually()
+
+    with manual_feed_c2:  # Manual memory feed edit box
+        st.text_area(
+            label="Manual Memory Feed (hidden)",
+            key="manual_memory_feed_text",
+            height=68,
+            label_visibility="collapsed",
+            placeholder="Paste LLM reply here for manual memory feed.",
+        )
 
     st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
 
@@ -1473,7 +1794,8 @@ def render_right_panel() -> None:
             do_a3_nli_gate()
 
     with b2c2:  # A4 button
-        st.button("A4 Condenser", key="btn_a4", use_container_width=True)
+        if st.button("A4 Condenser", key="btn_a4", use_container_width=True):
+            do_a4_condenser()
 
     with b2c3:  # A5 button
         st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
@@ -1510,13 +1832,74 @@ def render_right_panel() -> None:
 
     st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
 
+    # TextForge GUI log / status log
+    render_textforge_gui_log(height=150)
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
     # Project controls / file ingestion
     render_project_area(ctrl)
 
 
-def render_memory_demo(height: int = 420) -> None:
-    """Memory Demo list."""
-    memory_entries = st.session_state["a2_memory_demo_entries"]
+def render_textforge_gui_log(height: int = 150) -> None:
+    """Render the TextForge GUI log box."""
+    st.markdown(
+        '<div class="field-title" style="font-size:1.05rem;">Runtime Log</div>',
+        unsafe_allow_html=True,
+    )
+
+    log_text = st.session_state.get("textforge_gui_log", "")
+    if not log_text:
+        log_text = "(no log messages yet)"
+
+    lines = log_text.splitlines()
+    if lines:
+        first_line = html.escape(lines[0])
+        older_lines = "<br>".join(
+            f"<i>{html.escape(line)}</i>"
+            for line in lines[1:]
+        )
+        if older_lines:
+            log_html = f"{first_line}<br>{older_lines}"
+        else:
+            log_html = first_line
+    else:
+        log_html = ""
+
+    flash_active = time.time() < st.session_state.get("runtime_log_flash_until", 0)
+
+    if flash_active:
+        log_box_style = (
+            f"min-height:{height}px; max-height:{height}px;"
+            "background-color:#FFE5E5; border-color:#FF9A9A;"
+        )
+    else:
+        log_box_style = f"min-height:{height}px; max-height:{height}px;"
+
+    st.markdown(
+        f'<div class="textforge-log-box" style="{log_box_style}">{log_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_memory_records(height: int = 420) -> None:
+    """Memory record list."""
+    memory_manager = st.session_state.memory_manager
+
+    if memory_manager.filename_ragmem:
+        memory_title = f"Memory — {memory_manager.filename_ragmem}"
+    else:
+        memory_title = "Memory"
+
+    st.markdown(
+        f'<div class="field-title">{html.escape(memory_title)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.get("memory_title_required"):
+        render_memory_title_form()
+
+    memory_entries = memory_manager.records
 
     try:
         memory_container = st.container(height=height)
@@ -1525,19 +1908,25 @@ def render_memory_demo(height: int = 420) -> None:
 
     with memory_container:  # Memory container
         if not memory_entries:
-            st.info("No memory entries yet.")
+            st.info("No memory records yet.")
         else:
-            for entry in memory_entries:
-                entry_id = entry["id"]
-                tag_key = f"a2_memory_tag_{entry_id}"
+            for record in memory_entries:
+                tag_key = f"memory_tag_{record.record_id}"
+                keywords_key = f"memory_user_keywords_{record.record_id}"
 
                 if tag_key not in st.session_state:
-                    st.session_state[tag_key] = entry.get("tag", "Green")
+                    st.session_state[tag_key] = record.tag
 
-                input_col, tag_col = st.columns([8.8, 1.0], gap="small")
+                if keywords_key not in st.session_state:
+                    st.session_state[keywords_key] = ", ".join(record.user_keywords)
+
+                selected_tag = st.session_state.get(tag_key, record.tag)
+                tag_color = TAG_COLORS.get(selected_tag, "#6B7280")
+
+                input_col, meta_col = st.columns([7.8, 2.0], gap="small")
 
                 with input_col:  # Memory INPUT box
-                    input_html = html.escape(entry.get("input_text", "")).replace("\n", "<br>")
+                    input_html = html.escape(record.input_text).replace("\n", "<br>")
                     st.markdown(
                         f"""
                         <div class="memory-box memory-input-box">
@@ -1548,16 +1937,32 @@ def render_memory_demo(height: int = 420) -> None:
                         unsafe_allow_html=True,
                     )
 
-                with tag_col:  # Memory TAG selectbox
-                    selected_tag = st.selectbox(
+                with meta_col:  # Memory metadata controls
+                    st.markdown(
+                        f"""
+                        <div class="memory-tag-indicator">
+                            <span class="memory-tag-square" style="background-color:{tag_color};"></span>
+                            <span class="memory-tag-name">{html.escape(selected_tag)}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    st.selectbox(
                         "Tag",
-                        options=["Platin", "GOLD", "SILVER", "Green", "Black"],
+                        options=memory_manager.tag_catalog,
                         key=tag_key,
                         label_visibility="collapsed",
                     )
-                    entry["tag"] = selected_tag
 
-                output_html = html.escape(entry.get("output_text", "")).replace("\n", "<br>")
+                    st.text_input(
+                        "User Keywords",
+                        key=keywords_key,
+                        label_visibility="collapsed",
+                        placeholder="keywords",
+                    )
+
+                output_html = html.escape(record.output_text).replace("\n", "<br>")
                 st.markdown(
                     f"""
                     <div class="memory-box memory-output-box">
@@ -1569,6 +1974,20 @@ def render_memory_demo(height: int = 420) -> None:
                 )
 
                 st.markdown("<div style='height:0.40rem'></div>", unsafe_allow_html=True)
+
+
+def render_memory_title_form() -> None:
+    """Ask for first memory title before creating the first .ragmem file."""
+    with st.form("memory_title_form", clear_on_submit=False):
+        st.text_input(
+            "Memory Title",
+            key="memory_title_input",
+            placeholder="Example: Memory Design",
+        )
+        submitted = st.form_submit_button("Create Memory File", use_container_width=True)
+
+        if submitted:
+            do_confirm_memory_title_and_save()
 
 
 def render_project_area(ctrl: AppController) -> None:
@@ -1691,11 +2110,15 @@ from __future__ import annotations
 
 import threading
 
+from pathlib import Path
+
 import streamlit as st
 
 from ragstream.app.controller import AppController
 from ragstream.app.ui_layout import inject_base_css, render_page
+from ragstream.memory.memory_manager import MemoryManager
 from ragstream.orchestration.super_prompt import SuperPrompt
+from ragstream.textforge.RagLog import LogALL
 
 
 def init_session_state() -> None:
@@ -1703,6 +2126,23 @@ def init_session_state() -> None:
     if "controller" not in st.session_state:
         ctrl = AppController()
         st.session_state.controller = ctrl
+
+    if "memory_manager" not in st.session_state:
+        project_root = Path(__file__).resolve().parents[2]
+        memory_root = project_root / "data" / "memory"
+        sqlite_path = memory_root / "memory_index.sqlite3"
+
+        st.session_state.memory_manager = MemoryManager(
+            memory_root=memory_root,
+            sqlite_path=sqlite_path,
+            title="",
+        )
+
+    if "textforge_gui_log" not in st.session_state:
+        st.session_state["textforge_gui_log"] = ""
+
+    if "raglog" not in st.session_state:
+        st.session_state.raglog = LogALL(session_state=st.session_state)
 
     if "heavy_init_started" not in st.session_state:
         st.session_state["heavy_init_started"] = False
@@ -1730,6 +2170,8 @@ def init_session_state() -> None:
         st.session_state.sp_rrk = SuperPrompt()
     if "sp_a3" not in st.session_state:
         st.session_state.sp_a3 = SuperPrompt()
+    if "sp_a4" not in st.session_state:
+        st.session_state.sp_a4 = SuperPrompt()
 
     if "super_prompt_text" not in st.session_state:
         st.session_state["super_prompt_text"] = ""
@@ -1753,11 +2195,17 @@ def init_session_state() -> None:
     if "use_reranking_colbert" not in st.session_state:
             st.session_state["use_reranking_colbert"] = False
 
-    if "a2_memory_demo_entries" not in st.session_state:
-        st.session_state["a2_memory_demo_entries"] = []
+    if "manual_memory_feed_text" not in st.session_state:
+        st.session_state["manual_memory_feed_text"] = ""
 
-    if "a2_memory_demo_counter" not in st.session_state:
-        st.session_state["a2_memory_demo_counter"] = 0
+    if "memory_title_required" not in st.session_state:
+        st.session_state["memory_title_required"] = False
+
+    if "pending_manual_memory_pair" not in st.session_state:
+        st.session_state["pending_manual_memory_pair"] = None
+
+    if "memory_title_input" not in st.session_state:
+        st.session_state["memory_title_input"] = ""
 
 
 def main() -> None:
@@ -1774,287 +2222,9 @@ def main() -> None:
 
     # Page layout
     render_page()
-    if st.session_state.pop("pending_a2_memory_refresh", False):
-       st.rerun()
 
 if __name__ == "__main__":
     main()
-```
-
-### ~\ragstream\app\ui_streamlit_demo.py
-```python
-# -*- coding: utf-8 -*-
-"""
-RAGstream - ui_streamlit.py (Version 1 GUI Shell)
-
-Purpose
--------
-Single-file Streamlit UI that:
-- Defines the overall 3-zone layout and routing.
-- Implements top-level controls (Send/Cancel, Progress, Status, Transparency).
-- Integrates with AppController if available; otherwise uses a safe stub.
-- Calls out to support views (ui_sections/*) if present; provides inline fallbacks if not.
-
-Notes
------
-- Plain text UI (no emojis/icons), compact and readable on a standard 1080p monitor.
-- Advanced panels (History, Transparency, Debug, External Replies) are tucked into tabs/accordions.
-- This file is intentionally self-contained to run without the support modules.
-"""
-
-from __future__ import annotations
-
-import os
-from typing import Any, Dict, Optional
-
-import streamlit as st
-
-# -----------------------------------------------------------------------------
-# Optional controller import (graceful fallback if backend is not wired yet)
-# -----------------------------------------------------------------------------
-try:
-    from .controller import AppController  # type: ignore
-except Exception:
-    class AppController:  # type: ignore
-        """Fallback controller to keep the UI runnable without backend."""
-        def __init__(self) -> None:
-            self.model = "gpt-4o"
-        def handle(self, user_prompt: str, named_files: list[str], exact_lock: bool) -> str:
-            return "[Controller stub] No backend yet. This is a placeholder response."
-        def estimate_cost(self, tokens: int) -> float:
-            return 0.0
-
-
-# -----------------------------------------------------------------------------
-# Optional support views (graceful fallbacks provided if imports fail)
-# The real app can place these under ragstream/app/ui_sections/*.py
-# -----------------------------------------------------------------------------
-def _fallback_prompt_area(state: Dict[str, Any]) -> None:
-    st.subheader("Prompt")
-    state["prompt_text"] = st.text_area("Enter your prompt", value=state.get("prompt_text", ""), height=140)
-    st.subheader("Super-Prompt Preview (optional)")
-    state["super_prompt"] = st.text_area("Preview (editable before send)", value=state.get("super_prompt", ""), height=120)
-
-def _fallback_model_agent_bar(state: Dict[str, Any]) -> None:
-    st.subheader("Model & Agent Controls")
-    state["model"] = st.selectbox("Model", options=["gpt-4o", "gpt-4o-mini", "ollama:llama3"], index=0)
-    cols = st.columns(5)
-    state["a1_on"] = cols[0].checkbox("A1", value=True)
-    state["a2_on"] = cols[1].checkbox("A2", value=True)
-    state["a3_on"] = cols[2].checkbox("A3", value=True)
-    state["a4_on"] = cols[3].checkbox("A4", value=True)
-    state["a5_on"] = cols[4].checkbox("A5", value=True)
-    st.caption("Cost estimate is shown before send when available.")
-
-def _fallback_file_eligibility(state: Dict[str, Any]) -> None:
-    st.subheader("Files & Eligibility")
-    st.caption("Per-file ON/OFF determines the Eligibility Pool for retrieval.")
-    state.setdefault("files", ["docs/Req.md", "docs/Arch.md", "notes/plan.txt"])
-    state.setdefault("files_on", {f: True for f in state["files"]})
-    for f in state["files"]:
-        state["files_on"][f] = st.checkbox(f"ON — {f}", value=state["files_on"].get(f, True), key=f"on_{f}")
-    state["exact_lock"] = st.checkbox("Exact File Lock (skip retrieval, inject ❖ FILES only)", value=False)
-    st.caption("Manifest is not wired yet in this fallback. Add ui_sections/file_eligibility.py to replace.")
-
-def _fallback_prompt_shaper(state: Dict[str, Any]) -> None:
-    with st.expander("Prompt Shaper (A2)"):
-        state["intent"] = st.text_input("Intent", value=state.get("intent", "explain"))
-        state["domain"] = st.text_input("Domain", value=state.get("domain", "software"))
-        st.text_area("Headers / Roles (advisory)", value=state.get("headers", "H"), height=80)
-
-def _fallback_history_panel(state: Dict[str, Any]) -> None:
-    st.subheader("History Controls")
-    state["history_k"] = st.slider("Recent turns (Layer-G, k)", 0, 10, state.get("history_k", 3))
-    state["layer_e_budget"] = st.number_input("Layer-E token budget", min_value=0, max_value=5000, value=state.get("layer_e_budget", 500), step=50)
-    state["mark_important"] = st.checkbox("Mark current turn important", value=state.get("mark_important", False))
-    state["persist_history"] = st.checkbox("Persist History (Layer-E) ON/OFF", value=state.get("persist_history", True))
-    if st.button("Clear Persisted Layer-E"):
-        state["history_cleared"] = True
-        st.success("Persisted Layer-E cleared (placeholder).")
-    st.file_uploader("Synonym list import (optional)", type=["txt", "csv", "json"], accept_multiple_files=False)
-
-def _fallback_external_reply_panel(state: Dict[str, Any]) -> None:
-    st.subheader("External Reply Import")
-    state["external_reply"] = st.text_area("Paste external LLM reply here", value=state.get("external_reply", ""), height=140)
-    if st.button("Send to History"):
-        st.success("External reply appended to history (placeholder).")
-
-def _fallback_transparency_panel(state: Dict[str, Any]) -> None:
-    st.subheader("Transparency")
-    st.caption("Kept/Dropped with reasons; ❖ FILES and S_ctx views.")
-    st.text_area("Kept/Dropped (reasons)", value=state.get("kept_dropped", ""), height=100)
-    st.text_area("❖ FILES (injected)", value=state.get("files_block", ""), height=100)
-    st.text_area("S_ctx (Facts / Constraints / Open Issues)", value=state.get("s_ctx", ""), height=120)
-
-def _fallback_output_panel(state: Dict[str, Any]) -> None:
-    st.subheader("Output")
-    st.text_area("Assistant Response", value=state.get("answer_text", ""), height=240)
-    cols = st.columns(2)
-    if cols[0].button("Export with citations"):
-        st.success("Exported (placeholder).")
-    state["show_transparency"] = cols[1].checkbox("Show Transparency", value=state.get("show_transparency", False))
-
-def _fallback_debug_panel(state: Dict[str, Any]) -> None:
-    st.subheader("Debug / Diagnostics")
-    state["debug_on"] = st.checkbox("Enable Debug Logger", value=state.get("debug_on", False))
-    st.text_input("Session ID", value=state.get("session_id", "sess-0001"))
-    st.text_area("Last Ingestion Stats", value=state.get("ingestion_stats", "files=0, chunks=0, bytes=0"), height=80)
-    if st.button("Snapshot Vector DB"):
-        st.info("Snapshot triggered (placeholder).")
-
-
-# Try to import the real support modules; if missing, keep fallbacks
-try:
-    from .ui_sections.prompt_area import render as render_prompt_area  # type: ignore
-except Exception:
-    render_prompt_area = _fallback_prompt_area  # type: ignore
-
-try:
-    from .ui_sections.model_agent_bar import render as render_model_agent_bar  # type: ignore
-except Exception:
-    render_model_agent_bar = _fallback_model_agent_bar  # type: ignore
-
-try:
-    from .ui_sections.file_eligibility import render as render_file_eligibility  # type: ignore
-except Exception:
-    render_file_eligibility = _fallback_file_eligibility  # type: ignore
-
-try:
-    from .ui_sections.prompt_shaper import render as render_prompt_shaper  # type: ignore
-except Exception:
-    render_prompt_shaper = _fallback_prompt_shaper  # type: ignore
-
-try:
-    from .ui_sections.history_panel import render as render_history_panel  # type: ignore
-except Exception:
-    render_history_panel = _fallback_history_panel  # type: ignore
-
-try:
-    from .ui_sections.external_reply_panel import render as render_external_reply_panel  # type: ignore
-except Exception:
-    render_external_reply_panel = _fallback_external_reply_panel  # type: ignore
-
-try:
-    from .ui_sections.transparency_panel import render as render_transparency_panel  # type: ignore
-except Exception:
-    render_transparency_panel = _fallback_transparency_panel  # type: ignore
-
-try:
-    from .ui_sections.output_panel import render as render_output_panel  # type: ignore
-except Exception:
-    render_output_panel = _fallback_output_panel  # type: ignore
-
-try:
-    from .ui_sections.debug_panel import render as render_debug_panel  # type: ignore
-except Exception:
-    render_debug_panel = _fallback_debug_panel  # type: ignore
-
-
-# -----------------------------------------------------------------------------
-# UI helper: status bar and progress markers
-# -----------------------------------------------------------------------------
-def _status_bar(state: Dict[str, Any]) -> None:
-    cols = st.columns(4)
-    cols[0].markdown(f"**Model:** {state.get('model', 'gpt-4o')}")
-    cols[1].markdown(f"**History:** {'Persist ON' if state.get('persist_history', True) else 'Persist OFF'}")
-    cols[2].markdown(f"**Latency:** {state.get('latency_ms', '—')} ms")
-    cols[3].markdown(f"**Cost Ceiling:** {state.get('cost_ceiling', '—')}")
-
-def _progress_strip(state: Dict[str, Any]) -> None:
-    st.caption("Stages: A0 FileScope • A1 DCI • A2 Shaper • Retrieval • Rerank • A3 NLI • A4 Condense • A5 Validate")
-
-
-# -----------------------------------------------------------------------------
-# Main UI class
-# -----------------------------------------------------------------------------
-class StreamlitUI:
-    def __init__(self) -> None:
-        if "state" not in st.session_state:
-            st.session_state["state"] = {}
-        self.state: Dict[str, Any] = st.session_state["state"]
-        self.ctrl = AppController()
-
-    def _send_clicked(self) -> None:
-        prompt = self.state.get("prompt_text", "").strip()
-        files_on = self.state.get("files_on", {})
-        named_files = [p for p, on in files_on.items() if on]
-        exact_lock = bool(self.state.get("exact_lock", False))
-
-        if not prompt:
-            st.warning("Please enter a prompt.")
-            return
-
-        # Pre-send cost gate (placeholder)
-        self.state["cost_estimate"] = self.ctrl.estimate_cost(tokens=len(prompt) // 4) if hasattr(self.ctrl, "estimate_cost") else 0.0
-        ceiling = self.state.get("cost_ceiling_value", None)
-        if ceiling is not None and self.state["cost_estimate"] > ceiling:
-            st.error("Cost ceiling exceeded. Adjust prompt or settings.")
-            return
-
-        # Call controller (or stub)
-        answer = self.ctrl.handle(prompt, named_files, exact_lock)
-        self.state["answer_text"] = answer
-
-    def _cancel_clicked(self) -> None:
-        st.info("Cancelled (placeholder).")
-
-    def render(self) -> None:
-        st.title("RAGstream")
-
-        # Status / Safety banners
-        _status_bar(self.state)
-        _progress_strip(self.state)
-
-        # Primary action bar
-        bar = st.columns([1, 1, 2, 2, 2])
-        if bar[0].button("Send"):
-            self._send_clicked()
-        if bar[1].button("Cancel/Retry"):
-            self._cancel_clicked()
-        self.state["cost_ceiling_value"] = bar[2].number_input("Cost ceiling (€)", min_value=0.0, value=float(self.state.get("cost_ceiling_value", 0.0)), step=0.10, help="Pre-send ceiling; set 0 to disable")
-        self.state["latency_ms"] = bar[3].text_input("Latency hint (ms)", value=str(self.state.get("latency_ms", "")))
-        self.state["transparency_toggle"] = bar[4].checkbox("Transparency ON/OFF", value=self.state.get("transparency_toggle", False))
-
-        # Three-column layout
-        left, center, right = st.columns([0.33, 0.47, 0.20])
-
-        with left:
-            render_prompt_area(self.state)
-            render_model_agent_bar(self.state)
-            render_file_eligibility(self.state)
-            render_prompt_shaper(self.state)
-
-        with center:
-            render_output_panel(self.state)
-
-        with right:
-            tabs = st.tabs(["History", "Transparency", "External", "Debug"])
-            with tabs[0]:
-                render_history_panel(self.state)
-            with tabs[1]:
-                if self.state.get("show_transparency") or self.state.get("transparency_toggle"):
-                    render_transparency_panel(self.state)
-                else:
-                    st.info("Transparency is OFF.")
-            with tabs[2]:
-                render_external_reply_panel(self.state)
-            with tabs[3]:
-                render_debug_panel(self.state)
-
-        # Escalation (Human-in-the-Loop) panel if present
-        if self.state.get("escalate", False):
-            st.error(f"Escalation: {self.state.get('escalate_reason', 'unspecified')}")
-            st.write("Suggested next steps: adjust eligibility, inject ❖ FILES, or retry.")
-
-# -----------------------------------------------------------------------------
-# Entrypoint
-# -----------------------------------------------------------------------------
-def run() -> None:
-    ui = StreamlitUI()
-    ui.render()
-
-if __name__ == "__main__":
-    run()
 ```
 
 
@@ -3977,6 +4147,7 @@ class AgentFactory:
 
 ### ~\ragstream\orchestration\agent_prompt.py
 ```python
+# ragstream/orchestration/agent_prompt.py
 # -*- coding: utf-8 -*-
 """
 AgentPrompt
@@ -4016,6 +4187,7 @@ from ragstream.orchestration.agent_prompt_helpers.compose_texts import (
     build_system_text,
     build_user_text_for_selector,
     build_user_text_for_classifier,
+    build_user_text_for_synthesizer,
 )
 
 
@@ -4049,15 +4221,17 @@ class AgentPrompt:
         model_name: str,
         temperature: float,
         max_output_tokens: int,
+        elements_order: Optional[List[str]] = None,
     ) -> None:
         self.agent_name: str = agent_name
         self.version: str = version
-        self.mode: str = mode  # "selector" | "classifier" | "writer" | "extractor" | "scorer"
+        self.mode: str = mode  # "selector" | "classifier" | "synthesizer" | "writer" | "extractor" | "scorer"
 
         self.static_prompt: Dict[str, Any] = static_prompt
         self.dynamic_bindings: List[Dict[str, Any]] = dynamic_bindings
         self.decision_targets: List[Dict[str, Any]] = decision_targets
         self.output_schema: Dict[str, Any] = output_schema
+        self.elements_order: List[str] = list(elements_order or [])
 
         self.enums: Dict[str, List[str]] = enums
         self.defaults: Dict[str, Any] = defaults
@@ -4071,13 +4245,13 @@ class AgentPrompt:
 
         self._result_keys: Dict[str, str] = build_result_key_map(output_schema)
         self._top_level_result_keys: Dict[str, str] = self._build_field_map(
-            output_schema.get("top_level_fields", []) or []
+            output_schema.get("top_level_fields", []) or output_schema.get("fields", []) or []
         )
         self._item_result_keys: Dict[str, str] = self._build_field_map(
             output_schema.get("item_fields", []) or []
         )
 
-        if self.mode not in ("selector", "classifier", "writer", "extractor", "scorer"):
+        if self.mode not in ("selector", "classifier", "synthesizer", "writer", "extractor", "scorer"):
             SimpleLogger.error(f"AgentPrompt[{self.agent_name}] unknown mode: {self.mode}")
 
     @staticmethod
@@ -4099,6 +4273,7 @@ class AgentPrompt:
         static_prompt = config.get("static_prompt", {}) or {}
         dynamic_bindings = config.get("dynamic_bindings", []) or []
         decision_targets = config.get("decision_targets", []) or []
+        elements_order = config.get("elements_order", []) or []
 
         if not static_prompt:
             prompt_profile = config.get("prompt_profile", {}) or {}
@@ -4144,6 +4319,7 @@ class AgentPrompt:
             model_name=model_name,
             temperature=temperature,
             max_output_tokens=max_tokens,
+            elements_order=elements_order,
         )
 
     @property
@@ -4163,7 +4339,7 @@ class AgentPrompt:
         Build SYSTEM + USER messages and the response_format for the LLM.
 
         Neutrality rule:
-        - SYSTEM text comes only from static_prompt.
+        - SYSTEM text comes from JSON-owned config sections handled by AgentPrompt.
         - USER text comes only from dynamic_bindings + runtime payload.
         """
         for binding in self.dynamic_bindings:
@@ -4175,45 +4351,62 @@ class AgentPrompt:
                     f"AgentPrompt[{self.agent_name}] missing required input binding: '{binding_id}'"
                 )
 
-        system_text = build_system_text(
-            static_prompt=self.static_prompt,
-            agent_name=self.agent_name,
-            version=self.version,
-        )
-
         if self.mode == "selector":
             if active_fields is None:
                 active_list: List[str] = list(self.enums.keys())
             else:
                 active_list = [field_id for field_id in active_fields if field_id in self.enums]
+        elif self.mode == "classifier":
+            if active_fields is None:
+                active_list = list(self.enums.keys())
+            else:
+                active_list = [field_id for field_id in active_fields if field_id in self.enums]
+        else:
+            active_list = []
 
+        system_text, system_consumed_binding_ids = build_system_text(
+            static_prompt=self.static_prompt,
+            agent_name=self.agent_name,
+            version=self.version,
+            decision_targets=self.decision_targets,
+            result_keys=self._result_keys,
+            enums=self.enums,
+            option_labels=self.option_labels,
+            option_descriptions=self.option_descriptions,
+            active_fields=active_list,
+            input_payload=input_payload,
+            dynamic_bindings=self.dynamic_bindings,
+            elements_order=self.elements_order,
+        )
+
+        if self.mode == "selector":
             user_text = build_user_text_for_selector(
                 input_payload=input_payload,
                 dynamic_bindings=self.dynamic_bindings,
-                decision_targets=self.decision_targets,
-                result_keys=self._result_keys,
-                active_fields=active_list,
+                consumed_binding_ids=system_consumed_binding_ids,
             )
-
         elif self.mode == "classifier":
             user_text = build_user_text_for_classifier(
                 input_payload=input_payload,
                 dynamic_bindings=self.dynamic_bindings,
-                decision_targets=self.decision_targets,
-                output_schema=self.output_schema,
-                top_level_result_keys=self._top_level_result_keys,
-                item_result_keys=self._item_result_keys,
+                consumed_binding_ids=system_consumed_binding_ids,
             )
-
+        elif self.mode == "synthesizer":
+            user_text = build_user_text_for_synthesizer(
+                input_payload=input_payload,
+                dynamic_bindings=self.dynamic_bindings,
+                consumed_binding_ids=system_consumed_binding_ids,
+            )
         else:
             raise AgentPromptValidationError(
-                f"AgentPrompt[{self.agent_name}] compose() currently only supports mode='selector' or mode='classifier'"
+                f"AgentPrompt[{self.agent_name}] compose() currently only supports "
+                f"mode='selector', mode='classifier', or mode='synthesizer'"
             )
 
-        messages = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
-        ]
+        messages = [{"role": "system", "content": system_text}]
+        if user_text.strip():
+            messages.append({"role": "user", "content": user_text})
+
         response_format = {"type": "json_object"}
 
         SimpleLogger.info(f"AgentPrompt[{self.agent_name}] SYSTEM prompt:")
@@ -4304,7 +4497,7 @@ class AgentPrompt:
                 if not chunk_id:
                     continue
 
-                item_result: Dict[str, Any] = {"chunk_id": chunk_id}
+                item_result: Dict[str, Any] = {item_id_key: chunk_id}
 
                 for field_id, allowed in self.enums.items():
                     result_key = self._item_result_keys.get(field_id, field_id)
@@ -4324,8 +4517,57 @@ class AgentPrompt:
             result[root_key] = normalized_items
             return result
 
+        if self.mode == "synthesizer":
+            result: Dict[str, Any] = {}
+
+            root_key = self.output_schema.get("root_key", "")
+            item_id_key = self.output_schema.get("item_id_key", "")
+
+            if root_key and self._item_result_keys:
+                raw_items = json_obj.get(root_key, []) or []
+                if not isinstance(raw_items, list):
+                    raw_items = []
+
+                normalized_items: List[Dict[str, Any]] = []
+                for raw_item in raw_items:
+                    if not isinstance(raw_item, dict):
+                        continue
+
+                    item_result: Dict[str, Any] = {}
+                    if item_id_key:
+                        raw_item_id = raw_item.get(item_id_key)
+                        if raw_item_id is None:
+                            continue
+                        item_result[item_id_key] = str(raw_item_id).strip()
+
+                    for field_id, result_key in self._item_result_keys.items():
+                        raw_value = raw_item.get(result_key, "")
+                        if raw_value is None:
+                            item_result[field_id] = ""
+                        elif isinstance(raw_value, str):
+                            item_result[field_id] = raw_value.strip()
+                        else:
+                            item_result[field_id] = str(raw_value).strip()
+
+                    normalized_items.append(item_result)
+
+                result[root_key] = normalized_items
+                return result
+
+            for field_id, result_key in self._top_level_result_keys.items():
+                raw_value = json_obj.get(result_key, "")
+                if raw_value is None:
+                    result[field_id] = ""
+                elif isinstance(raw_value, str):
+                    result[field_id] = raw_value.strip()
+                else:
+                    result[field_id] = str(raw_value).strip()
+
+            return result
+
         raise AgentPromptValidationError(
-            f"AgentPrompt[{self.agent_name}] parse() currently only supports mode='selector' or mode='classifier'"
+            f"AgentPrompt[{self.agent_name}] parse() currently only supports "
+            f"mode='selector', mode='classifier', or mode='synthesizer'"
         )
 ```
 
@@ -4339,19 +4581,35 @@ LLMClient — thin wrapper around an LLM provider.
 Current implementation:
 - Uses OpenAI Python client v1 (OpenAI() + client.chat.completions.create).
 - Reads OPENAI_API_KEY from environment (or optional api_key in __init__).
-- Supports optional JSON-mode: if response_format={"type": "json_object"},
-  it will attempt json.loads on the returned content and give you a dict.
+- Keeps backward compatibility for old callers:
+    * default return = raw content string
+- Supports optional metadata return for cache/token inspection:
+    * return_metadata=True -> {"content": "...", "usage": {...}}
+
+Added:
+- Responses API path for A4 / reasoning-model calls.
+- Metadata extraction for:
+    * model name
+    * status
+    * incomplete reason
+    * input tokens
+    * cached input tokens
+    * output tokens
+    * reasoning tokens
+
+CLI logging:
+- Always logs model name, total input tokens, cached input tokens, and output tokens
+  for both chat() and responses().
 """
 
 from __future__ import annotations
+
 from typing import Any, Dict, List, Optional, Union
 import os
-import json
 
 from ragstream.utils.logging import SimpleLogger
 
 try:
-    # New v1-style client
     from openai import OpenAI  # type: ignore[import]
 except ImportError:  # pragma: no cover - import guard
     OpenAI = None  # type: ignore[assignment]
@@ -4363,14 +4621,12 @@ class LLMClient:
     """
     Neutral LLM gateway.
 
-    You give it:
-      - messages: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
-      - model_name, temperature, max_output_tokens
-      - optional response_format (e.g. {"type": "json_object"})
+    Default behavior stays backward compatible:
+    - chat() returns raw content string
 
-    It returns:
-      - string (raw content) OR
-      - dict (if JSON-mode used and parsing succeeded)
+    Optional metadata:
+    - chat(..., return_metadata=True)
+    - responses(..., return_metadata=True)
     """
 
     def __init__(self, api_key: Optional[str] = None) -> None:
@@ -4391,7 +4647,6 @@ class LLMClient:
             return
 
         try:
-            # v1 client: hold a single instance
             self._client = OpenAI(api_key=key)
             SimpleLogger.info("LLMClient: OpenAI client initialised (v1 API).")
         except Exception as exc:
@@ -4399,42 +4654,303 @@ class LLMClient:
             self._client = None
 
     def chat(
-            self,
-            *,
-            messages,
-            model_name: str,
-            temperature: float,
-            max_output_tokens: int,
-            response_format: dict | None = None,
-    ):
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        model_name: str,
+        temperature: float,
+        max_output_tokens: int,
+        response_format: Dict[str, Any] | None = None,
+        return_metadata: bool = False,
+        prompt_cache_key: Optional[str] = None,
+        prompt_cache_retention: Optional[str] = None,
+    ) -> Union[str, JsonDict]:
         """
         Thin wrapper over OpenAI chat.completions.
 
+        Notes:
         - Uses max_completion_tokens (new API) instead of max_tokens.
-        - For gpt-5* reasoning models, we do NOT send temperature (it is unsupported).
+        - For gpt-5* reasoning models, temperature is omitted.
+        - Prompt caching for recent models is automatic on the provider side.
         """
         if self._client is None:
             raise RuntimeError("LLMClient: OpenAI client is not initialised")
 
-        # Base kwargs for the API call
-        kwargs: dict = {
+        kwargs: Dict[str, Any] = {
             "model": model_name,
             "messages": messages,
-            "max_completion_tokens": max_output_tokens,
+            "max_completion_tokens": int(max_output_tokens),
         }
 
         if response_format is not None:
             kwargs["response_format"] = response_format
 
-        # temperature is illegal for gpt-5* reasoning models, allowed for others
-        if temperature is not None and not model_name.startswith("gpt-5"):
-            kwargs["temperature"] = temperature
+        if temperature is not None and not str(model_name).startswith("gpt-5"):
+            kwargs["temperature"] = float(temperature)
+
+        if prompt_cache_key:
+            kwargs["prompt_cache_key"] = prompt_cache_key  # Added: stable cache-routing key per prompt family.
+
+      # if prompt_cache_retention:
+           # kwargs["prompt_cache_retention"] = prompt_cache_retention  # Added: explicit retention policy for prompt cache.
 
         resp = self._client.chat.completions.create(**kwargs)
-        # AgentPrompt.parse() expects the raw content (string or JSON-string)
-        content = resp.choices[0].message.content
-        return content if isinstance(content, str) else str(content or "")
 
+        content = resp.choices[0].message.content
+        content_text = content if isinstance(content, str) else str(content or "")
+
+        usage = self._extract_chat_usage(resp)
+        actual_model_name = str(getattr(resp, "model", "") or model_name)
+        self._log_chat_usage(actual_model_name, usage)
+
+        if not return_metadata:
+            return content_text
+
+        return {
+            "content": content_text,
+            "usage": usage,
+            "model_name": actual_model_name,
+            "status": "",
+            "incomplete_reason": "",
+        }
+
+    def responses(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        model_name: str,
+        max_output_tokens: int,
+        reasoning_effort: Optional[str] = None,
+        return_metadata: bool = False,
+        prompt_cache_key: Optional[str] = None,
+        prompt_cache_retention: Optional[str] = None,
+    ) -> Union[str, JsonDict]:
+        """
+        Responses API path used for A4 / reasoning-style calls.
+
+        Design:
+        - First SYSTEM message becomes `instructions`.
+        - Remaining messages are collapsed into one text input string.
+        - reasoning_effort is explicitly controlled here.
+
+        Important fix:
+        - If the composed prompt has no non-system message, Responses API still
+          requires `input`.
+        - In that case we move the instructions text into `input` and clear
+          `instructions`.
+        """
+        if self._client is None:
+            raise RuntimeError("LLMClient: OpenAI client is not initialised")
+
+        instructions = ""
+        input_parts: List[str] = []
+
+        for message in messages:
+            role = str(message.get("role", "") or "").strip().lower()
+            content = str(message.get("content", "") or "")
+
+            if role == "system" and not instructions:
+                instructions = content
+            else:
+                if content:
+                    input_parts.append(content)
+
+        input_text = "\n\n".join(part for part in input_parts if part).strip()
+
+        # Fix for "missing_required_parameter":
+        # if everything is inside the system message, move it into input.
+        if not input_text and instructions:
+            input_text = instructions
+            instructions = ""
+
+        kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "input": input_text,
+            "max_output_tokens": int(max_output_tokens),
+        }
+
+        if reasoning_effort is not None:
+            kwargs["reasoning"] = {"effort": reasoning_effort}
+
+        if instructions:
+            kwargs["instructions"] = instructions
+
+        if prompt_cache_key:
+            kwargs["prompt_cache_key"] = prompt_cache_key  # Added: stable cache-routing key per prompt family.
+
+       # if prompt_cache_retention:
+         #   kwargs["prompt_cache_retention"] = prompt_cache_retention  # Added: explicit retention policy for prompt cache.
+
+        resp = self._client.responses.create(**kwargs)
+
+        content_text = self._extract_response_text(resp)
+        usage = self._extract_response_usage(resp)
+        status = self._extract_response_status(resp)
+        incomplete_reason = self._extract_response_incomplete_reason(resp)
+        actual_model_name = str(getattr(resp, "model", "") or model_name)
+
+        self._log_response_usage(
+            actual_model_name=actual_model_name,
+            usage=usage,
+            status=status,
+            incomplete_reason=incomplete_reason,
+        )
+
+        if not return_metadata:
+            return content_text
+
+        return {
+            "content": content_text,
+            "usage": usage,
+            "model_name": actual_model_name,
+            "status": status,
+            "incomplete_reason": incomplete_reason,
+        }
+
+    @staticmethod
+    def _extract_chat_usage(resp: Any) -> JsonDict:
+        """
+        Extract token usage including cached tokens when the provider returns it.
+        """
+        usage_obj = getattr(resp, "usage", None)
+        if usage_obj is None:
+            return {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+            }
+
+        prompt_tokens = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage_obj, "completion_tokens", 0) or 0)
+        total_tokens = int(getattr(usage_obj, "total_tokens", 0) or 0)
+
+        prompt_tokens_details = getattr(usage_obj, "prompt_tokens_details", None)
+        cached_tokens = 0
+        if prompt_tokens_details is not None:
+            cached_tokens = int(getattr(prompt_tokens_details, "cached_tokens", 0) or 0)
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+        }
+
+    @staticmethod
+    def _extract_response_text(resp: Any) -> str:
+        """
+        Extract visible text from a Responses API object.
+        """
+        output_text = getattr(resp, "output_text", None)
+        if isinstance(output_text, str) and output_text:
+            return output_text
+
+        output = getattr(resp, "output", None)
+        if not isinstance(output, list):
+            return ""
+
+        parts: List[str] = []
+
+        for item in output:
+            item_type = str(getattr(item, "type", "") or "")
+            if item_type != "message":
+                continue
+
+            content_list = getattr(item, "content", None)
+            if not isinstance(content_list, list):
+                continue
+
+            for content_item in content_list:
+                content_type = str(getattr(content_item, "type", "") or "")
+                if content_type in ("output_text", "text"):
+                    text = getattr(content_item, "text", None)
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+
+        return "\n".join(parts).strip()
+
+    @staticmethod
+    def _extract_response_usage(resp: Any) -> JsonDict:
+        """
+        Extract token usage from a Responses API object.
+        """
+        usage_obj = getattr(resp, "usage", None)
+        if usage_obj is None:
+            return {
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+            }
+
+        input_tokens = int(getattr(usage_obj, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage_obj, "output_tokens", 0) or 0)
+        total_tokens = int(getattr(usage_obj, "total_tokens", 0) or 0)
+
+        input_tokens_details = getattr(usage_obj, "input_tokens_details", None)
+        cached_input_tokens = 0
+        if input_tokens_details is not None:
+            cached_input_tokens = int(getattr(input_tokens_details, "cached_tokens", 0) or 0)
+
+        output_tokens_details = getattr(usage_obj, "output_tokens_details", None)
+        reasoning_tokens = 0
+        if output_tokens_details is not None:
+            reasoning_tokens = int(getattr(output_tokens_details, "reasoning_tokens", 0) or 0)
+
+        return {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    @staticmethod
+    def _extract_response_status(resp: Any) -> str:
+        return str(getattr(resp, "status", "") or "")
+
+    @staticmethod
+    def _extract_response_incomplete_reason(resp: Any) -> str:
+        incomplete_details = getattr(resp, "incomplete_details", None)
+        if incomplete_details is None:
+            return ""
+        return str(getattr(incomplete_details, "reason", "") or "")
+
+    @staticmethod
+    def _log_chat_usage(actual_model_name: str, usage: JsonDict) -> None:
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        cached_tokens = int(usage.get("cached_tokens", 0) or 0)
+        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+
+        SimpleLogger.info(
+            f"LLMClient.chat | model={actual_model_name} | "
+            f"input={prompt_tokens} | cached_input={cached_tokens} | output={completion_tokens}"
+        )
+
+    @staticmethod
+    def _log_response_usage(
+        *,
+        actual_model_name: str,
+        usage: JsonDict,
+        status: str,
+        incomplete_reason: str,
+    ) -> None:
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        cached_input_tokens = int(usage.get("cached_input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+
+        SimpleLogger.info(
+            f"LLMClient.responses | model={actual_model_name} | "
+            f"input={input_tokens} | cached_input={cached_input_tokens} | output={output_tokens}"
+        )
+
+        if status:
+            SimpleLogger.info(f"LLMClient.responses | status={status}")
+
+        if incomplete_reason:
+            SimpleLogger.warning(f"LLMClient.responses | incomplete_reason={incomplete_reason}")
 ```
 
 ### ~\ragstream\orchestration\prompt_builder.py
@@ -4681,15 +5197,12 @@ class SuperPromptProjector:
         if self.sp.Prompt_MD:
             parts.append(self.sp.Prompt_MD)
 
-        if self.sp.S_CTX_MD:
-            parts.append(self.sp.S_CTX_MD)
+        retrieved_context_md = self._render_retrieved_context_md()
+        if retrieved_context_md:
+            parts.append(retrieved_context_md)
 
         if self.sp.Attachments_MD:
             parts.append(self.sp.Attachments_MD)
-        else:
-            related_context_md = self._render_related_context_md()
-            if related_context_md:
-                parts.append(related_context_md)
 
         self.sp.prompt_ready = "\n\n".join(parts).strip()
         return self.sp.prompt_ready
@@ -4702,10 +5215,13 @@ class SuperPromptProjector:
         audience_value = (self.sp.body.get("audience") or "").strip()
         tone_value = (self.sp.body.get("tone") or "").strip()
         depth_value = (self.sp.body.get("depth") or "").strip()
+        confidence_value = (self.sp.body.get("confidence") or "").strip()
 
+        lines.append("## System")
         if system_value:
-            lines.append("## System")
             lines.append(system_value)
+        else:
+            lines.append("")
 
         config_lines: List[str] = []
 
@@ -4717,12 +5233,12 @@ class SuperPromptProjector:
             config_lines.append(f"- Tone: {tone_value}")
         if depth_value:
             config_lines.append(f"- Depth: {depth_value}")
+        if confidence_value:
+            config_lines.append(f"- Confidence: {confidence_value}")
 
-        if config_lines:
-            if lines:
-                lines.append("")
-            lines.append("## Configuration")
-            lines.extend(config_lines)
+        lines.append("")
+        lines.append("## Configuration")
+        lines.extend(config_lines)
 
         return "\n".join(lines).strip()
 
@@ -4735,43 +5251,75 @@ class SuperPromptProjector:
         format_value = (self.sp.body.get("format") or "").strip()
         text_value = (self.sp.body.get("text") or "").strip()
 
-        if task_value:
-            lines.append("## Task")
-            lines.append(task_value)
-            lines.append("")
+        lines.append("## User")
+        lines.append("")
+
+        lines.append("### Task")
+        lines.append(task_value)
+        lines.append("")
 
         if purpose_value:
-            lines.append("## Purpose")
+            lines.append("### Purpose")
             lines.append(purpose_value)
             lines.append("")
 
         if context_value:
-            lines.append("## Context")
+            lines.append("### Context")
             lines.append(context_value)
             lines.append("")
 
         if format_value:
-            lines.append("## Format")
+            lines.append("### Format")
             lines.append(format_value)
             lines.append("")
 
         if text_value:
-            lines.append("## Text")
+            lines.append("### Text")
             lines.append(text_value)
             lines.append("")
 
         return "\n".join(lines).strip()
 
-    def _format_score(self, score: float) -> str:
-        return f"{float(score):.8f}".rstrip("0").rstrip(".")
-
-    def _render_related_context_md(self) -> str:
+    def _render_retrieved_context_md(self) -> str:
         """
-        Render a chunk-based context preview from the current selected chunks.
+        Render retrieved/condensed context for GUI-visible SuperPrompt preview.
 
-        During A3, show:
-            selection_band at block level
-            usefulness judgment per chunk
+        This is intentionally neutral and reusable:
+        - A4 only produces S_CTX_MD.
+        - This projector decides how S_CTX_MD is displayed.
+        - Later PromptBuilder can reuse the same structure.
+        """
+        lines: List[str] = []
+
+        lines.append("## Retrieved Context")
+        lines.append("")
+
+        lines.append("### Retrieved Context Summary")
+        lines.append(
+            "The following summary is retrieved from selected project files or memory. "
+            "It is supporting context for the task, not part of the task itself."
+        )
+        lines.append("")
+
+        summary_text = (self.sp.S_CTX_MD or "").strip()
+        if summary_text:
+            lines.append(summary_text)
+        lines.append("")
+
+        lines.append("### Raw Retrieved Evidence")
+        raw_evidence_md = self._render_raw_retrieved_evidence_md()
+        if raw_evidence_md:
+            lines.append(raw_evidence_md)
+
+        return "\n".join(lines).strip()
+
+    def _render_raw_retrieved_evidence_md(self) -> str:
+        """
+        Render raw retrieved chunks as nested evidence.
+
+        Important:
+        Source Markdown headings inside chunks are converted to [H1]/[H2]/[H3]
+        so they do not compete with the visible SuperPrompt structure.
         """
         ordered_chunks = self._get_ordered_context_chunks()
         if not ordered_chunks:
@@ -4795,72 +5343,147 @@ class SuperPromptProjector:
         selection_band = str(self.sp.extras.get("a3_selection_band", "") or "").strip()
 
         lines: List[str] = []
-        lines.append("## Related Context")
-        lines.append("")
+        lines.append("<retrieved_chunks>")
 
         if self.sp.stage == "a3" and selection_band:
-            lines.append(f"Selection band: {selection_band}")
-            lines.append("")
+            lines.append(f'  <selection_band>{selection_band}</selection_band>')
 
         chunk_counter = 1
         for chunk_obj in ordered_chunks:
-            header = f"### Chunk {chunk_counter}"
+            attributes: List[str] = [
+                f'index="{chunk_counter}"',
+                f'chunk_id="{self._escape_attr(str(chunk_obj.id))}"',
+            ]
 
-            emb_score = self._get_meta_float(chunk_obj.meta, "emb_score")
-            splade_score = self._get_meta_float(chunk_obj.meta, "splade_score")
+            source_value = ""
+            meta = getattr(chunk_obj, "meta", None)
+            if isinstance(meta, dict):
+                source_value = str(meta.get("source") or meta.get("path") or meta.get("file") or "").strip()
+            if source_value:
+                attributes.append(f'source="{self._escape_attr(source_value)}"')
 
-            if self.sp.stage == "retrieval":
-                score_parts: List[str] = []
+            score_label = self._build_chunk_score_label(
+                chunk_obj=chunk_obj,
+                retrieval_score_map=retrieval_score_map,
+                reranked_score_map=reranked_score_map,
+                a3_decision_map=a3_decision_map,
+            )
+            if score_label:
+                attributes.append(f'info="{self._escape_attr(score_label)}"')
 
-                rt_score = retrieval_score_map.get(chunk_obj.id)
-                if rt_score is not None:
-                    score_parts.append(f"Rt={self._format_score(rt_score)}")
-                if emb_score is not None:
-                    score_parts.append(f"Emb={self._format_score(emb_score)}")
-                if splade_score is not None:
-                    score_parts.append(f"Splade={self._format_score(splade_score)}")
+            lines.append(f"  <chunk {' '.join(attributes)}>")
+            lines.append("    <chunk_text>")
 
-                if score_parts:
-                    header = f"{header} [{', '.join(score_parts)}]"
+            snippet = self._sanitize_chunk_text(chunk_obj.snippet.strip())
+            if snippet:
+                for snippet_line in snippet.splitlines():
+                    lines.append(f"      {snippet_line}")
 
-            elif self.sp.stage == "reranked":
-                score_parts = []
-
-                rnk_score = reranked_score_map.get(chunk_obj.id)
-                if rnk_score is None:
-                    rnk_score = self._get_meta_float(chunk_obj.meta, "rerank_rrf_score")
-
-                rcolb_score = self._get_meta_float(chunk_obj.meta, "colbert_score")
-
-                rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_rrf_score")
-                if rt_score is None:
-                    rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_score")
-                if rt_score is None:
-                    rt_score = retrieval_score_map.get(chunk_obj.id)
-
-                if rnk_score is not None:
-                    score_parts.append(f"Rnk={self._format_score(rnk_score)}")
-                if rcolb_score is not None:
-                    score_parts.append(f"RcolB={self._format_score(rcolb_score)}")
-                if rt_score is not None:
-                    score_parts.append(f"Rt={self._format_score(rt_score)}")
-
-                if score_parts:
-                    header = f"{header} [{', '.join(score_parts)}]"
-
-            elif self.sp.stage == "a3":
-                decision = a3_decision_map.get(chunk_obj.id, {})
-                usefulness = str(decision.get("usefulness_label", "") or "").strip()
-                if usefulness:
-                    header = f"{header} [Use={usefulness}]"
-
-            lines.append(header)
-            lines.append("")
-            lines.append(chunk_obj.snippet.strip())
-            lines.append("")
+            lines.append("    </chunk_text>")
+            lines.append("  </chunk>")
             chunk_counter += 1
 
+        lines.append("</retrieved_chunks>")
+
         return "\n".join(lines).strip()
+
+    def _build_chunk_score_label(
+        self,
+        *,
+        chunk_obj: Any,
+        retrieval_score_map: Dict[str, float],
+        reranked_score_map: Dict[str, float],
+        a3_decision_map: Dict[str, Dict[str, Any]],
+    ) -> str:
+        score_parts: List[str] = []
+
+        emb_score = self._get_meta_float(chunk_obj.meta, "emb_score")
+        splade_score = self._get_meta_float(chunk_obj.meta, "splade_score")
+
+        if self.sp.stage == "retrieval":
+            rt_score = retrieval_score_map.get(chunk_obj.id)
+            if rt_score is not None:
+                score_parts.append(f"Rt={self._format_score(rt_score)}")
+            if emb_score is not None:
+                score_parts.append(f"Emb={self._format_score(emb_score)}")
+            if splade_score is not None:
+                score_parts.append(f"Splade={self._format_score(splade_score)}")
+
+        elif self.sp.stage == "reranked":
+            rnk_score = reranked_score_map.get(chunk_obj.id)
+            if rnk_score is None:
+                rnk_score = self._get_meta_float(chunk_obj.meta, "rerank_rrf_score")
+
+            rcolb_score = self._get_meta_float(chunk_obj.meta, "colbert_score")
+
+            rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_rrf_score")
+            if rt_score is None:
+                rt_score = self._get_meta_float(chunk_obj.meta, "retrieval_score")
+            if rt_score is None:
+                rt_score = retrieval_score_map.get(chunk_obj.id)
+
+            if rnk_score is not None:
+                score_parts.append(f"Rnk={self._format_score(rnk_score)}")
+            if rcolb_score is not None:
+                score_parts.append(f"RcolB={self._format_score(rcolb_score)}")
+            if rt_score is not None:
+                score_parts.append(f"Rt={self._format_score(rt_score)}")
+
+        elif self.sp.stage == "a3":
+            decision = a3_decision_map.get(chunk_obj.id, {})
+            usefulness = str(decision.get("usefulness_label", "") or "").strip()
+            if usefulness:
+                score_parts.append(f"Use={usefulness}")
+
+        return ", ".join(score_parts).strip()
+
+    @staticmethod
+    def _sanitize_chunk_text(text: str) -> str:
+        """
+        Prevent source Markdown headings from becoming real prompt headings.
+        """
+        if not text:
+            return ""
+
+        sanitized_lines: List[str] = []
+
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            indent = line[: len(line) - len(stripped)]
+
+            if stripped.startswith("### "):
+                sanitized_lines.append(f"{indent}[H3] {stripped[4:].strip()}")
+            elif stripped.startswith("## "):
+                sanitized_lines.append(f"{indent}[H2] {stripped[3:].strip()}")
+            elif stripped.startswith("# "):
+                sanitized_lines.append(f"{indent}[H1] {stripped[2:].strip()}")
+            else:
+                sanitized_lines.append(line)
+
+        return "\n".join(sanitized_lines).strip()
+
+    @staticmethod
+    def _escape_attr(value: str) -> str:
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace('"', "&quot;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    def _format_score(self, score: float) -> str:
+        return f"{float(score):.8f}".rstrip("0").rstrip(".")
+
+    def _render_related_context_md(self) -> str:
+        """
+        Backward-compatible wrapper.
+
+        Older callers may still refer to _render_related_context_md().
+        The visible GUI format now uses Raw Retrieved Evidence instead of
+        the older Related Context block.
+        """
+        return self._render_raw_retrieved_evidence_md()
 
     @staticmethod
     def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:
@@ -4914,6 +5537,7 @@ class SuperPromptProjector:
 
 ### ~\ragstream\orchestration\agent_prompt_helpers\compose_texts.py
 ```python
+# ragstream/orchestration/agent_prompt_helpers/compose_texts.py
 # -*- coding: utf-8 -*-
 """
 compose_texts
@@ -4929,7 +5553,7 @@ Rule:
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 def _stringify_for_prompt(value: Any) -> str:
@@ -4948,58 +5572,196 @@ def _stringify_for_prompt(value: Any) -> str:
     return str(value)
 
 
+def _build_decision_targets_system_text(
+    decision_targets: List[Dict[str, Any]],
+    result_keys: Dict[str, str],
+    enums: Dict[str, List[str]],
+    option_labels: Dict[str, Dict[str, str]],
+    option_descriptions: Dict[str, Dict[str, str]],
+    active_fields: Optional[List[str]] = None,
+) -> str:
+    lines: List[str] = []
+
+    if active_fields is None:
+        active_set = None
+    else:
+        active_set = set(active_fields)
+
+    for target in decision_targets or []:
+        field_id = target.get("id")
+        if not field_id:
+            continue
+        if active_set is not None and field_id not in active_set:
+            continue
+
+        label = target.get("label", field_id)
+        result_key = result_keys.get(field_id, field_id)
+
+        min_selected = int(target.get("min_selected", 1))
+        max_selected = int(target.get("max_selected", 1))
+
+        lines.append(f"Field '{label}' (JSON key: '{result_key}')")
+
+        if max_selected > 1:
+            lines.append(f"- Select between {min_selected} and {max_selected} option ids.")
+        else:
+            lines.append("- Select exactly one option id.")
+
+        for opt_id in enums.get(field_id, []):
+            opt_label = (option_labels.get(field_id, {}).get(opt_id) or "").strip()
+            opt_desc = (option_descriptions.get(field_id, {}).get(opt_id) or "").strip()
+
+            if opt_label and opt_desc:
+                lines.append(f"  * {opt_id}: {opt_label} — {opt_desc}")
+            elif opt_label:
+                lines.append(f"  * {opt_id}: {opt_label}")
+            elif opt_desc:
+                lines.append(f"  * {opt_id}: {opt_desc}")
+            else:
+                lines.append(f"  * {opt_id}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 def build_system_text(
     static_prompt: Dict[str, Any],
     agent_name: str,
     version: str,
-) -> str:
+    decision_targets: Optional[List[Dict[str, Any]]] = None,
+    result_keys: Optional[Dict[str, str]] = None,
+    enums: Optional[Dict[str, List[str]]] = None,
+    option_labels: Optional[Dict[str, Dict[str, str]]] = None,
+    option_descriptions: Optional[Dict[str, Dict[str, str]]] = None,
+    active_fields: Optional[List[str]] = None,
+    input_payload: Optional[Dict[str, Any]] = None,
+    dynamic_bindings: Optional[List[Dict[str, Any]]] = None,
+    elements_order: Optional[List[str]] = None,
+) -> Tuple[str, Set[str]]:
     """
     Build the SYSTEM message content for the LLM.
 
-    Neutral rule:
-    - static_prompt is treated as dump-only content.
-    - No agent-specific wording is invented here.
-    - If key == 'preamble', render the text without a heading.
-    - Otherwise use the JSON key itself as the heading label.
+    Important A4-compatible rule:
+    - preamble is always first if present,
+    - elements_order may then inject selected dynamic bindings directly into SYSTEM,
+    - any dynamic binding moved into SYSTEM is removed from USER,
+    - old behavior remains when elements_order is absent.
     """
-    lines: List[str] = []
+    input_payload = input_payload or {}
+    dynamic_bindings = dynamic_bindings or []
+    elements_order = elements_order or []
 
-    for key, value in static_prompt.items():
-        text = _stringify_for_prompt(value)
-        if not text:
+    lines: List[str] = []
+    consumed_binding_ids: Set[str] = set()
+
+    preamble_text = _stringify_for_prompt(static_prompt.get("preamble", ""))
+    if preamble_text:
+        lines.append(preamble_text)
+        lines.append("")
+
+    remaining_static_keys = [key for key in static_prompt.keys() if str(key).strip().lower() != "preamble"]
+    binding_by_id: Dict[str, Dict[str, Any]] = {
+        str(binding.get("id", "")).strip(): binding
+        for binding in dynamic_bindings
+        if str(binding.get("id", "")).strip()
+    }
+
+    decision_targets_text = _build_decision_targets_system_text(
+        decision_targets=decision_targets or [],
+        result_keys=result_keys or {},
+        enums=enums or {},
+        option_labels=option_labels or {},
+        option_descriptions=option_descriptions or {},
+        active_fields=active_fields,
+    )
+
+    rendered_static_keys: Set[str] = set()
+    rendered_config_decision_targets = False
+
+    # New optional ordered render path.
+    for raw_item in elements_order:
+        item = str(raw_item or "").strip()
+        if not item:
             continue
 
-        if str(key).strip().lower() == "preamble":
-            lines.append(text)
-            lines.append("")
-        else:
-            lines.append(f"## {key}")
-            lines.append(text)
-            lines.append("")
+        normalized_item = item[3:] if item.lower().startswith("id:") else item
 
-    return "\n".join(lines).strip()
+        if normalized_item in binding_by_id:
+            binding = binding_by_id[normalized_item]
+            if binding.get("visible_in_prompt", True):
+                prompt_text = (binding.get("prompt_text") or "").strip()
+                if prompt_text:
+                    lines.append(prompt_text)
+
+                rendered = _stringify_for_prompt(input_payload.get(normalized_item, ""))
+                if rendered:
+                    lines.append(rendered)
+
+                lines.append("")
+            consumed_binding_ids.add(normalized_item)
+            continue
+
+        if normalized_item == "decision_targets":
+            runtime_rendered = _stringify_for_prompt(input_payload.get("decision_targets", ""))
+            if runtime_rendered:
+                lines.append("## Decision Targets")
+                lines.append(runtime_rendered)
+                lines.append("")
+                consumed_binding_ids.add("decision_targets")
+            elif decision_targets_text and not rendered_config_decision_targets:
+                lines.append("## Decision Targets")
+                lines.append(decision_targets_text)
+                lines.append("")
+                rendered_config_decision_targets = True
+            continue
+
+        for static_key in remaining_static_keys:
+            if static_key == normalized_item and static_key not in rendered_static_keys:
+                text = _stringify_for_prompt(static_prompt.get(static_key, ""))
+                if text:
+                    lines.append(f"## {static_key}")
+                    lines.append(text)
+                    lines.append("")
+                rendered_static_keys.add(static_key)
+                break
+
+    # Backward-compatible default remainder for static prompt keys.
+    for static_key in remaining_static_keys:
+        if static_key in rendered_static_keys:
+            continue
+        text = _stringify_for_prompt(static_prompt.get(static_key, ""))
+        if not text:
+            continue
+        lines.append(f"## {static_key}")
+        lines.append(text)
+        lines.append("")
+
+    # Backward-compatible default remainder for config-owned decision targets.
+    if decision_targets_text and not rendered_config_decision_targets:
+        lines.append("## Decision Targets")
+        lines.append(decision_targets_text)
+        lines.append("")
+
+    return "\n".join(lines).strip(), consumed_binding_ids
 
 
 def _build_user_text_from_dynamic_bindings(
     input_payload: Dict[str, Any],
     dynamic_bindings: List[Dict[str, Any]],
+    consumed_binding_ids: Optional[Set[str]] = None,
 ) -> str:
-    """
-    Generic neutral renderer for USER content from dynamic bindings.
-
-    Rule:
-    - prompt_text is rendered exactly as provided by JSON.
-    - payload values are rendered exactly as provided by the agent.
-    - no extra visible wording is added here.
-    """
     lines: List[str] = []
+    consumed_binding_ids = consumed_binding_ids or set()
 
     for binding in dynamic_bindings:
         if not binding.get("visible_in_prompt", True):
             continue
 
-        binding_id = binding.get("id")
+        binding_id = str(binding.get("id", "") or "").strip()
         if not binding_id:
+            continue
+        if binding_id in consumed_binding_ids:
             continue
 
         prompt_text = (binding.get("prompt_text") or "").strip()
@@ -5020,37 +5782,36 @@ def _build_user_text_from_dynamic_bindings(
 def build_user_text_for_selector(
     input_payload: Dict[str, Any],
     dynamic_bindings: List[Dict[str, Any]],
-    decision_targets: List[Dict[str, Any]],
-    result_keys: Dict[str, str],
-    active_fields: List[str],
+    consumed_binding_ids: Optional[Set[str]] = None,
 ) -> str:
-    """
-    Neutral USER renderer for selector agents.
-
-    All visible wording must already exist in JSON or in agent-prepared runtime text.
-    """
     return _build_user_text_from_dynamic_bindings(
         input_payload=input_payload,
         dynamic_bindings=dynamic_bindings,
+        consumed_binding_ids=consumed_binding_ids,
     )
 
 
 def build_user_text_for_classifier(
     input_payload: Dict[str, Any],
     dynamic_bindings: List[Dict[str, Any]],
-    decision_targets: List[Dict[str, Any]],
-    output_schema: Dict[str, Any],
-    top_level_result_keys: Dict[str, str],
-    item_result_keys: Dict[str, str],
+    consumed_binding_ids: Optional[Set[str]] = None,
 ) -> str:
-    """
-    Neutral USER renderer for classifier agents.
-
-    All visible wording must already exist in JSON or in agent-prepared runtime text.
-    """
     return _build_user_text_from_dynamic_bindings(
         input_payload=input_payload,
         dynamic_bindings=dynamic_bindings,
+        consumed_binding_ids=consumed_binding_ids,
+    )
+
+
+def build_user_text_for_synthesizer(
+    input_payload: Dict[str, Any],
+    dynamic_bindings: List[Dict[str, Any]],
+    consumed_binding_ids: Optional[Set[str]] = None,
+) -> str:
+    return _build_user_text_from_dynamic_bindings(
+        input_payload=input_payload,
+        dynamic_bindings=dynamic_bindings,
+        consumed_binding_ids=consumed_binding_ids,
     )
 ```
 
@@ -7031,29 +7792,722 @@ def split_query_into_pieces(
 
 ## /home/rusbeh_ab/project/RAGstream/ragstream/memory
 
-### ~\ragstream\memory\conversation_memory.py
+### ~\ragstream\memory\memory_actions.py
 ```python
+# ragstream/memory/memory_actions.py
+# -*- coding: utf-8 -*-
 """
-ConversationMemory (read-only)
-==============================
-Two-layer history:
-- Layer-G: recency window (last k turns), always available.
-- Layer-E: episodic store with metadata (on-topic, soft fading).
-Not part of the document store; no embeddings/retrieval.
+Memory actions
+==============
+Reusable workflow functions for memory capture.
+
+GUI buttons, future LLM calls, Copilot calls, or tool results should call
+these functions instead of embedding memory logic directly in UI callbacks.
 """
-from typing import List, Tuple
 
-class ConversationMemory:
-    def __init__(self, k_default: int = 5) -> None:
-        self.k_default = k_default
-        self.soft_fading = True
-        self.conflict_policy = "FILES>newer>older"
+from __future__ import annotations
 
-    def get_recent(self, k: int | None = None) -> List[Tuple[str, str]]:
-        return []
+from typing import Any
 
-    def get_episodic(self) -> List[Tuple[str, str]]:
-        return []
+from ragstream.memory.memory_manager import MemoryManager
+
+
+def capture_memory_pair(
+    memory_manager: MemoryManager,
+    input_text: str,
+    output_text: str,
+    source: str,
+    active_project_name: str | None = None,
+    embedded_files_snapshot: list[str] | None = None,
+    parent_id: str | None = None,
+    user_keywords: list[str] | None = None,
+    gui_records_state: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    clean_input = (input_text or "").strip()
+    clean_output = (output_text or "").strip()
+
+    if not clean_input:
+        return {
+            "success": False,
+            "message": "Prompt is empty. No memory record was created.",
+            "record": None,
+        }
+
+    if not clean_output:
+        return {
+            "success": False,
+            "message": "Manual memory response is empty. No memory record was created.",
+            "record": None,
+        }
+
+    memory_manager.sync_gui_edits(gui_records_state or [])
+
+    record = memory_manager.capture_pair(
+        input_text=clean_input,
+        output_text=clean_output,
+        source=source,
+        parent_id=parent_id,
+        user_keywords=user_keywords,
+        active_project_name=active_project_name,
+        embedded_files_snapshot=embedded_files_snapshot or [],
+    )
+
+    return {
+        "success": True,
+        "message": f"Memory record saved: {record.record_id}",
+        "record": record,
+        "record_id": record.record_id,
+        "file_id": memory_manager.file_id,
+        "filename_ragmem": memory_manager.filename_ragmem,
+    }
+```
+
+### ~\ragstream\memory\memory_manager.py
+```python
+# ragstream/memory/memory_manager.py
+# -*- coding: utf-8 -*-
+"""
+MemoryManager
+=============
+Owns one active memory history file, its MemoryRecords, MetaInfo,
+.ragmem persistence, .ragmeta.json persistence, and SQLite indexing.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import uuid
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from ragstream.memory.memory_record import (
+    MemoryRecord,
+    RECORD_END,
+    RECORD_START,
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _filename_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d-%H-%M")
+
+
+def _safe_title(title: str) -> str:
+    value = (title or "").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-._")
+    return value or "Untitled"
+
+
+def _unique(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        item = str(value).strip()
+        if not item:
+            continue
+
+        key = item.lower()
+        if key in seen:
+            continue
+
+        result.append(item)
+        seen.add(key)
+
+    return result
+
+
+class MemoryManager:
+    def __init__(
+        self,
+        memory_root: Path,
+        sqlite_path: Path,
+        title: str = "",
+    ) -> None:
+        self.file_id: str = uuid.uuid4().hex
+        self.title: str = ""
+        self.filename_ragmem: str = ""
+        self.filename_meta: str = ""
+
+        self.memory_root: Path = Path(memory_root)
+        self.sqlite_path: Path = Path(sqlite_path)
+
+        self.records: list[MemoryRecord] = []
+        self.metainfo: dict[str, Any] = {}
+
+        self.tag_catalog: list[str] = ["Gold", "Silver", "Red", "Green", "Black"]
+        self.b_file_created: bool = False
+
+        self.memory_root.mkdir(parents=True, exist_ok=True)
+        self.files_root.mkdir(parents=True, exist_ok=True)
+        self._init_sqlite()
+
+        if title.strip():
+            self.start_new_history(title)
+
+    @property
+    def files_root(self) -> Path:
+        return self.memory_root / "files"
+
+    @property
+    def ragmem_path(self) -> Path:
+        return self.files_root / self.filename_ragmem
+
+    @property
+    def meta_path(self) -> Path:
+        return self.files_root / self.filename_meta
+
+    def start_new_history(self, title: str) -> None:
+        clean_title = (title or "").strip()
+        if not clean_title:
+            raise ValueError("Memory title must not be empty.")
+
+        self.file_id = uuid.uuid4().hex
+        self.title = clean_title
+        self.records = []
+        self.metainfo = {}
+        self.b_file_created = False
+
+        stem = f"{_filename_timestamp()}-{_safe_title(clean_title)}"
+        filename_ragmem = f"{stem}.ragmem"
+        filename_meta = f"{stem}.ragmeta.json"
+
+        if (self.files_root / filename_ragmem).exists():
+            stem = f"{stem}-{self.file_id[:8]}"
+            filename_ragmem = f"{stem}.ragmem"
+            filename_meta = f"{stem}.ragmeta.json"
+
+        self.filename_ragmem = filename_ragmem
+        self.filename_meta = filename_meta
+
+    def load_history(self, file_id: str) -> None:
+        file_row = self._lookup_file(file_id)
+        if not file_row:
+            raise ValueError(f"Memory history not found: {file_id}")
+
+        self.file_id = file_row["file_id"]
+        self.title = file_row["title"]
+        self.filename_ragmem = file_row["filename_ragmem"]
+        self.filename_meta = file_row["filename_meta"]
+
+        self.records = self._read_ragmem_records(self.ragmem_path)
+        self.b_file_created = self.ragmem_path.exists()
+
+        if self.meta_path.exists():
+            with self.meta_path.open("r", encoding="utf-8") as f:
+                loaded_meta = json.load(f)
+            self.metainfo = loaded_meta if isinstance(loaded_meta, dict) else {}
+        else:
+            self.save_metainfo()
+
+        self.refresh_sqlite_index()
+
+    def list_histories(self) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT file_id, title, filename_ragmem, filename_meta,
+                       created_at_utc, updated_at_utc, record_count
+                FROM memory_files
+                ORDER BY updated_at_utc DESC
+                """
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def capture_pair(
+        self,
+        input_text: str,
+        output_text: str,
+        source: str,
+        parent_id: str | None = None,
+        user_keywords: list[str] | None = None,
+        active_project_name: str | None = None,
+        embedded_files_snapshot: list[str] | None = None,
+    ) -> MemoryRecord:
+        if not self.title.strip():
+            raise ValueError("Memory title is required before the first memory record is saved.")
+
+        record = MemoryRecord(
+            input_text=input_text,
+            output_text=output_text,
+            source=source,
+            parent_id=parent_id,
+            tag="Green",
+            user_keywords=user_keywords,
+            active_project_name=active_project_name,
+            embedded_files_snapshot=embedded_files_snapshot,
+        )
+
+        self.records.append(record)
+        self._append_record_to_ragmem(record)
+        self.save_metainfo()
+        self.refresh_sqlite_index()
+
+        return record
+
+    def sync_gui_edits(
+        self,
+        gui_records_state: list[dict[str, Any]],
+    ) -> None:
+        if not gui_records_state:
+            return
+
+        records_by_id = {record.record_id: record for record in self.records}
+
+        for item in gui_records_state:
+            record_id = str(item.get("record_id", "")).strip()
+            if not record_id or record_id not in records_by_id:
+                continue
+
+            tag = item.get("tag")
+            if tag is not None:
+                tag = str(tag).strip()
+                if tag not in self.tag_catalog:
+                    tag = None
+
+            user_keywords = item.get("user_keywords")
+            if user_keywords is not None and not isinstance(user_keywords, list):
+                user_keywords = []
+
+            records_by_id[record_id].update_editable_metadata(
+                tag=tag,
+                user_keywords=user_keywords,
+            )
+
+    def save_metainfo(self) -> None:
+        self.metainfo = self._build_metainfo()
+
+        if not self.filename_meta:
+            return
+
+        self.files_root.mkdir(parents=True, exist_ok=True)
+        with self.meta_path.open("w", encoding="utf-8") as f:
+            json.dump(self.metainfo, f, ensure_ascii=False, indent=2)
+
+    def refresh_sqlite_index(self) -> None:
+        self._init_sqlite()
+
+        if not self.file_id or not self.filename_ragmem:
+            return
+
+        metainfo = self._build_metainfo()
+        now = _utc_now()
+
+        created_at_utc = metainfo.get("created_at_utc") or now
+        updated_at_utc = metainfo.get("updated_at_utc") or now
+        record_count = int(metainfo.get("record_count", 0))
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_files (
+                    file_id, title, filename_ragmem, filename_meta,
+                    created_at_utc, updated_at_utc, record_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    title = excluded.title,
+                    filename_ragmem = excluded.filename_ragmem,
+                    filename_meta = excluded.filename_meta,
+                    created_at_utc = excluded.created_at_utc,
+                    updated_at_utc = excluded.updated_at_utc,
+                    record_count = excluded.record_count
+                """,
+                (
+                    self.file_id,
+                    self.title,
+                    self.filename_ragmem,
+                    self.filename_meta,
+                    created_at_utc,
+                    updated_at_utc,
+                    record_count,
+                ),
+            )
+
+            for record in self.records:
+                index_data = record.to_index_dict()
+
+                conn.execute(
+                    """
+                    INSERT INTO memory_records (
+                        file_id, record_id, parent_id, created_at_utc,
+                        source, tag, auto_keywords_json, user_keywords_json,
+                        active_project_name, embedded_files_snapshot_json,
+                        input_hash, output_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(file_id, record_id) DO UPDATE SET
+                        parent_id = excluded.parent_id,
+                        created_at_utc = excluded.created_at_utc,
+                        source = excluded.source,
+                        tag = excluded.tag,
+                        auto_keywords_json = excluded.auto_keywords_json,
+                        user_keywords_json = excluded.user_keywords_json,
+                        active_project_name = excluded.active_project_name,
+                        embedded_files_snapshot_json = excluded.embedded_files_snapshot_json,
+                        input_hash = excluded.input_hash,
+                        output_hash = excluded.output_hash
+                    """,
+                    (
+                        self.file_id,
+                        index_data["record_id"],
+                        index_data["parent_id"],
+                        index_data["created_at_utc"],
+                        index_data["source"],
+                        index_data["tag"],
+                        json.dumps(index_data["auto_keywords"], ensure_ascii=False),
+                        json.dumps(index_data["user_keywords"], ensure_ascii=False),
+                        index_data["active_project_name"],
+                        json.dumps(index_data["embedded_files_snapshot"], ensure_ascii=False),
+                        index_data["input_hash"],
+                        index_data["output_hash"],
+                    ),
+                )
+
+            conn.commit()
+
+    def _build_metainfo(self) -> dict[str, Any]:
+        record_ids = [record.record_id for record in self.records]
+        parent_ids = _unique([record.parent_id for record in self.records if record.parent_id])
+
+        tag_summary: dict[str, int] = {}
+        auto_keywords: list[str] = []
+        user_keywords: list[str] = []
+
+        for record in self.records:
+            tag_summary[record.tag] = tag_summary.get(record.tag, 0) + 1
+            auto_keywords.extend(record.auto_keywords)
+            user_keywords.extend(record.user_keywords)
+
+        created_at_utc = self.records[0].created_at_utc if self.records else ""
+        updated_at_utc = self.records[-1].created_at_utc if self.records else ""
+
+        return {
+            "file_id": self.file_id,
+            "title": self.title,
+            "filename_ragmem": self.filename_ragmem,
+            "filename_meta": self.filename_meta,
+            "created_at_utc": created_at_utc,
+            "updated_at_utc": updated_at_utc,
+            "record_count": len(self.records),
+            "record_ids": record_ids,
+            "parent_ids": parent_ids,
+            "tag_summary": tag_summary,
+            "auto_keywords": _unique(auto_keywords),
+            "user_keywords": _unique(user_keywords),
+            "records": [record.to_index_dict() for record in self.records],
+        }
+
+    def close(self) -> None:
+        self.save_metainfo()
+        self.refresh_sqlite_index()
+
+    def _append_record_to_ragmem(self, record: MemoryRecord) -> None:
+        if not self.filename_ragmem:
+            raise ValueError("Memory filename is not initialized.")
+
+        self.files_root.mkdir(parents=True, exist_ok=True)
+
+        with self.ragmem_path.open("a", encoding="utf-8") as f:
+            f.write(record.to_ragmem_block())
+            f.write("\n")
+
+        self.b_file_created = True
+
+    def _read_ragmem_records(self, path: Path) -> list[MemoryRecord]:
+        if not path.exists():
+            return []
+
+        text = path.read_text(encoding="utf-8")
+        pattern = re.compile(
+            rf"{re.escape(RECORD_START)}\n(.*?)\n{re.escape(RECORD_END)}",
+            re.DOTALL,
+        )
+
+        records: list[MemoryRecord] = []
+
+        for match in pattern.finditer(text):
+            raw_block = match.group(1)
+            try:
+                data = json.loads(raw_block)
+                if isinstance(data, dict):
+                    records.append(MemoryRecord.from_dict(data))
+            except Exception:
+                continue
+
+        return records
+
+    def _lookup_file(self, file_id: str) -> dict[str, Any] | None:
+        self._init_sqlite()
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT file_id, title, filename_ragmem, filename_meta,
+                       created_at_utc, updated_at_utc, record_count
+                FROM memory_files
+                WHERE file_id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def _init_sqlite(self) -> None:
+        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_files (
+                    file_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    filename_ragmem TEXT NOT NULL,
+                    filename_meta TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    record_count INTEGER NOT NULL
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_records (
+                    file_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    created_at_utc TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    auto_keywords_json TEXT NOT NULL,
+                    user_keywords_json TEXT NOT NULL,
+                    active_project_name TEXT,
+                    embedded_files_snapshot_json TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    output_hash TEXT NOT NULL,
+                    PRIMARY KEY (file_id, record_id)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_records_tag
+                ON memory_records(tag)
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_records_project
+                ON memory_records(active_project_name)
+                """
+            )
+
+            conn.commit()
+```
+
+### ~\ragstream\memory\memory_record.py
+```python
+# ragstream/memory/memory_record.py
+# -*- coding: utf-8 -*-
+"""
+MemoryRecord
+============
+One accepted input/output memory unit.
+
+A MemoryRecord stores:
+- raw Prompt input
+- accepted output/response
+- tag
+- automatic YAKE keywords
+- optional user keywords
+- active project snapshot
+- embedded files snapshot
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+
+from datetime import datetime, timezone
+from typing import Any
+
+
+RECORD_START = "----- MEMORY RECORD START -----"
+RECORD_END = "----- MEMORY RECORD END -----"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _clean_list(values: list[str] | None) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+
+    for value in values or []:
+        item = str(value).strip()
+        if not item:
+            continue
+
+        key = item.lower()
+        if key in seen:
+            continue
+
+        cleaned.append(item)
+        seen.add(key)
+
+    return cleaned
+
+
+class MemoryRecord:
+    def __init__(
+        self,
+        input_text: str,
+        output_text: str,
+        source: str,
+        parent_id: str | None = None,
+        tag: str = "Green",
+        user_keywords: list[str] | None = None,
+        active_project_name: str | None = None,
+        embedded_files_snapshot: list[str] | None = None,
+        *,
+        record_id: str | None = None,
+        created_at_utc: str | None = None,
+        auto_keywords: list[str] | None = None,
+        input_hash: str | None = None,
+        output_hash: str | None = None,
+    ) -> None:
+        self.record_id: str = record_id or uuid.uuid4().hex
+        self.parent_id: str | None = parent_id
+        self.created_at_utc: str = created_at_utc or _utc_now()
+
+        self.input_text: str = input_text or ""
+        self.output_text: str = output_text or ""
+        self.source: str = source or ""
+
+        self.tag: str = tag or "Green"
+        self.user_keywords: list[str] = _clean_list(user_keywords)
+
+        self.active_project_name: str | None = active_project_name
+        self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
+
+        self.input_hash: str = input_hash or _sha256(self.input_text)
+        self.output_hash: str = output_hash or _sha256(self.output_text)
+
+        if auto_keywords is None:
+            self.auto_keywords: list[str] = self.generate_auto_keywords()
+        else:
+            self.auto_keywords = _clean_list(auto_keywords)
+
+    def generate_auto_keywords(self) -> list[str]:
+        text = f"{self.input_text}\n\n{self.output_text}".strip()
+        if not text:
+            return []
+
+        try:
+            import yake
+        except Exception:
+            return []
+
+        try:
+            extractor = yake.KeywordExtractor(
+                lan="en",
+                n=3,
+                dedupLim=0.9,
+                top=5,
+                features=None,
+            )
+            keywords = extractor.extract_keywords(text)
+            return _clean_list([kw for kw, _score in keywords])
+        except Exception:
+            return []
+
+    def update_editable_metadata(
+        self,
+        tag: str | None = None,
+        user_keywords: list[str] | None = None,
+    ) -> None:
+        if tag is not None:
+            clean_tag = str(tag).strip()
+            if clean_tag:
+                self.tag = clean_tag
+
+        if user_keywords is not None:
+            self.user_keywords = _clean_list(user_keywords)
+
+    def to_full_dict(self) -> dict[str, Any]:
+        return {
+            "record_id": self.record_id,
+            "parent_id": self.parent_id,
+            "created_at_utc": self.created_at_utc,
+            "input_text": self.input_text,
+            "output_text": self.output_text,
+            "source": self.source,
+            "tag": self.tag,
+            "auto_keywords": self.auto_keywords,
+            "user_keywords": self.user_keywords,
+            "active_project_name": self.active_project_name,
+            "embedded_files_snapshot": self.embedded_files_snapshot,
+            "input_hash": self.input_hash,
+            "output_hash": self.output_hash,
+        }
+
+    def to_ragmem_block(self) -> str:
+        body = json.dumps(self.to_full_dict(), ensure_ascii=False, indent=2)
+        return f"{RECORD_START}\n{body}\n{RECORD_END}\n"
+
+    def to_index_dict(self) -> dict[str, Any]:
+        return {
+            "record_id": self.record_id,
+            "parent_id": self.parent_id,
+            "created_at_utc": self.created_at_utc,
+            "source": self.source,
+            "tag": self.tag,
+            "auto_keywords": self.auto_keywords,
+            "user_keywords": self.user_keywords,
+            "active_project_name": self.active_project_name,
+            "embedded_files_snapshot": self.embedded_files_snapshot,
+            "input_hash": self.input_hash,
+            "output_hash": self.output_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
+        return cls(
+            input_text=str(data.get("input_text", "")),
+            output_text=str(data.get("output_text", "")),
+            source=str(data.get("source", "")),
+            parent_id=data.get("parent_id"),
+            tag=str(data.get("tag", "Green")),
+            user_keywords=list(data.get("user_keywords") or []),
+            active_project_name=data.get("active_project_name"),
+            embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
+            record_id=str(data.get("record_id") or uuid.uuid4().hex),
+            created_at_utc=str(data.get("created_at_utc") or _utc_now()),
+            auto_keywords=list(data.get("auto_keywords") or []),
+            input_hash=data.get("input_hash"),
+            output_hash=data.get("output_hash"),
+        )
 ```
 
 
