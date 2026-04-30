@@ -1,0 +1,152 @@
+@startuml RAGstream_Memory_Ingestion
+
+left to right direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+'  MEMORY RECORDING CORE — EXTERNAL CONTEXT ONLY
+'──────────────────────────────────────────────────────────────
+package "Memory Recording Core (existing)" {
+
+    class MemoryManager {
+        + file_id : str
+        + records : List<MemoryRecord>
+    }
+
+    class MemoryRecord {
+        + record_id : str
+        + parent_id : str
+        + input_text : str
+        + output_text : str
+        + tag : str
+        + auto_keywords : List[str>
+        + user_keywords : List[str>
+        + active_project_name : str
+        + input_hash : str
+        + output_hash : str
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  MEMORY INGESTION CORE
+'──────────────────────────────────────────────────────────────
+package "Memory Ingestion Core" {
+
+    class MemoryIngestionManager {
+        + memory_manager : MemoryManager
+        + memory_chunker : MemoryChunker
+        + memory_vector_store : MemoryVectorStore
+
+        + ingest_record(record_id:str) : Dict
+        + ingest_all() : Dict
+        + ingest_record_async(record_id:str) : None
+    }
+
+    class MemoryChunker {
+        + config : Dict
+
+        + build_vector_entries(record:MemoryRecord) : List<Dict>
+    }
+
+    class MemoryVectorStore {
+        + persist_dir : str
+        + collection_name : str
+        + embedder : Any
+
+        + replace_record_entries(record_id:str, entries:List<Dict>) : Dict
+        + delete_record(record_id:str) : Dict
+        + count_record(record_id:str) : int
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  MEMORY VECTOR PERSISTENCE
+'──────────────────────────────────────────────────────────────
+package "Memory Vector Persistence" {
+
+    class MemoryChromaDB {
+        + path : Path
+        + collection_name : str
+    }
+
+    class MemoryVectorEntry {
+        + id : str
+        + document : str
+        + metadata : Dict
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  RELATIONSHIPS / FLOW
+'──────────────────────────────────────────────────────────────
+
+MemoryManager "1" o-- "0..*" MemoryRecord : owns live records
+
+MemoryIngestionManager --> MemoryManager : reads records
+MemoryIngestionManager --> MemoryChunker : builds entries
+MemoryIngestionManager --> MemoryVectorStore : writes/replaces vectors
+
+MemoryChunker --> MemoryRecord : reads Q/A + metadata
+MemoryChunker ..> MemoryVectorEntry : creates entry payloads
+
+MemoryVectorStore --> MemoryChromaDB : persists vectors
+MemoryVectorStore ..> MemoryVectorEntry : stores entries
+
+MemoryVectorEntry --> MemoryRecord : metadata.record_id links to parent
+
+'──────────────────────────────────────────────────────────────
+'  NOTES
+'──────────────────────────────────────────────────────────────
+
+note right of MemoryManager
+  Existing Memory Recording object.
+
+  It remains the owner of:
+  - full Q/A truth
+  - live MemoryRecord list
+  - persistence state
+
+  It does not perform vector ingestion.
+end note
+
+note right of MemoryIngestionManager
+  Orchestrates ingestion only.
+
+  Main flow:
+  record_id
+  -> find MemoryRecord
+  -> build vector entries
+  -> replace record vectors
+
+  May run async after durable save.
+end note
+
+note bottom of MemoryChunker
+  Creates deterministic/extractive entries:
+  - record_handle
+  - question blocks
+  - answer blocks
+
+  No LLM summary.
+  No inferred intent.
+end note
+
+note bottom of MemoryVectorStore
+  Owns dedicated memory ChromaDB.
+
+  It does not own MemoryRecord truth.
+  It does not perform retrieval ranking.
+  It does not compress context.
+end note
+
+note bottom of MemoryVectorEntry
+  Chroma entry has its own id.
+
+  Parent link is stored in metadata:
+  record_id -> MemoryRecord.record_id
+end note
+
+@enduml
