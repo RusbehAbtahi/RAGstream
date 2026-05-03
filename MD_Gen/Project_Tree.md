@@ -52,8 +52,11 @@
 │   │   ├── __init__.py
 │   │   ├── __pycache__
 │   │   ├── memory_actions.py
+│   │   ├── memory_chunker.py
+│   │   ├── memory_ingestion_manager.py
 │   │   ├── memory_manager.py
-│   │   └── memory_record.py
+│   │   ├── memory_record.py
+│   │   └── memory_vector_store.py
 │   ├── orchestration
 │   │   ├── __init__.py
 │   │   ├── __pycache__
@@ -152,7 +155,13 @@
     │   │   ├── 2026-04-28-17-54-Music_TEST_RAG.ragmeta.json
     │   │   ├── 2026-04-28-17-55-Music2.ragmeta.json
     │   │   ├── 2026-04-28-18-12-MUSIC3.ragmeta.json
-    │   │   └── 2026-04-28-18-34-Another-Test.ragmeta.json
+    │   │   ├── 2026-04-28-18-34-Another-Test.ragmeta.json
+    │   │   ├── 2026-05-01-15-01-TEST1.ragmeta.json
+    │   │   ├── 2026-05-01-15-19-MUSIC_SChostakovitch.ragmeta.json
+    │   │   ├── 2026-05-03-13-45-TEST.ragmeta.json
+    │   │   └── 2026-05-03-13-55-T.ragmeta.json
+    │   └── vector_db
+    │       ├── 36c58a2a-9b94-47e5-a496-e41f40090e5b
     ├── np_store
     │   └── project1
     ├── project1

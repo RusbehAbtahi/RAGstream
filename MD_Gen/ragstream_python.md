@@ -77,7 +77,8 @@ from ragstream.ingestion.vector_store_splade import VectorStoreSplade
 # Deterministic Retrieval stage.
 from ragstream.retrieval.retriever import Retriever
 from ragstream.retrieval.reranker import Reranker
-from ragstream.textforge.RagLog import LogALL
+from ragstream.textforge.RagLog import LogALL as logger
+
 
 class AppController:
     def __init__(self, schema_path: str = "ragstream/config/prompt_schema.json") -> None:
@@ -159,13 +160,12 @@ class AppController:
         - Ignore empty/whitespace-only input.
         - Otherwise run deterministic preprocessing, update sp in place.
         """
-        log = LogALL()
         text = (user_text or "").strip()
         if not text:
             return sp
-        log("PreProcessing started.", "INFO", "PUBLIC")
+        logger("PreProcessing started.", "INFO", "PUBLIC")
         preprocess(text, sp, self.schema)
-        log("PreProcessing completed.", "INFO", "PUBLIC")
+        logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 
     def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:
@@ -1118,16 +1118,7 @@ from ragstream.app.controller import AppController
 from ragstream.memory.memory_actions import capture_memory_pair
 from ragstream.memory.memory_manager import MemoryManager
 from ragstream.orchestration.super_prompt import SuperPrompt
-
-
-def _log_runtime(
-    text: str,
-    type: str = "INFO",
-    sensitivity: str = "PUBLIC",
-) -> None:
-    logger = st.session_state.get("raglog")
-    if logger is not None:
-        logger(text, type, sensitivity)
+from ragstream.textforge.RagLog import LogALL as logger
 
 
 def do_preprocess() -> None:
@@ -1169,11 +1160,11 @@ def do_feed_memory_manually() -> None:
     output_text = st.session_state.get("manual_memory_feed_text", "")
 
     if not (prompt_text or "").strip():
-        _log_runtime("Prompt is empty. No memory record was created.", "WARN", "PUBLIC")
+        logger("Prompt is empty. No memory record was created.", "WARN", "PUBLIC")
         return
 
     if not (output_text or "").strip():
-        _log_runtime("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
+        logger("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
         return
 
     memory_manager: MemoryManager = st.session_state.memory_manager
@@ -1184,7 +1175,7 @@ def do_feed_memory_manually() -> None:
             "output_text": output_text,
         }
         st.session_state["memory_title_required"] = True
-        _log_runtime("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
+        logger("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
         st.session_state["runtime_log_flash_until"] = time.time() + 5
         st.rerun()
 
@@ -1198,14 +1189,14 @@ def do_confirm_memory_title_and_save() -> None:
     """Confirm first memory title and save pending manual memory pair."""
     title = (st.session_state.get("memory_title_input", "") or "").strip()
     if not title:
-        _log_runtime("Memory title must not be empty.", "WARN", "PUBLIC")
+        logger("Memory title must not be empty.", "WARN", "PUBLIC")
         return
 
     memory_manager: MemoryManager = st.session_state.memory_manager
 
     if not memory_manager.title.strip():
         memory_manager.start_new_history(title)
-        _log_runtime(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
+        logger(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
 
     pending_pair = st.session_state.get("pending_manual_memory_pair")
     if pending_pair:
@@ -1240,19 +1231,19 @@ def _save_memory_pair(
             active_project_name=active_project_name,
             embedded_files_snapshot=embedded_files_snapshot,
             gui_records_state=gui_records_state,
+            memory_ingestion_manager=st.session_state.get("memory_ingestion_manager"),
         )
 
         if result.get("success"):
-            _log_runtime(result.get("message", "Memory record saved."), "INFO", "PUBLIC")
             st.session_state["pending_manual_memory_pair"] = None
             st.session_state["memory_title_required"] = False
             st.session_state["manual_memory_feed_text"] = ""
             st.rerun()
         else:
-            _log_runtime(result.get("message", "Memory record was not saved."), "WARN", "PUBLIC")
+            logger(result.get("message", "Memory record was not saved."), "WARN", "PUBLIC")
 
     except Exception as e:
-        _log_runtime(str(e), "ERROR", "PUBLIC")
+        logger(str(e), "ERROR", "PUBLIC")
 
 
 def _get_active_project_snapshot(ctrl: AppController) -> tuple[str | None, list[str]]:
@@ -2116,9 +2107,13 @@ import streamlit as st
 
 from ragstream.app.controller import AppController
 from ragstream.app.ui_layout import inject_base_css, render_page
+from ragstream.ingestion.embedder import Embedder
+from ragstream.memory.memory_chunker import MemoryChunker
+from ragstream.memory.memory_ingestion_manager import MemoryIngestionManager
 from ragstream.memory.memory_manager import MemoryManager
+from ragstream.memory.memory_vector_store import MemoryVectorStore
 from ragstream.orchestration.super_prompt import SuperPrompt
-from ragstream.textforge.RagLog import LogALL
+from ragstream.textforge.RagLog import LogALL as logger
 
 
 def init_session_state() -> None:
@@ -2126,6 +2121,9 @@ def init_session_state() -> None:
     if "controller" not in st.session_state:
         ctrl = AppController()
         st.session_state.controller = ctrl
+
+    if "textforge_gui_log" not in st.session_state:
+        st.session_state["textforge_gui_log"] = ""
 
     if "memory_manager" not in st.session_state:
         project_root = Path(__file__).resolve().parents[2]
@@ -2138,11 +2136,32 @@ def init_session_state() -> None:
             title="",
         )
 
-    if "textforge_gui_log" not in st.session_state:
-        st.session_state["textforge_gui_log"] = ""
+    if "memory_ingestion_manager" not in st.session_state:
+        project_root = Path(__file__).resolve().parents[2]
+        memory_root = project_root / "data" / "memory"
+        memory_vector_root = memory_root / "vector_db"
 
-    if "raglog" not in st.session_state:
-        st.session_state.raglog = LogALL(session_state=st.session_state)
+        memory_chunker = MemoryChunker()
+
+        memory_embedder = Embedder(model="text-embedding-3-large")
+
+        memory_vector_store = MemoryVectorStore(
+            persist_dir=str(memory_vector_root),
+            collection_name="memory_vectors",
+            embedder=memory_embedder,
+        )
+
+        st.session_state.memory_ingestion_manager = MemoryIngestionManager(
+            memory_manager=st.session_state.memory_manager,
+            memory_chunker=memory_chunker,
+            memory_vector_store=memory_vector_store,
+        )
+
+        logger(
+            "Memory ingestion layer ready: data/memory/vector_db/ | collection=memory_vectors",
+            "INFO",
+            "PUBLIC",
+        )
 
     if "heavy_init_started" not in st.session_state:
         st.session_state["heavy_init_started"] = False
@@ -2190,10 +2209,10 @@ def init_session_state() -> None:
         st.session_state["retrieval_top_k"] = 30
 
     if "use_retrieval_splade" not in st.session_state:
-            st.session_state["use_retrieval_splade"] = False
+        st.session_state["use_retrieval_splade"] = False
 
     if "use_reranking_colbert" not in st.session_state:
-            st.session_state["use_reranking_colbert"] = False
+        st.session_state["use_reranking_colbert"] = False
 
     if "manual_memory_feed_text" not in st.session_state:
         st.session_state["manual_memory_feed_text"] = ""
@@ -2222,6 +2241,7 @@ def main() -> None:
 
     # Page layout
     render_page()
+
 
 if __name__ == "__main__":
     main()
@@ -7810,6 +7830,7 @@ from __future__ import annotations
 from typing import Any
 
 from ragstream.memory.memory_manager import MemoryManager
+from ragstream.textforge.RagLog import LogALL as logger
 
 
 def capture_memory_pair(
@@ -7822,6 +7843,7 @@ def capture_memory_pair(
     parent_id: str | None = None,
     user_keywords: list[str] | None = None,
     gui_records_state: list[dict[str, Any]] | None = None,
+    memory_ingestion_manager: Any | None = None,
 ) -> dict[str, Any]:
     clean_input = (input_text or "").strip()
     clean_output = (output_text or "").strip()
@@ -7852,6 +7874,33 @@ def capture_memory_pair(
         embedded_files_snapshot=embedded_files_snapshot or [],
     )
 
+    logger(
+        f"Memory record saved: {record.record_id}",
+        "INFO",
+        "PUBLIC",
+    )
+
+    logger(
+        (
+            "MemoryRecord captured: "
+            f"record={record.record_id[:8]} | "
+            f"file={memory_manager.filename_ragmem} | "
+            f"tag={record.tag}"
+        ),
+        "INFO",
+        "INTERNAL",
+    )
+
+    if memory_ingestion_manager is not None:
+        try:
+            memory_ingestion_manager.ingest_record_async(record.record_id)
+        except Exception as e:
+            logger(
+                f"MemoryRecord was saved, but vector ingestion could not be scheduled: {e}",
+                "WARN",
+                "PUBLIC",
+            )
+
     return {
         "success": True,
         "message": f"Memory record saved: {record.record_id}",
@@ -7860,6 +7909,565 @@ def capture_memory_pair(
         "file_id": memory_manager.file_id,
         "filename_ragmem": memory_manager.filename_ragmem,
     }
+```
+
+### ~\ragstream\memory\memory_chunker.py
+```python
+# ragstream/memory/memory_chunker.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+
+from typing import Any
+
+
+class MemoryChunker:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config: dict[str, Any] = {
+            "config_version": "memory_chunker_001",
+            "target_tokens": 500,
+            "max_tokens": 800,
+            "question_anchor_tokens": 220,
+        }
+        self.config.update(config or {})
+
+    def build_vector_entries(
+        self,
+        record: Any,
+        *,
+        file_id: str,
+        filename_ragmem: str = "",
+        filename_meta: str = "",
+    ) -> list[dict[str, Any]]:
+        ingestion_hash = self._build_ingestion_hash(record, file_id)
+
+        entries: list[dict[str, Any]] = []
+
+        question_anchor = self._build_question_anchor(record.input_text)
+        record_handle_text = self._build_record_handle_text(record, question_anchor)
+
+        entries.append(
+            self._make_entry(
+                file_id=file_id,
+                filename_ragmem=filename_ragmem,
+                filename_meta=filename_meta,
+                record=record,
+                role="record_handle",
+                block_id="0000",
+                position=0,
+                text=record_handle_text,
+                start_offset=0,
+                end_offset=len(question_anchor),
+                ingestion_hash=ingestion_hash,
+            )
+        )
+
+        for position, block in enumerate(self._split_text(record.input_text), start=1):
+            entries.append(
+                self._make_entry(
+                    file_id=file_id,
+                    filename_ragmem=filename_ragmem,
+                    filename_meta=filename_meta,
+                    record=record,
+                    role="question",
+                    block_id=f"{position:04d}",
+                    position=position,
+                    text=block["text"],
+                    start_offset=block["start_offset"],
+                    end_offset=block["end_offset"],
+                    ingestion_hash=ingestion_hash,
+                )
+            )
+
+        for position, block in enumerate(self._split_text(record.output_text), start=1):
+            entries.append(
+                self._make_entry(
+                    file_id=file_id,
+                    filename_ragmem=filename_ragmem,
+                    filename_meta=filename_meta,
+                    record=record,
+                    role="answer",
+                    block_id=f"{position:04d}",
+                    position=position,
+                    text=block["text"],
+                    start_offset=block["start_offset"],
+                    end_offset=block["end_offset"],
+                    ingestion_hash=ingestion_hash,
+                )
+            )
+
+        return [entry for entry in entries if entry["document"].strip()]
+
+    def _build_record_handle_text(self, record: Any, question_anchor: str) -> str:
+        return "\n".join(
+            [
+                f"PROJECT: {record.active_project_name or ''}",
+                f"TAG: {record.tag or ''}",
+                f"USER_KEYWORDS: {self._join_list(record.user_keywords)}",
+                f"YAKE_KEYWORDS: {self._join_list(record.auto_keywords)}",
+                "QUESTION_ANCHOR:",
+                question_anchor.strip(),
+            ]
+        ).strip()
+
+    def _build_question_anchor(self, text: str) -> str:
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return ""
+
+        max_tokens = int(self.config["question_anchor_tokens"])
+        blocks = self._split_text(clean_text)
+
+        if blocks:
+            return self._truncate_by_tokens(blocks[0]["text"], max_tokens)
+
+        return self._truncate_by_tokens(clean_text, max_tokens)
+
+    def _split_text(self, text: str) -> list[dict[str, Any]]:
+        if not (text or "").strip():
+            return []
+
+        target_tokens = int(self.config["target_tokens"])
+        max_tokens = int(self.config["max_tokens"])
+
+        units = self._semantic_units(text)
+        blocks: list[dict[str, Any]] = []
+
+        current_units: list[tuple[int, int, str]] = []
+        current_tokens = 0
+
+        for start, end, unit_text in units:
+            unit_tokens = self._count_tokens(unit_text)
+
+            if unit_tokens > max_tokens:
+                if current_units:
+                    blocks.append(self._units_to_block(current_units))
+                    current_units = []
+                    current_tokens = 0
+
+                blocks.extend(self._hard_split(unit_text, base_offset=start, max_tokens=max_tokens))
+                continue
+
+            if current_units and current_tokens + unit_tokens > max_tokens:
+                blocks.append(self._units_to_block(current_units))
+                current_units = []
+                current_tokens = 0
+
+            current_units.append((start, end, unit_text))
+            current_tokens += unit_tokens
+
+            if current_tokens >= target_tokens:
+                blocks.append(self._units_to_block(current_units))
+                current_units = []
+                current_tokens = 0
+
+        if current_units:
+            blocks.append(self._units_to_block(current_units))
+
+        return blocks
+
+    def _semantic_units(self, text: str) -> list[tuple[int, int, str]]:
+        units: list[tuple[int, int, str]] = []
+
+        paragraph_pattern = re.compile(r"\S(?:.*?\S)?(?=\n\s*\n|\Z)", re.DOTALL)
+
+        for paragraph_match in paragraph_pattern.finditer(text):
+            paragraph_text = paragraph_match.group(0)
+            paragraph_start = paragraph_match.start()
+            paragraph_end = paragraph_match.end()
+
+            if self._count_tokens(paragraph_text) <= int(self.config["max_tokens"]):
+                units.append((paragraph_start, paragraph_end, paragraph_text))
+                continue
+
+            sentence_pattern = re.compile(r"\S[^.!?\n]*(?:[.!?]+|$)", re.DOTALL)
+
+            for sentence_match in sentence_pattern.finditer(paragraph_text):
+                sentence_text = sentence_match.group(0).strip()
+                if not sentence_text:
+                    continue
+
+                start = paragraph_start + sentence_match.start()
+                end = paragraph_start + sentence_match.end()
+                units.append((start, end, text[start:end]))
+
+        if not units and text.strip():
+            units.append((0, len(text), text.strip()))
+
+        return units
+
+    def _hard_split(
+        self,
+        text: str,
+        *,
+        base_offset: int,
+        max_tokens: int,
+    ) -> list[dict[str, Any]]:
+        word_matches = list(re.finditer(r"\S+", text))
+        blocks: list[dict[str, Any]] = []
+
+        for i in range(0, len(word_matches), max_tokens):
+            group = word_matches[i : i + max_tokens]
+            if not group:
+                continue
+
+            start = base_offset + group[0].start()
+            end = base_offset + group[-1].end()
+            block_text = text[group[0].start() : group[-1].end()]
+
+            blocks.append(
+                {
+                    "text": block_text,
+                    "start_offset": start,
+                    "end_offset": end,
+                    "token_count": self._count_tokens(block_text),
+                }
+            )
+
+        return blocks
+
+    @staticmethod
+    def _units_to_block(units: list[tuple[int, int, str]]) -> dict[str, Any]:
+        start = units[0][0]
+        end = units[-1][1]
+        text = "\n\n".join(unit[2].strip() for unit in units if unit[2].strip())
+
+        return {
+            "text": text,
+            "start_offset": start,
+            "end_offset": end,
+            "token_count": MemoryChunker._count_tokens(text),
+        }
+
+    def _make_entry(
+        self,
+        *,
+        file_id: str,
+        filename_ragmem: str,
+        filename_meta: str,
+        record: Any,
+        role: str,
+        block_id: str,
+        position: int,
+        text: str,
+        start_offset: int,
+        end_offset: int,
+        ingestion_hash: str,
+    ) -> dict[str, Any]:
+        metadata = {
+            "file_id": file_id or "",
+            "filename_ragmem": filename_ragmem or "",
+            "filename_meta": filename_meta or "",
+            "record_id": record.record_id or "",
+            "parent_id": record.parent_id or "",
+            "role": role,
+            "block_id": block_id,
+            "position": int(position),
+            "start_offset": int(start_offset),
+            "end_offset": int(end_offset),
+            "token_count": int(self._count_tokens(text)),
+            "tag": record.tag or "",
+            "active_project_name": record.active_project_name or "",
+            "source": record.source or "",
+            "created_at_utc": record.created_at_utc or "",
+            "input_hash": record.input_hash or "",
+            "output_hash": record.output_hash or "",
+            "auto_keywords_text": self._join_list(record.auto_keywords),
+            "yake_keywords_text": self._join_list(record.auto_keywords),
+            "user_keywords_text": self._join_list(record.user_keywords),
+            "embedded_files_snapshot_text": self._join_list(record.embedded_files_snapshot),
+            "chunking_config_version": str(self.config["config_version"]),
+            "ingestion_hash": ingestion_hash,
+        }
+
+        return {
+            "id": f"mem::{file_id}::{record.record_id}::{role}::{block_id}",
+            "document": text or "",
+            "metadata": metadata,
+        }
+
+    def _build_ingestion_hash(self, record: Any, file_id: str) -> str:
+        payload = {
+            "file_id": file_id,
+            "record_id": record.record_id,
+            "input_hash": record.input_hash,
+            "output_hash": record.output_hash,
+            "tag": record.tag,
+            "auto_keywords": list(record.auto_keywords or []),
+            "user_keywords": list(record.user_keywords or []),
+            "active_project_name": record.active_project_name,
+            "chunking_config_version": self.config["config_version"],
+        }
+
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _truncate_by_tokens(text: str, max_tokens: int) -> str:
+        words = re.findall(r"\S+", text or "")
+        if len(words) <= max_tokens:
+            return (text or "").strip()
+        return " ".join(words[:max_tokens]).strip()
+
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        return len(re.findall(r"\S+", text or ""))
+
+    @staticmethod
+    def _join_list(values: list[str] | None) -> str:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+
+        for value in values or []:
+            item = str(value).strip()
+            if not item:
+                continue
+
+            key = item.lower()
+            if key in seen:
+                continue
+
+            cleaned.append(item)
+            seen.add(key)
+
+        return "; ".join(cleaned)
+```
+
+### ~\ragstream\memory\memory_ingestion_manager.py
+```python
+# ragstream/memory/memory_ingestion_manager.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import threading
+
+from typing import Any
+
+from ragstream.textforge.RagLog import LogALL as logger
+
+
+class MemoryIngestionManager:
+    def __init__(
+        self,
+        memory_manager: Any,
+        memory_chunker: Any,
+        memory_vector_store: Any,
+    ) -> None:
+        self.memory_manager = memory_manager
+        self.memory_chunker = memory_chunker
+        self.memory_vector_store = memory_vector_store
+
+        self._lock = threading.Lock()
+        self._active_record_ids: set[str] = set()
+
+    def ingest_record(self, record_id: str) -> dict[str, Any]:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return {
+                "success": False,
+                "record_id": record_id,
+                "message": "record_id is empty.",
+            }
+
+        record = self._find_record(clean_record_id)
+        if record is None:
+            message = f"MemoryRecord not found for ingestion: {clean_record_id}"
+            logger(message, "WARN", "PUBLIC")
+            return {
+                "success": False,
+                "record_id": clean_record_id,
+                "message": message,
+            }
+
+        try:
+            logger(
+                (
+                    "Memory ingestion started: "
+                    f"record={clean_record_id[:8]} | file_id={self.memory_manager.file_id[:8]}"
+                ),
+                "INFO",
+                "INTERNAL",
+            )
+
+            entries = self.memory_chunker.build_vector_entries(
+                record,
+                file_id=self.memory_manager.file_id,
+                filename_ragmem=self.memory_manager.filename_ragmem,
+                filename_meta=self.memory_manager.filename_meta,
+            )
+
+            role_counts = self._count_roles(entries)
+
+            logger(
+                (
+                    "Memory blocks prepared: "
+                    f"handle={role_counts.get('record_handle', 0)}, "
+                    f"question={role_counts.get('question', 0)}, "
+                    f"answer={role_counts.get('answer', 0)}"
+                ),
+                "INFO",
+                "INTERNAL",
+            )
+
+            result = self.memory_vector_store.replace_record_entries(
+                record_id=clean_record_id,
+                entries=entries,
+            )
+
+            result.update(
+                {
+                    "role_counts": role_counts,
+                    "file_id": self.memory_manager.file_id,
+                    "filename_ragmem": self.memory_manager.filename_ragmem,
+                }
+            )
+
+            logger(
+                (
+                    "Memory ingestion finished: "
+                    f"{role_counts.get('record_handle', 0)} handle, "
+                    f"{role_counts.get('question', 0)} question blocks, "
+                    f"{role_counts.get('answer', 0)} answer blocks "
+                    f"→ {result.get('vectors_written', 0)} vectors."
+                ),
+                "INFO",
+                "PUBLIC",
+            )
+
+            logger(
+                (
+                    "Memory vector store updated: "
+                    f"path={result.get('persist_dir', '')} | "
+                    f"collection={result.get('collection_name', '')} | "
+                    f"record_vectors={result.get('record_vector_count', 0)}"
+                ),
+                "INFO",
+                "INTERNAL",
+            )
+
+            return result
+
+        except Exception as e:
+            message = f"Memory ingestion failed for {clean_record_id[:8]}: {e}"
+            logger(message, "ERROR", "PUBLIC")
+            return {
+                "success": False,
+                "record_id": clean_record_id,
+                "message": message,
+            }
+
+    def ingest_all(self) -> dict[str, Any]:
+        records = list(getattr(self.memory_manager, "records", []) or [])
+
+        total = len(records)
+        success_count = 0
+        failure_count = 0
+        results: list[dict[str, Any]] = []
+
+        logger(f"Memory ingestion started for loaded history: {total} records.", "INFO", "PUBLIC")
+
+        for record in records:
+            result = self.ingest_record(record.record_id)
+            results.append(result)
+
+            if result.get("success"):
+                success_count += 1
+            else:
+                failure_count += 1
+
+        logger(
+            (
+                "Memory history ingestion finished: "
+                f"{success_count} succeeded, {failure_count} failed."
+            ),
+            "INFO" if failure_count == 0 else "WARN",
+            "PUBLIC",
+        )
+
+        return {
+            "success": failure_count == 0,
+            "total": total,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "results": results,
+        }
+
+    def ingest_record_async(self, record_id: str) -> None:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return
+
+        record = self._find_record(clean_record_id)
+        if record is None:
+            logger(f"Memory ingestion was not scheduled; record not found: {clean_record_id}", "WARN", "PUBLIC")
+            return
+
+        with self._lock:
+            if clean_record_id in self._active_record_ids:
+                logger(
+                    f"Memory ingestion already running for record: {clean_record_id[:8]}",
+                    "INFO",
+                    "INTERNAL",
+                )
+                return
+
+            self._active_record_ids.add(clean_record_id)
+
+        logger(
+            (
+                "Memory ingestion scheduled: "
+                f"record={clean_record_id[:8]} | "
+                f"question_chars={len(record.input_text or '')} | "
+                f"answer_chars={len(record.output_text or '')}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
+        thread = threading.Thread(
+            target=self._async_worker,
+            args=(clean_record_id,),
+            daemon=True,
+            name=f"memory-ingest-{clean_record_id[:8]}",
+        )
+
+        try:
+            from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+
+            ctx = get_script_run_ctx()
+            if ctx is not None:
+                add_script_run_ctx(thread, ctx)
+        except Exception:
+            pass
+
+        thread.start()
+
+    def _async_worker(self, record_id: str) -> None:
+        try:
+            self.ingest_record(record_id)
+        finally:
+            with self._lock:
+                self._active_record_ids.discard(record_id)
+
+    def _find_record(self, record_id: str) -> Any | None:
+        for record in getattr(self.memory_manager, "records", []) or []:
+            if getattr(record, "record_id", None) == record_id:
+                return record
+        return None
+
+    @staticmethod
+    def _count_roles(entries: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+
+        for entry in entries:
+            metadata = entry.get("metadata", {})
+            role = str(metadata.get("role", "")).strip() or "unknown"
+            counts[role] = counts.get(role, 0) + 1
+
+        return counts
 ```
 
 ### ~\ragstream\memory\memory_manager.py
@@ -8508,6 +9116,174 @@ class MemoryRecord:
             input_hash=data.get("input_hash"),
             output_hash=data.get("output_hash"),
         )
+```
+
+### ~\ragstream\memory\memory_vector_store.py
+```python
+# ragstream/memory/memory_vector_store.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+from typing import Any
+
+from ragstream.textforge.RagLog import LogALL as logger
+
+
+class MemoryVectorStore:
+    def __init__(
+        self,
+        persist_dir: str,
+        collection_name: str,
+        embedder: Any,
+    ) -> None:
+        self.persist_dir = str(persist_dir)
+        self.collection_name = collection_name
+        self.embedder = embedder
+
+        Path(self.persist_dir).mkdir(parents=True, exist_ok=True)
+
+        import chromadb
+
+        self._client = chromadb.PersistentClient(path=self.persist_dir)
+        self._collection = self._client.get_or_create_collection(name=self.collection_name)
+
+        logger(
+            f"MemoryVectorStore ready: {self.persist_dir} | collection={self.collection_name}",
+            "INFO",
+            "INTERNAL",
+        )
+
+    def replace_record_entries(
+        self,
+        record_id: str,
+        entries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            raise ValueError("record_id must not be empty.")
+
+        old_count = self.count_record(clean_record_id)
+        self.delete_record(clean_record_id)
+
+        if not entries:
+            return {
+                "success": True,
+                "record_id": clean_record_id,
+                "deleted_old_vectors": old_count,
+                "vectors_written": 0,
+                "record_vector_count": 0,
+                "collection_name": self.collection_name,
+                "persist_dir": self.persist_dir,
+            }
+
+        ids = [str(entry["id"]) for entry in entries]
+        documents = [str(entry.get("document", "")) for entry in entries]
+        metadatas = [self._sanitize_metadata(entry.get("metadata", {})) for entry in entries]
+
+        embeddings = self._embed_documents(documents)
+
+        self._collection.add(
+            ids=ids,
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+
+        new_count = self.count_record(clean_record_id)
+
+        logger(
+            (
+                "Memory vectors written: "
+                f"record={clean_record_id[:8]} | deleted={old_count} | "
+                f"new={len(ids)} | total_for_record={new_count}"
+            ),
+            "INFO",
+            "INTERNAL",
+        )
+
+        return {
+            "success": True,
+            "record_id": clean_record_id,
+            "deleted_old_vectors": old_count,
+            "vectors_written": len(ids),
+            "record_vector_count": new_count,
+            "collection_name": self.collection_name,
+            "persist_dir": self.persist_dir,
+        }
+
+    def delete_record(self, record_id: str) -> dict[str, Any]:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return {
+                "success": False,
+                "record_id": record_id,
+                "deleted_vectors": 0,
+                "message": "record_id is empty.",
+            }
+
+        old_count = self.count_record(clean_record_id)
+
+        if old_count > 0:
+            self._collection.delete(where={"record_id": clean_record_id})
+
+        new_count = self.count_record(clean_record_id)
+
+        return {
+            "success": True,
+            "record_id": clean_record_id,
+            "deleted_vectors": max(old_count - new_count, 0),
+            "record_vector_count": new_count,
+        }
+
+    def count_record(self, record_id: str) -> int:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return 0
+
+        try:
+            result = self._collection.get(where={"record_id": clean_record_id})
+            return len(result.get("ids", []))
+        except Exception:
+            return 0
+
+    def _embed_documents(self, documents: list[str]) -> list[list[float]]:
+        if not documents:
+            return []
+
+        vectors = self.embedder.embed(documents)
+
+        result: list[list[float]] = []
+        for vector in vectors:
+            if hasattr(vector, "tolist"):
+                vector = vector.tolist()
+            result.append([float(value) for value in vector])
+
+        return result
+
+    @staticmethod
+    def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
+        clean: dict[str, str | int | float | bool] = {}
+
+        for key, value in (metadata or {}).items():
+            clean_key = str(key)
+
+            if value is None:
+                clean[clean_key] = ""
+            elif isinstance(value, bool):
+                clean[clean_key] = value
+            elif isinstance(value, int):
+                clean[clean_key] = value
+            elif isinstance(value, float):
+                clean[clean_key] = value
+            elif isinstance(value, str):
+                clean[clean_key] = value
+            else:
+                clean[clean_key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+        return clean
 ```
 
 

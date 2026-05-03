@@ -34,7 +34,8 @@ from ragstream.ingestion.vector_store_splade import VectorStoreSplade
 # Deterministic Retrieval stage.
 from ragstream.retrieval.retriever import Retriever
 from ragstream.retrieval.reranker import Reranker
-from ragstream.textforge.RagLog import LogALL
+from ragstream.textforge.RagLog import LogALL as logger
+
 
 class AppController:
     def __init__(self, schema_path: str = "ragstream/config/prompt_schema.json") -> None:
@@ -116,13 +117,12 @@ class AppController:
         - Ignore empty/whitespace-only input.
         - Otherwise run deterministic preprocessing, update sp in place.
         """
-        log = LogALL()
         text = (user_text or "").strip()
         if not text:
             return sp
-        log("PreProcessing started.", "INFO", "PUBLIC")
+        logger("PreProcessing started.", "INFO", "PUBLIC")
         preprocess(text, sp, self.schema)
-        log("PreProcessing completed.", "INFO", "PUBLIC")
+        logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 
     def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:

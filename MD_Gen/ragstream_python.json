@@ -39,8 +39,11 @@
   "~\\ragstream\\retrieval\\rrf_merger.py",
   "~\\ragstream\\retrieval\\smart_query_splitter.py",
   "~\\ragstream\\memory\\memory_actions.py",
+  "~\\ragstream\\memory\\memory_chunker.py",
+  "~\\ragstream\\memory\\memory_ingestion_manager.py",
   "~\\ragstream\\memory\\memory_manager.py",
   "~\\ragstream\\memory\\memory_record.py",
+  "~\\ragstream\\memory\\memory_vector_store.py",
   "~\\ragstream\\utils\\logging.py",
   "~\\ragstream\\utils\\paths.py"
 ]

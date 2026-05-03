@@ -10,7 +10,7 @@ Responsibilities:
 - Create the fixed 4-sink RAGstream logging setup.
 - Keep the 5 core classes neutral.
 - Decide sink order, sink flags, paths, accepted severities, and accepted sensitivities.
-- Provide ready-made logger factories:
+- Provide ready-made logger entry points:
     LogALL()
     LogNoGUI()
     LogConf()
@@ -77,6 +77,11 @@ CLI_DEVELOPER_SENSITIVITIES: list[str] = [
 ]
 
 
+_LOG_ALL: TextForge | None = None
+_LOG_NO_GUI: TextForge | None = None
+_LOG_CONF: TextForge | None = None
+
+
 # ---------------------------------------------------------------------
 # 1) CreateSinks
 # ---------------------------------------------------------------------
@@ -97,53 +102,11 @@ def CreateSinks(
         sinks[1] = File_PublicRun
         sinks[2] = CliRuntimeSink
         sinks[3] = GuiPublicSink
-
-    Args:
-        mode:
-            "normal" or "developer".
-
-            normal:
-                CLI accepts INFO/WARN/ERROR/FATAL and PUBLIC/INTERNAL.
-
-            developer:
-                CLI accepts TRACE/DEBUG/INFO/WARN/ERROR/FATAL and
-                PUBLIC/INTERNAL/CONFIDENTIAL.
-
-        session_state:
-            Streamlit st.session_state or compatible mapping.
-            If None, RagLog tries to use streamlit.session_state.
-            If Streamlit is not available, a small internal dict is used.
-
-        gui_key:
-            Key used by GuiSink, normally "textforge_gui_log".
-
-        log_root:
-            Root folder for logs.
-            Default:
-                <project-root>/data/logs
-
-        public_run_rotation_size:
-            Rotation size for the public readable log.
-            Option:
-                increase for fewer rotated files.
-                decrease for smaller files.
-
-        archive_rotation_size:
-            Rotation size for the full archive log.
-            Option:
-                archive can be larger because it records much more.
-
-    Returns:
-        list[TextSink]:
-            The four configured sink objects.
     """
 
     if mode not in {"normal", "developer"}:
         raise ValueError("mode must be 'normal' or 'developer'.")
 
-    # RagLog.py lives in:
-    #   <project-root>/ragstream/textforge/RagLog.py
-    # Therefore parents[2] is <project-root>.
     project_root = Path(__file__).resolve().parents[2]
 
     if log_root is None:
@@ -165,16 +128,6 @@ def CreateSinks(
     archive_path = archive_dir / f"archive_{today}.log"
     sqlite_path = sqlite_dir / "textforge_index.sqlite3"
 
-    # ------------------------------------------------------------
-    # GUI session_state resolution.
-    #
-    # In Streamlit:
-    #     session_state should be st.session_state.
-    #
-    # Outside Streamlit:
-    #     we fall back to a plain dict so that the sink can still exist.
-    #     This keeps the fixed 4-sink structure intact.
-    # ------------------------------------------------------------
     if session_state is None:
         try:
             import streamlit as st  # type: ignore
@@ -182,17 +135,6 @@ def CreateSinks(
         except Exception:
             session_state = {}
 
-    # ------------------------------------------------------------
-    # sinks[0] = Sink0_Archive
-    #
-    # Full archive:
-    # - all severities
-    # - PUBLIC / INTERNAL / CONFIDENTIAL
-    # - SQLite active
-    # - async active
-    #
-    # HIGHLY_CONFIDENTIAL is intentionally not accepted.
-    # ------------------------------------------------------------
     sink0_archive = FileSink(
         path=str(archive_path),
         accept_types=ALL_TYPES,
@@ -207,15 +149,6 @@ def CreateSinks(
         b_suffix=False,
     )
 
-    # ------------------------------------------------------------
-    # sinks[1] = File_PublicRun
-    #
-    # Clean readable public runtime file:
-    # - normal operational severities only
-    # - PUBLIC only
-    # - no SQLite
-    # - synchronous
-    # ------------------------------------------------------------
     sink1_public_run = FileSink(
         path=str(public_run_path),
         accept_types=RUNTIME_TYPES,
@@ -230,21 +163,6 @@ def CreateSinks(
         b_suffix=False,
     )
 
-    # ------------------------------------------------------------
-    # sinks[2] = CliRuntimeSink
-    #
-    # CLI is dynamic by startup mode.
-    #
-    # normal:
-    #   quiet runtime terminal
-    #
-    # developer:
-    #   detailed terminal including DEBUG/TRACE and CONFIDENTIAL
-    #
-    # Stream option:
-    #   currently stdout for all CLI logs.
-    #   If later wanted, this can be changed to stderr.
-    # ------------------------------------------------------------
     if mode == "developer":
         cli_types = ALL_TYPES
         cli_sensitivities = CLI_DEVELOPER_SENSITIVITIES
@@ -261,19 +179,6 @@ def CreateSinks(
         b_suffix=False,
     )
 
-    # ------------------------------------------------------------
-    # sinks[3] = GuiPublicSink
-    #
-    # GUI should remain clean:
-    # - normal runtime severities only
-    # - PUBLIC only
-    # - newest message first by default
-    #
-    # display_mode options:
-    #   "prepend" = newest on top
-    #   "append"  = newest at bottom
-    #   "replace" = only latest message
-    # ------------------------------------------------------------
     sink3_gui = GuiSink(
         session_state=session_state,
         key=gui_key,
@@ -309,36 +214,6 @@ def CreateTextForge(
 ) -> TextForge:
     """
     Create one TextForge logger with all 4 sinks attached.
-
-    Args:
-        text:
-            Initial/default text.
-
-        type:
-            Initial/default severity type.
-
-        sensitivity:
-            Initial/default sensitivity flag.
-
-        mode:
-            "normal" or "developer"; affects CLI sink.
-
-        session_state:
-            Streamlit session_state for GuiSink.
-
-        gui_key:
-            GUI session_state key.
-
-        log_root:
-            Optional custom logs root.
-
-        b_enable:
-            Enable map for the 4 sinks.
-            If None, all 4 sinks are enabled.
-
-    Returns:
-        TextForge:
-            Ready logger object.
     """
 
     sinks = CreateSinks(
@@ -374,30 +249,30 @@ def LogALL(
     log_root: Optional[str | Path] = None,
 ) -> TextForge:
     """
-    Create a logger with all 4 sinks enabled.
+    Log through all 4 sinks.
 
-    b_enable:
-        [1, 1, 1, 1]
+    Routing:
+        b_enable = [1, 1, 1, 1]
 
-    Active sinks:
-        sinks[0] Sink0_Archive
-        sinks[1] File_PublicRun
-        sinks[2] CliRuntimeSink
-        sinks[3] GuiPublicSink
+    Filtering:
+        Only the sinks decide by accept_types and accept_sensitivities.
     """
 
-    logger = CreateTextForge(
-        text=text,
-        type=type,
-        sensitivity=sensitivity,
-        mode=mode,
-        session_state=session_state,
-        gui_key=gui_key,
-        log_root=log_root,
-        b_enable=[True, True, True, True],
-    )
+    global _LOG_ALL
 
-    return logger
+    if _LOG_ALL is None or session_state is not None or log_root is not None:
+        _LOG_ALL = CreateTextForge(
+            mode=mode,
+            session_state=session_state,
+            gui_key=gui_key,
+            log_root=log_root,
+            b_enable=[True, True, True, True],
+        )
+
+    if text:
+        _LOG_ALL(text, type, sensitivity)
+
+    return _LOG_ALL
 
 
 # ---------------------------------------------------------------------
@@ -414,35 +289,30 @@ def LogNoGUI(
     log_root: Optional[str | Path] = None,
 ) -> TextForge:
     """
-    Create a logger with GUI disabled.
+    Log through all sinks except GUI.
 
-    b_enable:
-        [1, 1, 1, 0]
+    Routing:
+        b_enable = [1, 1, 1, 0]
 
-    Active sinks:
-        sinks[0] Sink0_Archive
-        sinks[1] File_PublicRun
-        sinks[2] CliRuntimeSink
-
-    Disabled:
-        sinks[3] GuiPublicSink
-
-    Use case:
-        Logging without disturbing the GUI.
+    Filtering:
+        Only the sinks decide by accept_types and accept_sensitivities.
     """
 
-    logger = CreateTextForge(
-        text=text,
-        type=type,
-        sensitivity=sensitivity,
-        mode=mode,
-        session_state=session_state,
-        gui_key=gui_key,
-        log_root=log_root,
-        b_enable=[True, True, True, False],
-    )
+    global _LOG_NO_GUI
 
-    return logger
+    if _LOG_NO_GUI is None or session_state is not None or log_root is not None:
+        _LOG_NO_GUI = CreateTextForge(
+            mode=mode,
+            session_state=session_state,
+            gui_key=gui_key,
+            log_root=log_root,
+            b_enable=[True, True, True, False],
+        )
+
+    if text:
+        _LOG_NO_GUI(text, type, sensitivity)
+
+    return _LOG_NO_GUI
 
 
 # ---------------------------------------------------------------------
@@ -452,46 +322,34 @@ def LogNoGUI(
 def LogConf(
     text: str = "",
     type: str = "INFO",
-    sensitivity: str = "CONFIDENTIAL",
+    sensitivity: str = "PUBLIC",
     mode: str = "normal",
     session_state: Optional[object] = None,
     gui_key: str = "textforge_gui_log",
     log_root: Optional[str | Path] = None,
 ) -> TextForge:
     """
-    Create a logger for confidential developer-analysis material.
+    Log only through archive.
 
-    b_enable:
-        [1, 0, 0, 0]
+    Routing:
+        b_enable = [1, 0, 0, 0]
 
-    Active sinks:
-        sinks[0] Sink0_Archive only
-
-    Disabled:
-        sinks[1] File_PublicRun
-        sinks[2] CliRuntimeSink
-        sinks[3] GuiPublicSink
-
-    Default sensitivity:
-        CONFIDENTIAL
-
-    Use case:
-        Full prompt, full SuperPrompt, retrieved chunks, LLM output,
-        or similar protected developer-analysis material.
-
-    Note:
-        HIGHLY_CONFIDENTIAL should normally not be logged.
+    Filtering:
+        Only the archive sink decides by accept_types and accept_sensitivities.
     """
 
-    logger = CreateTextForge(
-        text=text,
-        type=type,
-        sensitivity=sensitivity,
-        mode=mode,
-        session_state=session_state,
-        gui_key=gui_key,
-        log_root=log_root,
-        b_enable=[True, False, False, False],
-    )
+    global _LOG_CONF
 
-    return logger
+    if _LOG_CONF is None or session_state is not None or log_root is not None:
+        _LOG_CONF = CreateTextForge(
+            mode=mode,
+            session_state=session_state,
+            gui_key=gui_key,
+            log_root=log_root,
+            b_enable=[True, False, False, False],
+        )
+
+    if text:
+        _LOG_CONF(text, type, sensitivity)
+
+    return _LOG_CONF

@@ -18,16 +18,7 @@ from ragstream.app.controller import AppController
 from ragstream.memory.memory_actions import capture_memory_pair
 from ragstream.memory.memory_manager import MemoryManager
 from ragstream.orchestration.super_prompt import SuperPrompt
-
-
-def _log_runtime(
-    text: str,
-    type: str = "INFO",
-    sensitivity: str = "PUBLIC",
-) -> None:
-    logger = st.session_state.get("raglog")
-    if logger is not None:
-        logger(text, type, sensitivity)
+from ragstream.textforge.RagLog import LogALL as logger
 
 
 def do_preprocess() -> None:
@@ -69,11 +60,11 @@ def do_feed_memory_manually() -> None:
     output_text = st.session_state.get("manual_memory_feed_text", "")
 
     if not (prompt_text or "").strip():
-        _log_runtime("Prompt is empty. No memory record was created.", "WARN", "PUBLIC")
+        logger("Prompt is empty. No memory record was created.", "WARN", "PUBLIC")
         return
 
     if not (output_text or "").strip():
-        _log_runtime("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
+        logger("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
         return
 
     memory_manager: MemoryManager = st.session_state.memory_manager
@@ -84,7 +75,7 @@ def do_feed_memory_manually() -> None:
             "output_text": output_text,
         }
         st.session_state["memory_title_required"] = True
-        _log_runtime("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
+        logger("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
         st.session_state["runtime_log_flash_until"] = time.time() + 5
         st.rerun()
 
@@ -98,14 +89,14 @@ def do_confirm_memory_title_and_save() -> None:
     """Confirm first memory title and save pending manual memory pair."""
     title = (st.session_state.get("memory_title_input", "") or "").strip()
     if not title:
-        _log_runtime("Memory title must not be empty.", "WARN", "PUBLIC")
+        logger("Memory title must not be empty.", "WARN", "PUBLIC")
         return
 
     memory_manager: MemoryManager = st.session_state.memory_manager
 
     if not memory_manager.title.strip():
         memory_manager.start_new_history(title)
-        _log_runtime(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
+        logger(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
 
     pending_pair = st.session_state.get("pending_manual_memory_pair")
     if pending_pair:
@@ -140,19 +131,19 @@ def _save_memory_pair(
             active_project_name=active_project_name,
             embedded_files_snapshot=embedded_files_snapshot,
             gui_records_state=gui_records_state,
+            memory_ingestion_manager=st.session_state.get("memory_ingestion_manager"),
         )
 
         if result.get("success"):
-            _log_runtime(result.get("message", "Memory record saved."), "INFO", "PUBLIC")
             st.session_state["pending_manual_memory_pair"] = None
             st.session_state["memory_title_required"] = False
             st.session_state["manual_memory_feed_text"] = ""
             st.rerun()
         else:
-            _log_runtime(result.get("message", "Memory record was not saved."), "WARN", "PUBLIC")
+            logger(result.get("message", "Memory record was not saved."), "WARN", "PUBLIC")
 
     except Exception as e:
-        _log_runtime(str(e), "ERROR", "PUBLIC")
+        logger(str(e), "ERROR", "PUBLIC")
 
 
 def _get_active_project_snapshot(ctrl: AppController) -> tuple[str | None, list[str]]:

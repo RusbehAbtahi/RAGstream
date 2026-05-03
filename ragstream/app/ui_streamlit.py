@@ -15,9 +15,13 @@ import streamlit as st
 
 from ragstream.app.controller import AppController
 from ragstream.app.ui_layout import inject_base_css, render_page
+from ragstream.ingestion.embedder import Embedder
+from ragstream.memory.memory_chunker import MemoryChunker
+from ragstream.memory.memory_ingestion_manager import MemoryIngestionManager
 from ragstream.memory.memory_manager import MemoryManager
+from ragstream.memory.memory_vector_store import MemoryVectorStore
 from ragstream.orchestration.super_prompt import SuperPrompt
-from ragstream.textforge.RagLog import LogALL
+from ragstream.textforge.RagLog import LogALL as logger
 
 
 def init_session_state() -> None:
@@ -25,6 +29,9 @@ def init_session_state() -> None:
     if "controller" not in st.session_state:
         ctrl = AppController()
         st.session_state.controller = ctrl
+
+    if "textforge_gui_log" not in st.session_state:
+        st.session_state["textforge_gui_log"] = ""
 
     if "memory_manager" not in st.session_state:
         project_root = Path(__file__).resolve().parents[2]
@@ -37,11 +44,32 @@ def init_session_state() -> None:
             title="",
         )
 
-    if "textforge_gui_log" not in st.session_state:
-        st.session_state["textforge_gui_log"] = ""
+    if "memory_ingestion_manager" not in st.session_state:
+        project_root = Path(__file__).resolve().parents[2]
+        memory_root = project_root / "data" / "memory"
+        memory_vector_root = memory_root / "vector_db"
 
-    if "raglog" not in st.session_state:
-        st.session_state.raglog = LogALL(session_state=st.session_state)
+        memory_chunker = MemoryChunker()
+
+        memory_embedder = Embedder(model="text-embedding-3-large")
+
+        memory_vector_store = MemoryVectorStore(
+            persist_dir=str(memory_vector_root),
+            collection_name="memory_vectors",
+            embedder=memory_embedder,
+        )
+
+        st.session_state.memory_ingestion_manager = MemoryIngestionManager(
+            memory_manager=st.session_state.memory_manager,
+            memory_chunker=memory_chunker,
+            memory_vector_store=memory_vector_store,
+        )
+
+        logger(
+            "Memory ingestion layer ready: data/memory/vector_db/ | collection=memory_vectors",
+            "INFO",
+            "PUBLIC",
+        )
 
     if "heavy_init_started" not in st.session_state:
         st.session_state["heavy_init_started"] = False
@@ -89,10 +117,10 @@ def init_session_state() -> None:
         st.session_state["retrieval_top_k"] = 30
 
     if "use_retrieval_splade" not in st.session_state:
-            st.session_state["use_retrieval_splade"] = False
+        st.session_state["use_retrieval_splade"] = False
 
     if "use_reranking_colbert" not in st.session_state:
-            st.session_state["use_reranking_colbert"] = False
+        st.session_state["use_reranking_colbert"] = False
 
     if "manual_memory_feed_text" not in st.session_state:
         st.session_state["manual_memory_feed_text"] = ""
@@ -121,6 +149,7 @@ def main() -> None:
 
     # Page layout
     render_page()
+
 
 if __name__ == "__main__":
     main()

@@ -26,3 +26,6 @@ colorama>=0.4            # nicer console output on Windows
 python-dotenv>=1.0       # `.env` loader for Settings
 
 yake>=0.4.8              # local automatic keyword extraction for MemoryRecord
+
+# ─────────── Memory ingestion ───────
+llama-index-core==0.12.52   # semantic sentence-based chunking for MemoryRecord ingestion
