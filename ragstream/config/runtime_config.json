@@ -1,0 +1,84 @@
+{
+  "config_meta": {
+    "config_name": "runtime_config",
+    "version": "001",
+    "scope": "global_runtime_defaults"
+  },
+  "memory_retrieval": {
+    "enabled": true,
+    "tag_catalog": [
+      "Gold",
+      "Green",
+      "Black"
+    ],
+    "retrieval_source_modes": {
+      "default": "QA",
+      "options": {
+        "QA": "Retrieve Q+A",
+        "Q": "Retrieve only Q",
+        "A": "Retrieve only A"
+      }
+    },
+    "parent_score_weights": {
+      "QA": {
+        "answer": 0.55,
+        "question": 0.35,
+        "meta": 0.10
+      },
+      "A": {
+        "answer": 0.85,
+        "question": 0.00,
+        "meta": 0.15
+      },
+      "Q": {
+        "answer": 0.00,
+        "question": 0.85,
+        "meta": 0.15
+      }
+    },
+    "working_memory": {
+      "enabled": true,
+      "max_pairs": 2,
+      "latest_pair_max_tokens": 3000,
+      "other_pair_max_tokens": 1500,
+      "total_max_tokens": 4000,
+      "exclude_tags": [
+        "Black"
+      ]
+    },
+    "episodic_memory": {
+      "enabled": true,
+      "max_total_records": 3,
+      "max_gold_records": 1,
+      "gold_max_tokens": 3000,
+      "green_max_tokens": 1500,
+      "exclude_tags": [
+        "Black"
+      ]
+    },
+    "direct_recall": {
+      "enabled": true,
+      "max_keys_per_run": 1,
+      "gold_max_tokens": 3000,
+      "green_max_tokens": 1500,
+      "exclude_tags": [
+        "Black"
+      ]
+    },
+    "semantic_memory_chunks": {
+      "enabled": true,
+      "max_memory_chunks": 5
+    }
+  },
+  "document_retrieval": {
+    "semantic_stage_max_total_chunks": 30,
+    "max_document_chunks_for_a3": 25
+  },
+  "a4_condenser": {
+    "max_output_tokens": 5000
+  },
+  "hard_rules": {
+    "enabled": false,
+    "planned_later": true
+  }
+}

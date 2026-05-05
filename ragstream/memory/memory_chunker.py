@@ -90,8 +90,8 @@ class MemoryChunker:
         return "\n".join(
             [
                 f"PROJECT: {record.active_project_name or ''}",
-                f"TAG: {record.tag or ''}",
-                f"USER_KEYWORDS: {self._join_list(record.user_keywords)}",
+             #   f"TAG: {record.tag or ''}",
+            #    f"USER_KEYWORDS: {self._join_list(record.user_keywords)}",
                 f"YAKE_KEYWORDS: {self._join_list(record.auto_keywords)}",
                 "QUESTION_ANCHOR:",
                 question_anchor.strip(),

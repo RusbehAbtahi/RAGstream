@@ -34,6 +34,7 @@
 │   ├── config
 │   │   ├── __init__.py
 │   │   ├── prompt_schema.json
+│   │   ├── runtime_config.json
 │   │   └── settings.py
 │   ├── ingestion
 │   │   ├── __init__.py
@@ -159,7 +160,14 @@
     │   │   ├── 2026-05-01-15-01-TEST1.ragmeta.json
     │   │   ├── 2026-05-01-15-19-MUSIC_SChostakovitch.ragmeta.json
     │   │   ├── 2026-05-03-13-45-TEST.ragmeta.json
-    │   │   └── 2026-05-03-13-55-T.ragmeta.json
+    │   │   ├── 2026-05-03-13-55-T.ragmeta.json
+    │   │   ├── 2026-05-04-16-22-Test.ragmeta.json
+    │   │   ├── 2026-05-04-16-56-TEST.ragmeta.json
+    │   │   ├── 2026-05-04-17-03-Test.ragmeta.json
+    │   │   ├── 2026-05-05-04-36-Test.ragmeta.json
+    │   │   ├── 2026-05-05-04-42-Test.ragmeta.json
+    │   │   ├── 2026-05-05-05-15-Test.ragmeta.json
+    │   │   └── 2026-05-05-05-29-TA.ragmeta.json
     │   └── vector_db
     │       ├── 36c58a2a-9b94-47e5-a496-e41f40090e5b
     ├── np_store

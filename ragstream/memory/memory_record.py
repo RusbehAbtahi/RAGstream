@@ -5,14 +5,16 @@ MemoryRecord
 ============
 One accepted input/output memory unit.
 
-A MemoryRecord stores:
-- raw Prompt input
-- accepted output/response
-- tag
-- automatic YAKE keywords
-- optional user keywords
-- active project snapshot
-- embedded files snapshot
+Authority split:
+- .ragmem stores only the stable append-only memory body.
+- .ragmeta.json stores current metadata.
+- SQLite mirrors .ragmeta.json for fast lookup/indexing.
+
+A MemoryRecord in RAM contains both:
+- stable body fields
+- current metadata fields
+
+Only stable body fields are serialized into .ragmem.
 """
 
 from __future__ import annotations
@@ -27,6 +29,9 @@ from typing import Any
 
 RECORD_START = "----- MEMORY RECORD START -----"
 RECORD_END = "----- MEMORY RECORD END -----"
+
+
+RETRIEVAL_SOURCE_MODES = {"QA", "Q", "A"}
 
 
 def _utc_now() -> str:
@@ -56,6 +61,23 @@ def _clean_list(values: list[str] | None) -> list[str]:
     return cleaned
 
 
+def _clean_retrieval_source_mode(value: str | None) -> str:
+    mode = str(value or "QA").strip().upper()
+    return mode if mode in RETRIEVAL_SOURCE_MODES else "QA"
+
+
+def _clean_direct_recall_key(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    return text if text else None
+
+
 class MemoryRecord:
     def __init__(
         self,
@@ -67,6 +89,8 @@ class MemoryRecord:
         user_keywords: list[str] | None = None,
         active_project_name: str | None = None,
         embedded_files_snapshot: list[str] | None = None,
+        retrieval_source_mode: str = "QA",
+        direct_recall_key: str = "",
         *,
         record_id: str | None = None,
         created_at_utc: str | None = None,
@@ -84,6 +108,8 @@ class MemoryRecord:
 
         self.tag: str = tag or "Green"
         self.user_keywords: list[str] = _clean_list(user_keywords)
+        self.retrieval_source_mode: str = _clean_retrieval_source_mode(retrieval_source_mode)
+        self.direct_recall_key: str = _clean_direct_recall_key(direct_recall_key)
 
         self.active_project_name: str | None = active_project_name
         self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
@@ -123,6 +149,8 @@ class MemoryRecord:
         self,
         tag: str | None = None,
         user_keywords: list[str] | None = None,
+        retrieval_source_mode: str | None = None,
+        direct_recall_key: str | None = None,
     ) -> None:
         if tag is not None:
             clean_tag = str(tag).strip()
@@ -132,7 +160,54 @@ class MemoryRecord:
         if user_keywords is not None:
             self.user_keywords = _clean_list(user_keywords)
 
-    def to_full_dict(self) -> dict[str, Any]:
+        if retrieval_source_mode is not None:
+            self.retrieval_source_mode = _clean_retrieval_source_mode(retrieval_source_mode)
+
+        if direct_recall_key is not None:
+            self.direct_recall_key = _clean_direct_recall_key(direct_recall_key)
+
+    def update_metadata_overlay(
+        self,
+        metadata: dict[str, Any],
+    ) -> None:
+        """
+        Apply current metadata loaded from .ragmeta.json.
+
+        This method deliberately does not modify stable .ragmem body fields:
+        - record_id
+        - parent_id
+        - created_at_utc
+        - input_text
+        - output_text
+        - source
+        - input_hash
+        - output_hash
+        """
+        if not isinstance(metadata, dict):
+            return
+
+        self.update_editable_metadata(
+            tag=metadata.get("tag"),
+            user_keywords=list(metadata.get("user_keywords") or []),
+            retrieval_source_mode=metadata.get("retrieval_source_mode"),
+            direct_recall_key=metadata.get("direct_recall_key"),
+        )
+
+        if "auto_keywords" in metadata:
+            self.auto_keywords = _clean_list(list(metadata.get("auto_keywords") or []))
+
+        if "active_project_name" in metadata:
+            self.active_project_name = _optional_str(metadata.get("active_project_name"))
+
+        if "embedded_files_snapshot" in metadata:
+            self.embedded_files_snapshot = list(metadata.get("embedded_files_snapshot") or [])
+
+    def to_ragmem_dict(self) -> dict[str, Any]:
+        """
+        Stable append-only .ragmem body.
+
+        Editable GUI metadata is intentionally excluded from this dictionary.
+        """
         return {
             "record_id": self.record_id,
             "parent_id": self.parent_id,
@@ -140,26 +215,32 @@ class MemoryRecord:
             "input_text": self.input_text,
             "output_text": self.output_text,
             "source": self.source,
-            "tag": self.tag,
-            "auto_keywords": self.auto_keywords,
-            "user_keywords": self.user_keywords,
-            "active_project_name": self.active_project_name,
-            "embedded_files_snapshot": self.embedded_files_snapshot,
             "input_hash": self.input_hash,
             "output_hash": self.output_hash,
         }
 
     def to_ragmem_block(self) -> str:
-        body = json.dumps(self.to_full_dict(), ensure_ascii=False, indent=2)
+        body = json.dumps(self.to_ragmem_dict(), ensure_ascii=False, indent=2)
         return f"{RECORD_START}\n{body}\n{RECORD_END}\n"
 
     def to_index_dict(self) -> dict[str, Any]:
+        """
+        Current metadata/index view.
+
+        This dictionary is used for:
+        - .ragmeta.json per-record metadata
+        - SQLite mirror rows
+
+        It does not duplicate full input_text or output_text.
+        """
         return {
             "record_id": self.record_id,
             "parent_id": self.parent_id,
             "created_at_utc": self.created_at_utc,
             "source": self.source,
             "tag": self.tag,
+            "retrieval_source_mode": self.retrieval_source_mode,
+            "direct_recall_key": self.direct_recall_key,
             "auto_keywords": self.auto_keywords,
             "user_keywords": self.user_keywords,
             "active_project_name": self.active_project_name,
@@ -168,20 +249,57 @@ class MemoryRecord:
             "output_hash": self.output_hash,
         }
 
+    def to_full_dict(self) -> dict[str, Any]:
+        """
+        Full in-RAM diagnostic/export view.
+
+        This is not used for .ragmem serialization.
+        """
+        data = self.to_ragmem_dict()
+        data.update(
+            {
+                "tag": self.tag,
+                "retrieval_source_mode": self.retrieval_source_mode,
+                "direct_recall_key": self.direct_recall_key,
+                "auto_keywords": self.auto_keywords,
+                "user_keywords": self.user_keywords,
+                "active_project_name": self.active_project_name,
+                "embedded_files_snapshot": self.embedded_files_snapshot,
+            }
+        )
+        return data
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
+        """
+        Load one MemoryRecord from a .ragmem block.
+
+        Supports both:
+        - new body-only .ragmem blocks
+        - older full .ragmem blocks that still contain metadata
+
+        Current metadata from .ragmeta.json is applied later by MemoryManager.
+        """
+        auto_keywords_raw = data.get("auto_keywords")
+
         return cls(
             input_text=str(data.get("input_text", "")),
             output_text=str(data.get("output_text", "")),
             source=str(data.get("source", "")),
-            parent_id=data.get("parent_id"),
+            parent_id=_optional_str(data.get("parent_id")),
             tag=str(data.get("tag", "Green")),
             user_keywords=list(data.get("user_keywords") or []),
-            active_project_name=data.get("active_project_name"),
+            active_project_name=_optional_str(data.get("active_project_name")),
             embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
+            retrieval_source_mode=str(data.get("retrieval_source_mode", "QA")),
+            direct_recall_key=str(data.get("direct_recall_key", "")),
             record_id=str(data.get("record_id") or uuid.uuid4().hex),
             created_at_utc=str(data.get("created_at_utc") or _utc_now()),
-            auto_keywords=list(data.get("auto_keywords") or []),
+            auto_keywords=(
+                list(auto_keywords_raw)
+                if isinstance(auto_keywords_raw, list)
+                else None
+            ),
             input_hash=data.get("input_hash"),
             output_hash=data.get("output_hash"),
         )

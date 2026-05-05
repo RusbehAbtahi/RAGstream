@@ -168,19 +168,31 @@ def _collect_memory_gui_state(memory_manager: MemoryManager) -> list[dict[str, A
 
     for record in memory_manager.records:
         tag_key = f"memory_tag_{record.record_id}"
+        source_mode_key = f"memory_retrieval_source_mode_{record.record_id}"
         keywords_key = f"memory_user_keywords_{record.record_id}"
+        direct_recall_key = f"memory_direct_recall_key_{record.record_id}"
 
         tag = st.session_state.get(tag_key, record.tag)
+        retrieval_source_mode = st.session_state.get(
+            source_mode_key,
+            getattr(record, "retrieval_source_mode", "QA"),
+        )
         user_keywords_text = st.session_state.get(
             keywords_key,
             ", ".join(record.user_keywords),
+        )
+        direct_recall_value = st.session_state.get(
+            direct_recall_key,
+            getattr(record, "direct_recall_key", ""),
         )
 
         gui_state.append(
             {
                 "record_id": record.record_id,
                 "tag": tag,
+                "retrieval_source_mode": retrieval_source_mode,
                 "user_keywords": _parse_user_keywords(user_keywords_text),
+                "direct_recall_key": str(direct_recall_value or "").strip(),
             }
         )
 

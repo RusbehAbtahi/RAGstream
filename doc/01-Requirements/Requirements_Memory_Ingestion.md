@@ -1,9 +1,6 @@
-Revised in the same spirit as `Requirements_AgentStack.md`: detailed enough to guide implementation, but not so concrete that every method name, dictionary field, or worker detail becomes a future trap.
-
-````markdown
 # Requirements_Memory_Ingestion.md
 
-Last update: 30.04.2026
+Last update: 05.05.2026
 
 ## 1. Purpose and scope
 
@@ -36,7 +33,7 @@ The full original Q/A remains owned by Memory Recording:
 - full assistant answer / output
 - tag
 - YAKE keywords
-- user keywords
+- user keywords as a future-reserved metadata field
 - project/session metadata
 - hashes and source information
 
@@ -451,7 +448,7 @@ integrity:
 
 keywords:
   YAKE keywords
-  user keywords
+  user keywords as a future-reserved metadata field
 ```
 
 The exact encoding of list-like values is an implementation detail.
@@ -491,20 +488,9 @@ offsets
 hashes
 ```
 
-Some fields may appear both in embedded text and metadata.
+The record-handle embedded text shall use YAKE keywords and the copied question anchor.
 
-For example, in the record-handle vector:
-
-* project name
-* tag
-* YAKE keywords
-* user keywords
-
-may be part of the embedded handle text.
-
-The same fields are also stored as metadata for all vector roles.
-
-This is intentional.
+Tag, project name, and user keywords shall remain metadata only.
 
 Embedding supports semantic matching.
 
@@ -541,8 +527,7 @@ existing vectors for record_id are removed or replaced
 
 This is necessary when:
 
-* a tag changes
-* user keywords change
+* explicit re-ingestion is requested after metadata changes
 * ingestion is retried
 * chunking configuration changes
 * the embedding model changes
@@ -563,10 +548,8 @@ It may include:
 * record identity
 * input hash
 * output hash
-* tag
-* user keywords
 * YAKE keywords
-* project name
+* metadata fields that are intentionally mirrored into vector metadata
 * chunking configuration version
 * embedding model name
 
@@ -667,7 +650,7 @@ Memory Recording, Memory Ingestion, Memory Retrieval, and Compression must remai
 Memory Ingestion must be deterministic given:
 
 * the same MemoryRecord
-* the same metadata
+* the same vector-relevant metadata
 * the same chunking configuration
 * the same embedding model
 
@@ -726,7 +709,7 @@ Memory Ingestion is complete when:
    * parent `record_id`
    * role metadata
    * block metadata
-   * tag/project/keyword metadata
+   * tag/project metadata and future-reserved user-keyword metadata
 
 5. Record-handle text is deterministic and extractive.
 
@@ -743,6 +726,3 @@ Memory Ingestion is complete when:
 11. Document vector stores and memory vector stores remain separate.
 
 12. The original full MemoryRecord remains the only memory truth.
-
-```
-```

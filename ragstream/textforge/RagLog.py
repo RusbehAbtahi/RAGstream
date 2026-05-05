@@ -14,12 +14,22 @@ Responsibilities:
     LogALL()
     LogNoGUI()
     LogConf()
+    LOGDeveloper()
 
 Fixed sink order:
     sinks[0] = Sink0_Archive
     sinks[1] = File_PublicRun
     sinks[2] = CliRuntimeSink
     sinks[3] = GuiPublicSink
+
+Developer logger:
+    LOGDeveloper()
+    - Standalone TextForge.
+    - One single FileSink only.
+    - Writes to data/logs/developer/.
+    - Accepts all types and all sensitivities.
+    - Async file writing enabled.
+    - Controlled globally by B_developer.
 """
 
 from __future__ import annotations
@@ -33,6 +43,13 @@ from ragstream.textforge.TextSink import TextSink
 from ragstream.textforge.FileSink import FileSink
 from ragstream.textforge.CliSink import CliSink
 from ragstream.textforge.GUISink import GuiSink
+
+
+# ---------------------------------------------------------------------
+# Global developer logging switch
+# ---------------------------------------------------------------------
+
+B_developer: bool = True
 
 
 # ---------------------------------------------------------------------
@@ -76,10 +93,18 @@ CLI_DEVELOPER_SENSITIVITIES: list[str] = [
     "CONFIDENTIAL",
 ]
 
+DEVELOPER_ALL_SENSITIVITIES: list[str] = [
+    "PUBLIC",
+    "INTERNAL",
+    "CONFIDENTIAL",
+    "HIGHLY_CONFIDENTIAL",
+]
+
 
 _LOG_ALL: TextForge | None = None
 _LOG_NO_GUI: TextForge | None = None
 _LOG_CONF: TextForge | None = None
+_LOG_DEVELOPER: TextForge | None = None
 
 
 # ---------------------------------------------------------------------
@@ -236,7 +261,81 @@ def CreateTextForge(
 
 
 # ---------------------------------------------------------------------
-# 3) LogALL
+# 3) CreateDeveloperTextForge
+# ---------------------------------------------------------------------
+
+def CreateDeveloperTextForge(
+    text: str = "",
+    type: str = "DEBUG",
+    sensitivity: str = "CONFIDENTIAL",
+    log_root: Optional[str | Path] = None,
+    developer_rotation_size: int = 100_000_000,
+) -> TextForge:
+    """
+    Create the standalone developer TextForge.
+
+    This logger is intentionally separate from the normal 4-sink runtime logger.
+
+    Sink model:
+        sinks[0] = Developer_FileSink
+
+    Routing:
+        b_enable = [B_developer]
+
+    Behavior:
+        If B_developer is True:
+            Developer messages are written to data/logs/developer/.
+        If B_developer is False:
+            The logger call remains valid, but no sink receives the message.
+
+    Intended use:
+        Detailed development diagnostics:
+        - token reports
+        - variable dumps
+        - stage internals
+        - prompt fragments
+        - model/debug metadata
+    """
+
+    project_root = Path(__file__).resolve().parents[2]
+
+    if log_root is None:
+        logs_root = project_root / "data" / "logs"
+    else:
+        logs_root = Path(log_root)
+
+    today = date.today().isoformat()
+
+    developer_dir = logs_root / "developer"
+    developer_dir.mkdir(parents=True, exist_ok=True)
+
+    developer_path = developer_dir / f"developer_{today}.log"
+
+    developer_sink = FileSink(
+        path=str(developer_path),
+        accept_types=ALL_TYPES,
+        accept_sensitivities=DEVELOPER_ALL_SENSITIVITIES,
+        rotation_size=developer_rotation_size,
+        split_flag=True,
+        b_sqlite=False,
+        sqlite_path=None,
+        b_async=True,
+        b_timestamp=True,
+        b_prefix=True,
+        b_suffix=False,
+    )
+
+    return TextForge(
+        text=text,
+        type=type,
+        sensitivity=sensitivity,
+        sinks=[developer_sink],
+        b_enable=[bool(B_developer)],
+    )
+
+
+# ---------------------------------------------------------------------
+# 4) LogALL
 # ---------------------------------------------------------------------
 
 def LogALL(
@@ -276,7 +375,7 @@ def LogALL(
 
 
 # ---------------------------------------------------------------------
-# 4) LogNoGUI
+# 5) LogNoGUI
 # ---------------------------------------------------------------------
 
 def LogNoGUI(
@@ -316,7 +415,7 @@ def LogNoGUI(
 
 
 # ---------------------------------------------------------------------
-# 5) LogConf
+# 6) LogConf
 # ---------------------------------------------------------------------
 
 def LogConf(
@@ -353,3 +452,71 @@ def LogConf(
         _LOG_CONF(text, type, sensitivity)
 
     return _LOG_CONF
+
+
+# ---------------------------------------------------------------------
+# 7) LOGDeveloper
+# ---------------------------------------------------------------------
+
+def LOGDeveloper(
+    text: str = "",
+    type: str = "DEBUG",
+    sensitivity: str = "CONFIDENTIAL",
+    log_root: Optional[str | Path] = None,
+) -> TextForge:
+    """
+    Standalone developer logger.
+
+    Import pattern:
+        from ragstream.textforge.RagLog import LOGDeveloper as logger_dev
+
+    Usage:
+        logger_dev("A4 token usage: ...", "DEBUG", "CONFIDENTIAL")
+        logger_dev(f"sp.extras = {sp.extras}", "TRACE", "CONFIDENTIAL")
+
+    Routing:
+        b_enable = [B_developer]
+
+    If B_developer is False:
+        Existing logger_dev(...) lines remain in the code,
+        but no developer message is written.
+    """
+
+    global _LOG_DEVELOPER
+
+    if _LOG_DEVELOPER is None or log_root is not None:
+        _LOG_DEVELOPER = CreateDeveloperTextForge(
+            log_root=log_root,
+        )
+
+    _LOG_DEVELOPER.b_enable = [bool(B_developer)]
+
+    if text:
+        _LOG_DEVELOPER(text, type, sensitivity)
+
+    return _LOG_DEVELOPER
+
+
+# ---------------------------------------------------------------------
+# 8) LogDeveloper compatibility alias
+# ---------------------------------------------------------------------
+
+def LogDeveloper(
+    text: str = "",
+    type: str = "DEBUG",
+    sensitivity: str = "CONFIDENTIAL",
+    log_root: Optional[str | Path] = None,
+) -> TextForge:
+    """
+    Compatibility alias for LOGDeveloper.
+
+    Preferred name:
+        LOGDeveloper
+    """
+
+    return LOGDeveloper(
+        text=text,
+        type=type,
+        sensitivity=sensitivity,
+        log_root=log_root,
+    )

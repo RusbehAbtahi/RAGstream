@@ -1,0 +1,201 @@
+You are right. I used extra layout control. Below is the cleaner AgentStack-style format: same standard settings, no `together`, no `nodesep`, no `ranksep`, no layout rails. I only shortened the visual method signatures and moved detail into notes, like your AgentStack UML style. 
+
+```plantuml
+@startuml RAGstream_Memory_Retrieval
+
+'──────────────────────────────────────────────────────────────
+'  GLOBAL SETTINGS
+'──────────────────────────────────────────────────────────────
+left to right direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+'  1) GUI / ORCHESTRATION CONTEXT
+'──────────────────────────────────────────────────────────────
+package "GUI / Orchestration Context" {
+
+    class StreamlitUI
+
+    class AppController
+
+    class SuperPrompt {
+        + memory_context_pack : MemoryContextPack
+        + prompt_ready : str
+        + extras : Dict
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  2) MEMORY RETRIEVAL CORE
+'──────────────────────────────────────────────────────────────
+package "Memory Retrieval Core" {
+
+    class MemoryRetriever {
+        + memory_manager : MemoryManager
+        + memory_vector_store : MemoryVectorStore
+        + index_lookup : MemoryIndexLookup
+        + scorer : MemoryScorer
+        + config : Dict
+
+        + run(sp:SuperPrompt) : SuperPrompt
+        - _build_query_text(sp:SuperPrompt) : str
+        - _run_semantic_pass(...) : List[Dict]
+        - _collect_index_candidates(...) : Dict
+        - _build_context_pack(...) : MemoryContextPack
+        - _write_to_superprompt(...) : None
+        - _log_developer_diagnostics(...) : None
+    }
+
+    class MemoryScorer {
+        + config : Dict
+        + parent_score_weights : Dict
+
+        + score_vector_hits(raw_hits:List[Dict]) : List[Dict]
+        + aggregate_parent_scores(...) : List[Dict]
+        + select_semantic_chunks(...) : List[Dict]
+    }
+
+    class MemoryIndexLookup {
+        + sqlite_path : str
+
+        + get_working_memory(file_id:str, cfg:Dict) : List[Dict]
+        + get_latest_gold(file_id:str, cfg:Dict) : List[Dict]
+        + get_direct_recall(key:str, cfg:Dict) : Dict
+        + get_records_by_ids(...) : List[Dict]
+    }
+
+    class MemoryContextPack {
+        + working_memory_candidates : List[Dict]
+        + episodic_candidates : List[Dict]
+        + semantic_memory_chunks : List[Dict]
+        + direct_recall_candidate : Dict
+        + selection_diagnostics : Dict
+        + token_budget_report : Dict
+
+        + add_working_memory(candidate:Dict) : None
+        + add_episodic_candidate(candidate:Dict) : None
+        + add_semantic_chunk(candidate:Dict) : None
+        + set_direct_recall(candidate:Dict) : None
+        + to_dict() : Dict
+        + to_debug_markdown() : str
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+'  3) EXISTING MEMORY SUBSYSTEM
+'──────────────────────────────────────────────────────────────
+package "Existing Memory Subsystem" {
+
+    class MemoryManager
+    class MemoryRecord
+    class MemoryVectorStore
+}
+
+'──────────────────────────────────────────────────────────────
+'  4) PERSISTENCE / CONFIG
+'──────────────────────────────────────────────────────────────
+package "Persistence / Config" {
+
+    class RuntimeConfigJSON
+    class MemorySQLite
+    class RagMetaJson
+    class RagMemFile
+}
+
+'──────────────────────────────────────────────────────────────
+'  5) DEPENDENCIES & FLOW
+'──────────────────────────────────────────────────────────────
+
+StreamlitUI --> AppController : press Retrieval
+AppController --> MemoryRetriever : run(sp)
+AppController --> SuperPrompt : passes current sp
+
+MemoryRetriever --> SuperPrompt : reads query fields
+MemoryRetriever --> MemoryScorer : score / aggregate
+MemoryRetriever --> MemoryIndexLookup : deterministic lookups
+MemoryRetriever --> MemoryVectorStore : semantic search
+MemoryRetriever --> MemoryManager : active file_id / live records
+MemoryRetriever --> MemoryContextPack : builds runtime pack
+MemoryRetriever --> SuperPrompt : writes memory_context_pack
+
+MemoryScorer ..> MemoryRecord : uses mode/tag metadata
+
+MemoryIndexLookup --> MemorySQLite : SELECT lookups
+MemoryIndexLookup ..> RagMetaJson : metadata truth
+MemoryIndexLookup ..> RagMemFile : parent Q/A truth if needed
+
+MemoryManager "1" o-- "0..*" MemoryRecord : owns live records
+MemoryVectorStore ..> MemoryRecord : metadata.record_id links to parent
+
+RuntimeConfigJSON ..> MemoryRetriever : memory_retrieval cfg
+RuntimeConfigJSON ..> MemoryScorer : score weights / limits
+
+SuperPrompt --> StreamlitUI : raw memory debug rendering
+
+'──────────────────────────────────────────────────────────────
+'  6) NOTES
+'──────────────────────────────────────────────────────────────
+
+note right of MemoryRetriever
+  File:
+  ragstream/retrieval/retriever_mem.py
+
+  Main orchestrator.
+
+  Input:
+  - current SuperPrompt
+  - active memory file
+  - runtime_config memory_retrieval
+
+  Output:
+  - raw MemoryContextPack stored in SuperPrompt
+
+  Important:
+  - A3 is not run here
+  - A4 is not run here
+  - MemoryMerge is not run here
+end note
+
+note right of MemoryScorer
+  File:
+  ragstream/memory/memory_scoring.py
+
+  Job:
+  - score raw vector hits
+  - aggregate by parent MemoryRecord
+  - keep top semantic chunks
+end note
+
+note right of MemoryIndexLookup
+  File:
+  ragstream/memory/memory_index_lookup.py
+
+  Job:
+  - working memory lookup
+  - latest Gold lookup
+  - Direct Recall lookup
+  - SQLite-based filtering
+end note
+
+note right of MemoryContextPack
+  File:
+  ragstream/memory/memory_context_pack.py
+
+  Runtime candidate container only.
+
+  Not durable truth.
+  Not compressed memory.
+end note
+
+note top of SuperPrompt
+  Retrieval stage stores:
+  - raw memory episodes
+  - raw semantic chunks
+  - raw direct recall result
+end note
+
+@enduml
+```

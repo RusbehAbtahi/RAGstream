@@ -29,8 +29,6 @@ from ragstream.app.ui_actions import (
 
 TAG_COLORS: dict[str, str] = {
     "Gold": "#D4AF37",
-    "Silver": "#C0C7D2",
-    "Red": "#E0115F",
     "Green": "#00A86B",
     "Black": "#111111",
 }
@@ -177,6 +175,18 @@ def inject_base_css() -> None:
             /* Make small select boxes look compact */
             div[data-baseweb="select"] > div {
                 min-height: 34px;
+            }
+
+            /* Direct Recall Key field: special red border */
+            div[data-testid="stTextInput"]:has(input[aria-label="Direct Recall Key"]) div[data-baseweb="input"] {
+                border: 2px solid #D11A2A !important;
+                border-radius: 0.45rem !important;
+                box-shadow: none !important;
+            }
+
+            div[data-testid="stTextInput"]:has(input[aria-label="Direct Recall Key"]) div[data-baseweb="input"]:focus-within {
+                border: 2px solid #D11A2A !important;
+                box-shadow: 0 0 0 1px rgba(209, 26, 42, 0.25) !important;
             }
         </style>
         """,
@@ -427,15 +437,30 @@ def render_memory_records(height: int = 420) -> None:
         else:
             for record in memory_entries:
                 tag_key = f"memory_tag_{record.record_id}"
+                source_mode_key = f"memory_retrieval_source_mode_{record.record_id}"
                 keywords_key = f"memory_user_keywords_{record.record_id}"
+                direct_recall_key = f"memory_direct_recall_key_{record.record_id}"
+
+                tag_options = list(memory_manager.tag_catalog)
+                record_tag = record.tag if record.tag in tag_options else "Green"
 
                 if tag_key not in st.session_state:
-                    st.session_state[tag_key] = record.tag
+                    st.session_state[tag_key] = record_tag
+                elif st.session_state[tag_key] not in tag_options:
+                    st.session_state[tag_key] = "Green"
+
+                if source_mode_key not in st.session_state:
+                    st.session_state[source_mode_key] = getattr(record, "retrieval_source_mode", "QA")
+                elif st.session_state[source_mode_key] not in {"QA", "Q", "A"}:
+                    st.session_state[source_mode_key] = "QA"
 
                 if keywords_key not in st.session_state:
                     st.session_state[keywords_key] = ", ".join(record.user_keywords)
 
-                selected_tag = st.session_state.get(tag_key, record.tag)
+                if direct_recall_key not in st.session_state:
+                    st.session_state[direct_recall_key] = getattr(record, "direct_recall_key", "")
+
+                selected_tag = st.session_state.get(tag_key, record_tag)
                 tag_color = TAG_COLORS.get(selected_tag, "#6B7280")
 
                 input_col, meta_col = st.columns([7.8, 2.0], gap="small")
@@ -453,28 +478,50 @@ def render_memory_records(height: int = 420) -> None:
                     )
 
                 with meta_col:  # Memory metadata controls
-                    st.markdown(
-                        f"""
-                        <div class="memory-tag-indicator">
-                            <span class="memory-tag-square" style="background-color:{tag_color};"></span>
-                            <span class="memory-tag-name">{html.escape(selected_tag)}</span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                    tag_square_col, tag_select_col = st.columns([0.22, 1.0], gap="small")
+
+                    with tag_square_col:
+                        st.markdown(
+                            f"""
+                            <div class="memory-tag-indicator">
+                                <span class="memory-tag-square" style="background-color:{tag_color};"></span>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                    with tag_select_col:
+                        st.selectbox(
+                            "Tag",
+                            options=tag_options,
+                            key=tag_key,
+                            label_visibility="collapsed",
+                        )
 
                     st.selectbox(
-                        "Tag",
-                        options=memory_manager.tag_catalog,
-                        key=tag_key,
+                        "Retrieval Source Mode",
+                        options=["QA", "Q", "A"],
+                        key=source_mode_key,
+                        format_func={
+                            "QA": "Retrieve Q+A",
+                            "Q": "Retrieve only Q",
+                            "A": "Retrieve only A",
+                        }.get,
                         label_visibility="collapsed",
                     )
 
+                   # st.text_input(
+                    #    "User Keywords",
+                     #   key=keywords_key,
+                      #  label_visibility="collapsed",
+                       # placeholder="keywords",
+                    #)
+
                     st.text_input(
-                        "User Keywords",
-                        key=keywords_key,
-                        label_visibility="collapsed",
-                        placeholder="keywords",
+                        "Direct Recall Key",
+                        key=direct_recall_key,
+                        placeholder="Direct Recall Key",
+                     #   label_visibility="collapsed",
                     )
 
                 output_html = html.escape(record.output_text).replace("\n", "<br>")

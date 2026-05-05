@@ -5,6 +5,11 @@ MemoryManager
 =============
 Owns one active memory history file, its MemoryRecords, MetaInfo,
 .ragmem persistence, .ragmeta.json persistence, and SQLite indexing.
+
+Authority split:
+- .ragmem is append-only and stores stable memory body fields only.
+- .ragmeta.json stores current editable/readable metadata.
+- SQLite mirrors .ragmeta.json for fast lookup/indexing.
 """
 
 from __future__ import annotations
@@ -59,6 +64,24 @@ def _unique(values: list[str]) -> list[str]:
     return result
 
 
+def _clean_retrieval_source_mode(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    mode = str(value or "").strip().upper()
+    if mode in {"QA", "Q", "A"}:
+        return mode
+
+    return "QA"
+
+
+def _clean_direct_recall_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    return str(value or "").strip()
+
+
 class MemoryManager:
     def __init__(
         self,
@@ -77,7 +100,7 @@ class MemoryManager:
         self.records: list[MemoryRecord] = []
         self.metainfo: dict[str, Any] = {}
 
-        self.tag_catalog: list[str] = ["Gold", "Silver", "Red", "Green", "Black"]
+        self.tag_catalog: list[str] = ["Gold", "Green", "Black"]
         self.b_file_created: bool = False
 
         self.memory_root.mkdir(parents=True, exist_ok=True)
@@ -139,6 +162,7 @@ class MemoryManager:
             with self.meta_path.open("r", encoding="utf-8") as f:
                 loaded_meta = json.load(f)
             self.metainfo = loaded_meta if isinstance(loaded_meta, dict) else {}
+            self._apply_metainfo_overlay_to_records()
         else:
             self.save_metainfo()
 
@@ -180,6 +204,8 @@ class MemoryManager:
             user_keywords=user_keywords,
             active_project_name=active_project_name,
             embedded_files_snapshot=embedded_files_snapshot,
+            retrieval_source_mode="QA",
+            direct_recall_key="",
         )
 
         self.records.append(record)
@@ -197,11 +223,14 @@ class MemoryManager:
             return
 
         records_by_id = {record.record_id: record for record in self.records}
+        changed = False
 
         for item in gui_records_state:
             record_id = str(item.get("record_id", "")).strip()
             if not record_id or record_id not in records_by_id:
                 continue
+
+            record = records_by_id[record_id]
 
             tag = item.get("tag")
             if tag is not None:
@@ -213,10 +242,24 @@ class MemoryManager:
             if user_keywords is not None and not isinstance(user_keywords, list):
                 user_keywords = []
 
-            records_by_id[record_id].update_editable_metadata(
+            retrieval_source_mode = _clean_retrieval_source_mode(item.get("retrieval_source_mode"))
+            direct_recall_key = _clean_direct_recall_key(item.get("direct_recall_key"))
+
+            before = record.to_index_dict()
+            record.update_editable_metadata(
                 tag=tag,
                 user_keywords=user_keywords,
+                retrieval_source_mode=retrieval_source_mode,
+                direct_recall_key=direct_recall_key,
             )
+            after = record.to_index_dict()
+
+            if before != after:
+                changed = True
+
+        if changed:
+            self.save_metainfo()
+            self.refresh_sqlite_index()
 
     def save_metainfo(self) -> None:
         self.metainfo = self._build_metainfo()
@@ -275,16 +318,19 @@ class MemoryManager:
                     """
                     INSERT INTO memory_records (
                         file_id, record_id, parent_id, created_at_utc,
-                        source, tag, auto_keywords_json, user_keywords_json,
+                        source, tag, retrieval_source_mode, direct_recall_key,
+                        auto_keywords_json, user_keywords_json,
                         active_project_name, embedded_files_snapshot_json,
                         input_hash, output_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(file_id, record_id) DO UPDATE SET
                         parent_id = excluded.parent_id,
                         created_at_utc = excluded.created_at_utc,
                         source = excluded.source,
                         tag = excluded.tag,
+                        retrieval_source_mode = excluded.retrieval_source_mode,
+                        direct_recall_key = excluded.direct_recall_key,
                         auto_keywords_json = excluded.auto_keywords_json,
                         user_keywords_json = excluded.user_keywords_json,
                         active_project_name = excluded.active_project_name,
@@ -299,6 +345,8 @@ class MemoryManager:
                         index_data["created_at_utc"],
                         index_data["source"],
                         index_data["tag"],
+                        index_data["retrieval_source_mode"],
+                        index_data["direct_recall_key"],
                         json.dumps(index_data["auto_keywords"], ensure_ascii=False),
                         json.dumps(index_data["user_keywords"], ensure_ascii=False),
                         index_data["active_project_name"],
@@ -308,6 +356,7 @@ class MemoryManager:
                     ),
                 )
 
+            self._delete_sqlite_rows_not_in_memory(conn)
             conn.commit()
 
     def _build_metainfo(self) -> dict[str, Any]:
@@ -324,7 +373,7 @@ class MemoryManager:
             user_keywords.extend(record.user_keywords)
 
         created_at_utc = self.records[0].created_at_utc if self.records else ""
-        updated_at_utc = self.records[-1].created_at_utc if self.records else ""
+        updated_at_utc = _utc_now() if self.records else ""
 
         return {
             "file_id": self.file_id,
@@ -381,6 +430,60 @@ class MemoryManager:
 
         return records
 
+    def _apply_metainfo_overlay_to_records(self) -> None:
+        """
+        Overlay current .ragmeta.json metadata onto records loaded from .ragmem.
+
+        .ragmem supplies the stable body.
+        .ragmeta.json supplies current metadata.
+        """
+        meta_records = self.metainfo.get("records", [])
+        if not isinstance(meta_records, list):
+            return
+
+        metadata_by_record_id: dict[str, dict[str, Any]] = {}
+
+        for item in meta_records:
+            if not isinstance(item, dict):
+                continue
+
+            record_id = str(item.get("record_id", "")).strip()
+            if not record_id:
+                continue
+
+            metadata_by_record_id[record_id] = item
+
+        for record in self.records:
+            metadata = metadata_by_record_id.get(record.record_id)
+            if metadata is None:
+                continue
+
+            record.update_metadata_overlay(metadata)
+
+    def _delete_sqlite_rows_not_in_memory(self, conn: sqlite3.Connection) -> None:
+        """
+        Keep SQLite as a mirror of the active MemoryManager.records list.
+        SQLite is not allowed to keep extra current rows for this file_id.
+        """
+        if not self.records:
+            conn.execute(
+                "DELETE FROM memory_records WHERE file_id = ?",
+                (self.file_id,),
+            )
+            return
+
+        record_ids = [record.record_id for record in self.records]
+        placeholders = ",".join("?" for _ in record_ids)
+
+        conn.execute(
+            f"""
+            DELETE FROM memory_records
+            WHERE file_id = ?
+              AND record_id NOT IN ({placeholders})
+            """,
+            [self.file_id, *record_ids],
+        )
+
     def _lookup_file(self, file_id: str) -> dict[str, Any] | None:
         self._init_sqlite()
 
@@ -425,6 +528,8 @@ class MemoryManager:
                     created_at_utc TEXT NOT NULL,
                     source TEXT NOT NULL,
                     tag TEXT NOT NULL,
+                    retrieval_source_mode TEXT NOT NULL DEFAULT 'QA',
+                    direct_recall_key TEXT NOT NULL DEFAULT '',
                     auto_keywords_json TEXT NOT NULL,
                     user_keywords_json TEXT NOT NULL,
                     active_project_name TEXT,
@@ -435,6 +540,8 @@ class MemoryManager:
                 )
                 """
             )
+
+            self._ensure_memory_records_columns(conn)
 
             conn.execute(
                 """
@@ -450,4 +557,28 @@ class MemoryManager:
                 """
             )
 
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_records_direct_recall_key
+                ON memory_records(direct_recall_key)
+                """
+            )
+
             conn.commit()
+
+    @staticmethod
+    def _ensure_memory_records_columns(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(memory_records)").fetchall()
+        existing_columns = {str(row[1]) for row in rows}
+
+        if "retrieval_source_mode" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_records "
+                "ADD COLUMN retrieval_source_mode TEXT NOT NULL DEFAULT 'QA'"
+            )
+
+        if "direct_recall_key" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_records "
+                "ADD COLUMN direct_recall_key TEXT NOT NULL DEFAULT ''"
+            )

@@ -1,14 +1,11 @@
-Here is the complete `Requirements_Memory_Recording.md` draft.
-
-````markdown
 # Requirements_Memory_Recording.md
 
-Last update: 28.04.2026
+Last update: 05.05.2026
 
 Purpose:
 This document defines the memory-recording layer of RAGstream.
 
-It specifies how accepted prompt/response pairs are captured as MemoryRecords, managed by MemoryManager, displayed in the Streamlit GUI, persisted into `.ragmem` files, synchronized into `.ragmeta.json`, and indexed in SQLite.
+It specifies how accepted prompt/response pairs are captured as MemoryRecords, managed by MemoryManager, displayed in the Streamlit GUI, persisted into append-only `.ragmem` body files, synchronized into `.ragmeta.json` metadata files, and indexed in SQLite.
 
 This document does not define memory vector ingestion, memory chunking, semantic retrieval, or merging memory with the RAG pipeline. Those are defined in separate future requirement files.
 
@@ -30,7 +27,7 @@ It covers:
 - `.ragmeta.json` sidecar metadata files
 - `memory_index.sqlite3`
 - YAKE-based automatic keywords
-- user-entered keywords
+- user keywords as a future-reserved backend field
 - per-record tag handling
 - per-record active project snapshot
 - synchronization between GUI, MemoryManager, `.ragmeta.json`, and SQLite
@@ -273,7 +270,7 @@ MemoryManager
 │
 ├─ tag_catalog: list[str]
 │    Allowed tag values.
-│    Required values: ["Platin", "GOLD", "SILVER", "Green", "Black"]
+│    Required values: ["Gold", "Green", "Black"]
 │
 └─ b_file_created: bool
      False until the first MemoryRecord is captured and the .ragmem file is physically created.
@@ -411,7 +408,8 @@ MemoryRecord
 │    Keywords generated automatically by YAKE from input_text + output_text.
 │
 ├─ user_keywords: list[str]
-│    Optional keywords manually entered by the user in the GUI.
+│    Future-reserved backend metadata field.
+│    In the current GUI flow this remains empty.
 │
 ├─ active_project_name: str | None
 │    Active DB / Project selected in GUI at the moment this record was created.
@@ -450,9 +448,12 @@ MemoryRecord.methods
 │
 ├─ update_editable_metadata(
 │      tag: str | None = None,
+│      retrieval_source_mode: str | None = None,
+│      direct_recall_key: str | None = None,
 │      user_keywords: list[str] | None = None
 │   ) -> None
-│      Updates only GUI-editable metadata.
+│      Updates editable metadata in RAM.
+│      user_keywords is future-reserved and remains empty in the current GUI flow.
 │      Does not change input_text, output_text, record_id, hashes, or project snapshot.
 │
 ├─ to_ragmem_block() -> str
@@ -497,9 +498,7 @@ Green
 The GUI tag selector and MemoryManager tag catalog shall support at least:
 
 ```text
-Platin
-GOLD
-SILVER
+Gold
 Green
 Black
 ```
@@ -509,9 +508,10 @@ Black
 The current tag value shall be stored in:
 
 * the MemoryRecord object,
-* `.ragmem` record block,
 * `.ragmeta.json`,
 * SQLite.
+
+The tag shall not be written into `.ragmem`.
 
 ### 8.4 GUI tag changes
 
@@ -542,9 +542,10 @@ input_text + output_text
 Auto keywords shall be stored in:
 
 * MemoryRecord,
-* `.ragmem`,
 * `.ragmeta.json`,
 * SQLite.
+
+Auto keywords shall not be written into `.ragmem`.
 
 ### 9.2 User keywords
 
@@ -554,24 +555,27 @@ Each MemoryRecord shall contain:
 user_keywords: list[str]
 ```
 
-User keywords are optional.
+`user_keywords` is a future-reserved backend metadata field.
 
-They are manually entered by the user in the GUI.
+In the current GUI flow, no user-keyword input is shown and new records keep:
 
-They are considered high-authority metadata.
+```text
+user_keywords = []
+```
 
 User keywords shall be stored in:
 
 * MemoryRecord,
-* `.ragmem`,
 * `.ragmeta.json`,
 * SQLite.
 
+User keywords shall not be written into `.ragmem`.
+
 ### 9.3 Keyword synchronization
 
-If the user changes user keywords for an existing MemoryRecord in the GUI, the change shall be synchronized during the next memory save/sync cycle.
+Current GUI synchronization does not collect user keywords.
 
-The synchronization shall use stable `record_id`.
+Future user-keyword synchronization, if reactivated, shall use stable `record_id`.
 
 ---
 
@@ -761,9 +765,9 @@ During a save/sync cycle, `MemoryManager.records` shall be treated as the curren
 
 ### 14.1 Purpose
 
-`.ragmem` is the durable full memory file.
+`.ragmem` is the durable append-only memory body file.
 
-It stores the actual MemoryRecord content.
+It stores stable MemoryRecord body content only.
 
 ### 14.2 Filename pattern
 
@@ -781,23 +785,28 @@ The `.ragmem` file shall be physically created only after the first MemoryRecord
 
 ### 14.4 Content rule
 
-Each MemoryRecord shall be written as a complete durable block.
+Each MemoryRecord shall be written as one stable body block.
 
-The block shall contain at least:
+The block shall contain only:
 
 * `record_id`
 * `parent_id`
 * `created_at_utc`
 * `source`
+* `input_hash`
+* `output_hash`
+* `input_text`
+* `output_text`
+
+The block shall not contain editable GUI metadata:
+
 * `tag`
+* `retrieval_source_mode`
+* `direct_recall_key`
 * `auto_keywords`
 * `user_keywords`
 * `active_project_name`
 * `embedded_files_snapshot`
-* `input_hash`
-* `output_hash`
-* `INPUT`
-* `OUTPUT`
 
 ### 14.5 Append behavior
 
@@ -844,7 +853,7 @@ MetaInfo shall contain at least:
 * `parent_ids`
 * tag summary
 * aggregated auto keywords
-* aggregated user keywords
+* aggregated user keywords as future-reserved metadata
 * per-record metadata summary
 
 ### 15.5 Per-record metadata summary
@@ -856,9 +865,12 @@ For each MemoryRecord, MetaInfo shall include at least:
 * `created_at_utc`
 * `source`
 * `tag`
+* `retrieval_source_mode`
+* `direct_recall_key`
 * `auto_keywords`
 * `user_keywords`
 * `active_project_name`
+* `embedded_files_snapshot`
 * `input_hash`
 * `output_hash`
 
@@ -920,9 +932,12 @@ SQLite shall index at least:
 * `created_at_utc`
 * `source`
 * `tag`
+* `retrieval_source_mode`
+* `direct_recall_key`
 * `auto_keywords`
 * `user_keywords`
 * `active_project_name`
+* `embedded_files_snapshot`
 * `input_hash`
 * `output_hash`
 
@@ -930,7 +945,7 @@ SQLite shall index at least:
 
 SQLite shall be synchronized from the active MemoryManager state.
 
-If a user changes tags or user keywords for old records and then captures a new memory, SQLite shall update those old records as part of the same synchronization cycle.
+If a user changes editable metadata for old records and then captures a new memory, SQLite shall update those old records as part of the same synchronization cycle.
 
 ### 16.7 Upsert rule
 
@@ -965,11 +980,13 @@ The source of truth during runtime is:
 MemoryManager.records
 ```
 
-The durable source is:
+The durable portable source is:
 
 ```text
-.ragmem + .ragmeta.json + SQLite
+.ragmem + .ragmeta.json
 ```
+
+SQLite is the query-optimized mirror and shall not contain unique business truth absent from those files.
 
 ### 17.2 Memory display
 
@@ -998,7 +1015,11 @@ Memory Records
 The GUI shall allow editing at least:
 
 * tag
-* user keywords
+* retrieval source mode
+* direct recall key
+
+User keywords are not shown in the current GUI.
+They remain a future-reserved backend field.
 
 The GUI shall not directly edit:
 
@@ -1037,7 +1058,8 @@ When the user selects an old memory history:
 
 * MemoryManager shall load the corresponding `.ragmem`.
 * MemoryManager shall load the corresponding `.ragmeta.json`.
-* MemoryManager shall rebuild `records`.
+* MemoryManager shall rebuild `records` from `.ragmem` body data.
+* MemoryManager shall overlay current metadata from `.ragmeta.json` onto the loaded records.
 * GUI shall render the loaded records.
 
 ### 18.3 Single active memory history
@@ -1202,11 +1224,8 @@ The core invariant is:
 MemoryManager owns one active memory history.
 MemoryManager owns records: list[MemoryRecord].
 MemoryRecord owns one accepted input/output pair.
-.ragmem stores full content.
+.ragmem stores append-only stable body content.
 .ragmeta.json stores rewritten current metadata.
-SQLite indexes searchable metadata.
+SQLite mirrors searchable metadata and is not unique business truth.
 GUI displays and edits metadata, but does not own memory truth.
-```
-
-```
 ```

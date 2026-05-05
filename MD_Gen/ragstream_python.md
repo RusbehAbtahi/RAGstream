@@ -1268,19 +1268,31 @@ def _collect_memory_gui_state(memory_manager: MemoryManager) -> list[dict[str, A
 
     for record in memory_manager.records:
         tag_key = f"memory_tag_{record.record_id}"
+        source_mode_key = f"memory_retrieval_source_mode_{record.record_id}"
         keywords_key = f"memory_user_keywords_{record.record_id}"
+        direct_recall_key = f"memory_direct_recall_key_{record.record_id}"
 
         tag = st.session_state.get(tag_key, record.tag)
+        retrieval_source_mode = st.session_state.get(
+            source_mode_key,
+            getattr(record, "retrieval_source_mode", "QA"),
+        )
         user_keywords_text = st.session_state.get(
             keywords_key,
             ", ".join(record.user_keywords),
+        )
+        direct_recall_value = st.session_state.get(
+            direct_recall_key,
+            getattr(record, "direct_recall_key", ""),
         )
 
         gui_state.append(
             {
                 "record_id": record.record_id,
                 "tag": tag,
+                "retrieval_source_mode": retrieval_source_mode,
                 "user_keywords": _parse_user_keywords(user_keywords_text),
+                "direct_recall_key": str(direct_recall_value or "").strip(),
             }
         )
 
@@ -1505,8 +1517,6 @@ from ragstream.app.ui_actions import (
 
 TAG_COLORS: dict[str, str] = {
     "Gold": "#D4AF37",
-    "Silver": "#C0C7D2",
-    "Red": "#E0115F",
     "Green": "#00A86B",
     "Black": "#111111",
 }
@@ -1653,6 +1663,18 @@ def inject_base_css() -> None:
             /* Make small select boxes look compact */
             div[data-baseweb="select"] > div {
                 min-height: 34px;
+            }
+
+            /* Direct Recall Key field: special red border */
+            div[data-testid="stTextInput"]:has(input[aria-label="Direct Recall Key"]) div[data-baseweb="input"] {
+                border: 2px solid #D11A2A !important;
+                border-radius: 0.45rem !important;
+                box-shadow: none !important;
+            }
+
+            div[data-testid="stTextInput"]:has(input[aria-label="Direct Recall Key"]) div[data-baseweb="input"]:focus-within {
+                border: 2px solid #D11A2A !important;
+                box-shadow: 0 0 0 1px rgba(209, 26, 42, 0.25) !important;
             }
         </style>
         """,
@@ -1903,15 +1925,30 @@ def render_memory_records(height: int = 420) -> None:
         else:
             for record in memory_entries:
                 tag_key = f"memory_tag_{record.record_id}"
+                source_mode_key = f"memory_retrieval_source_mode_{record.record_id}"
                 keywords_key = f"memory_user_keywords_{record.record_id}"
+                direct_recall_key = f"memory_direct_recall_key_{record.record_id}"
+
+                tag_options = list(memory_manager.tag_catalog)
+                record_tag = record.tag if record.tag in tag_options else "Green"
 
                 if tag_key not in st.session_state:
-                    st.session_state[tag_key] = record.tag
+                    st.session_state[tag_key] = record_tag
+                elif st.session_state[tag_key] not in tag_options:
+                    st.session_state[tag_key] = "Green"
+
+                if source_mode_key not in st.session_state:
+                    st.session_state[source_mode_key] = getattr(record, "retrieval_source_mode", "QA")
+                elif st.session_state[source_mode_key] not in {"QA", "Q", "A"}:
+                    st.session_state[source_mode_key] = "QA"
 
                 if keywords_key not in st.session_state:
                     st.session_state[keywords_key] = ", ".join(record.user_keywords)
 
-                selected_tag = st.session_state.get(tag_key, record.tag)
+                if direct_recall_key not in st.session_state:
+                    st.session_state[direct_recall_key] = getattr(record, "direct_recall_key", "")
+
+                selected_tag = st.session_state.get(tag_key, record_tag)
                 tag_color = TAG_COLORS.get(selected_tag, "#6B7280")
 
                 input_col, meta_col = st.columns([7.8, 2.0], gap="small")
@@ -1929,28 +1966,50 @@ def render_memory_records(height: int = 420) -> None:
                     )
 
                 with meta_col:  # Memory metadata controls
-                    st.markdown(
-                        f"""
-                        <div class="memory-tag-indicator">
-                            <span class="memory-tag-square" style="background-color:{tag_color};"></span>
-                            <span class="memory-tag-name">{html.escape(selected_tag)}</span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                    tag_square_col, tag_select_col = st.columns([0.22, 1.0], gap="small")
+
+                    with tag_square_col:
+                        st.markdown(
+                            f"""
+                            <div class="memory-tag-indicator">
+                                <span class="memory-tag-square" style="background-color:{tag_color};"></span>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                    with tag_select_col:
+                        st.selectbox(
+                            "Tag",
+                            options=tag_options,
+                            key=tag_key,
+                            label_visibility="collapsed",
+                        )
 
                     st.selectbox(
-                        "Tag",
-                        options=memory_manager.tag_catalog,
-                        key=tag_key,
+                        "Retrieval Source Mode",
+                        options=["QA", "Q", "A"],
+                        key=source_mode_key,
+                        format_func={
+                            "QA": "Retrieve Q+A",
+                            "Q": "Retrieve only Q",
+                            "A": "Retrieve only A",
+                        }.get,
                         label_visibility="collapsed",
                     )
 
+                   # st.text_input(
+                    #    "User Keywords",
+                     #   key=keywords_key,
+                      #  label_visibility="collapsed",
+                       # placeholder="keywords",
+                    #)
+
                     st.text_input(
-                        "User Keywords",
-                        key=keywords_key,
-                        label_visibility="collapsed",
-                        placeholder="keywords",
+                        "Direct Recall Key",
+                        key=direct_recall_key,
+                        placeholder="Direct Recall Key",
+                     #   label_visibility="collapsed",
                     )
 
                 output_html = html.escape(record.output_text).replace("\n", "<br>")
@@ -8005,8 +8064,8 @@ class MemoryChunker:
         return "\n".join(
             [
                 f"PROJECT: {record.active_project_name or ''}",
-                f"TAG: {record.tag or ''}",
-                f"USER_KEYWORDS: {self._join_list(record.user_keywords)}",
+             #   f"TAG: {record.tag or ''}",
+            #    f"USER_KEYWORDS: {self._join_list(record.user_keywords)}",
                 f"YAKE_KEYWORDS: {self._join_list(record.auto_keywords)}",
                 "QUESTION_ANCHOR:",
                 question_anchor.strip(),
@@ -8479,6 +8538,11 @@ MemoryManager
 =============
 Owns one active memory history file, its MemoryRecords, MetaInfo,
 .ragmem persistence, .ragmeta.json persistence, and SQLite indexing.
+
+Authority split:
+- .ragmem is append-only and stores stable memory body fields only.
+- .ragmeta.json stores current editable/readable metadata.
+- SQLite mirrors .ragmeta.json for fast lookup/indexing.
 """
 
 from __future__ import annotations
@@ -8533,6 +8597,24 @@ def _unique(values: list[str]) -> list[str]:
     return result
 
 
+def _clean_retrieval_source_mode(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    mode = str(value or "").strip().upper()
+    if mode in {"QA", "Q", "A"}:
+        return mode
+
+    return "QA"
+
+
+def _clean_direct_recall_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    return str(value or "").strip()
+
+
 class MemoryManager:
     def __init__(
         self,
@@ -8551,7 +8633,7 @@ class MemoryManager:
         self.records: list[MemoryRecord] = []
         self.metainfo: dict[str, Any] = {}
 
-        self.tag_catalog: list[str] = ["Gold", "Silver", "Red", "Green", "Black"]
+        self.tag_catalog: list[str] = ["Gold", "Green", "Black"]
         self.b_file_created: bool = False
 
         self.memory_root.mkdir(parents=True, exist_ok=True)
@@ -8613,6 +8695,7 @@ class MemoryManager:
             with self.meta_path.open("r", encoding="utf-8") as f:
                 loaded_meta = json.load(f)
             self.metainfo = loaded_meta if isinstance(loaded_meta, dict) else {}
+            self._apply_metainfo_overlay_to_records()
         else:
             self.save_metainfo()
 
@@ -8654,6 +8737,8 @@ class MemoryManager:
             user_keywords=user_keywords,
             active_project_name=active_project_name,
             embedded_files_snapshot=embedded_files_snapshot,
+            retrieval_source_mode="QA",
+            direct_recall_key="",
         )
 
         self.records.append(record)
@@ -8671,11 +8756,14 @@ class MemoryManager:
             return
 
         records_by_id = {record.record_id: record for record in self.records}
+        changed = False
 
         for item in gui_records_state:
             record_id = str(item.get("record_id", "")).strip()
             if not record_id or record_id not in records_by_id:
                 continue
+
+            record = records_by_id[record_id]
 
             tag = item.get("tag")
             if tag is not None:
@@ -8687,10 +8775,24 @@ class MemoryManager:
             if user_keywords is not None and not isinstance(user_keywords, list):
                 user_keywords = []
 
-            records_by_id[record_id].update_editable_metadata(
+            retrieval_source_mode = _clean_retrieval_source_mode(item.get("retrieval_source_mode"))
+            direct_recall_key = _clean_direct_recall_key(item.get("direct_recall_key"))
+
+            before = record.to_index_dict()
+            record.update_editable_metadata(
                 tag=tag,
                 user_keywords=user_keywords,
+                retrieval_source_mode=retrieval_source_mode,
+                direct_recall_key=direct_recall_key,
             )
+            after = record.to_index_dict()
+
+            if before != after:
+                changed = True
+
+        if changed:
+            self.save_metainfo()
+            self.refresh_sqlite_index()
 
     def save_metainfo(self) -> None:
         self.metainfo = self._build_metainfo()
@@ -8749,16 +8851,19 @@ class MemoryManager:
                     """
                     INSERT INTO memory_records (
                         file_id, record_id, parent_id, created_at_utc,
-                        source, tag, auto_keywords_json, user_keywords_json,
+                        source, tag, retrieval_source_mode, direct_recall_key,
+                        auto_keywords_json, user_keywords_json,
                         active_project_name, embedded_files_snapshot_json,
                         input_hash, output_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(file_id, record_id) DO UPDATE SET
                         parent_id = excluded.parent_id,
                         created_at_utc = excluded.created_at_utc,
                         source = excluded.source,
                         tag = excluded.tag,
+                        retrieval_source_mode = excluded.retrieval_source_mode,
+                        direct_recall_key = excluded.direct_recall_key,
                         auto_keywords_json = excluded.auto_keywords_json,
                         user_keywords_json = excluded.user_keywords_json,
                         active_project_name = excluded.active_project_name,
@@ -8773,6 +8878,8 @@ class MemoryManager:
                         index_data["created_at_utc"],
                         index_data["source"],
                         index_data["tag"],
+                        index_data["retrieval_source_mode"],
+                        index_data["direct_recall_key"],
                         json.dumps(index_data["auto_keywords"], ensure_ascii=False),
                         json.dumps(index_data["user_keywords"], ensure_ascii=False),
                         index_data["active_project_name"],
@@ -8782,6 +8889,7 @@ class MemoryManager:
                     ),
                 )
 
+            self._delete_sqlite_rows_not_in_memory(conn)
             conn.commit()
 
     def _build_metainfo(self) -> dict[str, Any]:
@@ -8798,7 +8906,7 @@ class MemoryManager:
             user_keywords.extend(record.user_keywords)
 
         created_at_utc = self.records[0].created_at_utc if self.records else ""
-        updated_at_utc = self.records[-1].created_at_utc if self.records else ""
+        updated_at_utc = _utc_now() if self.records else ""
 
         return {
             "file_id": self.file_id,
@@ -8855,6 +8963,60 @@ class MemoryManager:
 
         return records
 
+    def _apply_metainfo_overlay_to_records(self) -> None:
+        """
+        Overlay current .ragmeta.json metadata onto records loaded from .ragmem.
+
+        .ragmem supplies the stable body.
+        .ragmeta.json supplies current metadata.
+        """
+        meta_records = self.metainfo.get("records", [])
+        if not isinstance(meta_records, list):
+            return
+
+        metadata_by_record_id: dict[str, dict[str, Any]] = {}
+
+        for item in meta_records:
+            if not isinstance(item, dict):
+                continue
+
+            record_id = str(item.get("record_id", "")).strip()
+            if not record_id:
+                continue
+
+            metadata_by_record_id[record_id] = item
+
+        for record in self.records:
+            metadata = metadata_by_record_id.get(record.record_id)
+            if metadata is None:
+                continue
+
+            record.update_metadata_overlay(metadata)
+
+    def _delete_sqlite_rows_not_in_memory(self, conn: sqlite3.Connection) -> None:
+        """
+        Keep SQLite as a mirror of the active MemoryManager.records list.
+        SQLite is not allowed to keep extra current rows for this file_id.
+        """
+        if not self.records:
+            conn.execute(
+                "DELETE FROM memory_records WHERE file_id = ?",
+                (self.file_id,),
+            )
+            return
+
+        record_ids = [record.record_id for record in self.records]
+        placeholders = ",".join("?" for _ in record_ids)
+
+        conn.execute(
+            f"""
+            DELETE FROM memory_records
+            WHERE file_id = ?
+              AND record_id NOT IN ({placeholders})
+            """,
+            [self.file_id, *record_ids],
+        )
+
     def _lookup_file(self, file_id: str) -> dict[str, Any] | None:
         self._init_sqlite()
 
@@ -8899,6 +9061,8 @@ class MemoryManager:
                     created_at_utc TEXT NOT NULL,
                     source TEXT NOT NULL,
                     tag TEXT NOT NULL,
+                    retrieval_source_mode TEXT NOT NULL DEFAULT 'QA',
+                    direct_recall_key TEXT NOT NULL DEFAULT '',
                     auto_keywords_json TEXT NOT NULL,
                     user_keywords_json TEXT NOT NULL,
                     active_project_name TEXT,
@@ -8909,6 +9073,8 @@ class MemoryManager:
                 )
                 """
             )
+
+            self._ensure_memory_records_columns(conn)
 
             conn.execute(
                 """
@@ -8924,7 +9090,31 @@ class MemoryManager:
                 """
             )
 
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_records_direct_recall_key
+                ON memory_records(direct_recall_key)
+                """
+            )
+
             conn.commit()
+
+    @staticmethod
+    def _ensure_memory_records_columns(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(memory_records)").fetchall()
+        existing_columns = {str(row[1]) for row in rows}
+
+        if "retrieval_source_mode" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_records "
+                "ADD COLUMN retrieval_source_mode TEXT NOT NULL DEFAULT 'QA'"
+            )
+
+        if "direct_recall_key" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_records "
+                "ADD COLUMN direct_recall_key TEXT NOT NULL DEFAULT ''"
+            )
 ```
 
 ### ~\ragstream\memory\memory_record.py
@@ -8936,14 +9126,16 @@ MemoryRecord
 ============
 One accepted input/output memory unit.
 
-A MemoryRecord stores:
-- raw Prompt input
-- accepted output/response
-- tag
-- automatic YAKE keywords
-- optional user keywords
-- active project snapshot
-- embedded files snapshot
+Authority split:
+- .ragmem stores only the stable append-only memory body.
+- .ragmeta.json stores current metadata.
+- SQLite mirrors .ragmeta.json for fast lookup/indexing.
+
+A MemoryRecord in RAM contains both:
+- stable body fields
+- current metadata fields
+
+Only stable body fields are serialized into .ragmem.
 """
 
 from __future__ import annotations
@@ -8958,6 +9150,9 @@ from typing import Any
 
 RECORD_START = "----- MEMORY RECORD START -----"
 RECORD_END = "----- MEMORY RECORD END -----"
+
+
+RETRIEVAL_SOURCE_MODES = {"QA", "Q", "A"}
 
 
 def _utc_now() -> str:
@@ -8987,6 +9182,23 @@ def _clean_list(values: list[str] | None) -> list[str]:
     return cleaned
 
 
+def _clean_retrieval_source_mode(value: str | None) -> str:
+    mode = str(value or "QA").strip().upper()
+    return mode if mode in RETRIEVAL_SOURCE_MODES else "QA"
+
+
+def _clean_direct_recall_key(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    return text if text else None
+
+
 class MemoryRecord:
     def __init__(
         self,
@@ -8998,6 +9210,8 @@ class MemoryRecord:
         user_keywords: list[str] | None = None,
         active_project_name: str | None = None,
         embedded_files_snapshot: list[str] | None = None,
+        retrieval_source_mode: str = "QA",
+        direct_recall_key: str = "",
         *,
         record_id: str | None = None,
         created_at_utc: str | None = None,
@@ -9015,6 +9229,8 @@ class MemoryRecord:
 
         self.tag: str = tag or "Green"
         self.user_keywords: list[str] = _clean_list(user_keywords)
+        self.retrieval_source_mode: str = _clean_retrieval_source_mode(retrieval_source_mode)
+        self.direct_recall_key: str = _clean_direct_recall_key(direct_recall_key)
 
         self.active_project_name: str | None = active_project_name
         self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
@@ -9054,6 +9270,8 @@ class MemoryRecord:
         self,
         tag: str | None = None,
         user_keywords: list[str] | None = None,
+        retrieval_source_mode: str | None = None,
+        direct_recall_key: str | None = None,
     ) -> None:
         if tag is not None:
             clean_tag = str(tag).strip()
@@ -9063,7 +9281,54 @@ class MemoryRecord:
         if user_keywords is not None:
             self.user_keywords = _clean_list(user_keywords)
 
-    def to_full_dict(self) -> dict[str, Any]:
+        if retrieval_source_mode is not None:
+            self.retrieval_source_mode = _clean_retrieval_source_mode(retrieval_source_mode)
+
+        if direct_recall_key is not None:
+            self.direct_recall_key = _clean_direct_recall_key(direct_recall_key)
+
+    def update_metadata_overlay(
+        self,
+        metadata: dict[str, Any],
+    ) -> None:
+        """
+        Apply current metadata loaded from .ragmeta.json.
+
+        This method deliberately does not modify stable .ragmem body fields:
+        - record_id
+        - parent_id
+        - created_at_utc
+        - input_text
+        - output_text
+        - source
+        - input_hash
+        - output_hash
+        """
+        if not isinstance(metadata, dict):
+            return
+
+        self.update_editable_metadata(
+            tag=metadata.get("tag"),
+            user_keywords=list(metadata.get("user_keywords") or []),
+            retrieval_source_mode=metadata.get("retrieval_source_mode"),
+            direct_recall_key=metadata.get("direct_recall_key"),
+        )
+
+        if "auto_keywords" in metadata:
+            self.auto_keywords = _clean_list(list(metadata.get("auto_keywords") or []))
+
+        if "active_project_name" in metadata:
+            self.active_project_name = _optional_str(metadata.get("active_project_name"))
+
+        if "embedded_files_snapshot" in metadata:
+            self.embedded_files_snapshot = list(metadata.get("embedded_files_snapshot") or [])
+
+    def to_ragmem_dict(self) -> dict[str, Any]:
+        """
+        Stable append-only .ragmem body.
+
+        Editable GUI metadata is intentionally excluded from this dictionary.
+        """
         return {
             "record_id": self.record_id,
             "parent_id": self.parent_id,
@@ -9071,26 +9336,32 @@ class MemoryRecord:
             "input_text": self.input_text,
             "output_text": self.output_text,
             "source": self.source,
-            "tag": self.tag,
-            "auto_keywords": self.auto_keywords,
-            "user_keywords": self.user_keywords,
-            "active_project_name": self.active_project_name,
-            "embedded_files_snapshot": self.embedded_files_snapshot,
             "input_hash": self.input_hash,
             "output_hash": self.output_hash,
         }
 
     def to_ragmem_block(self) -> str:
-        body = json.dumps(self.to_full_dict(), ensure_ascii=False, indent=2)
+        body = json.dumps(self.to_ragmem_dict(), ensure_ascii=False, indent=2)
         return f"{RECORD_START}\n{body}\n{RECORD_END}\n"
 
     def to_index_dict(self) -> dict[str, Any]:
+        """
+        Current metadata/index view.
+
+        This dictionary is used for:
+        - .ragmeta.json per-record metadata
+        - SQLite mirror rows
+
+        It does not duplicate full input_text or output_text.
+        """
         return {
             "record_id": self.record_id,
             "parent_id": self.parent_id,
             "created_at_utc": self.created_at_utc,
             "source": self.source,
             "tag": self.tag,
+            "retrieval_source_mode": self.retrieval_source_mode,
+            "direct_recall_key": self.direct_recall_key,
             "auto_keywords": self.auto_keywords,
             "user_keywords": self.user_keywords,
             "active_project_name": self.active_project_name,
@@ -9099,20 +9370,57 @@ class MemoryRecord:
             "output_hash": self.output_hash,
         }
 
+    def to_full_dict(self) -> dict[str, Any]:
+        """
+        Full in-RAM diagnostic/export view.
+
+        This is not used for .ragmem serialization.
+        """
+        data = self.to_ragmem_dict()
+        data.update(
+            {
+                "tag": self.tag,
+                "retrieval_source_mode": self.retrieval_source_mode,
+                "direct_recall_key": self.direct_recall_key,
+                "auto_keywords": self.auto_keywords,
+                "user_keywords": self.user_keywords,
+                "active_project_name": self.active_project_name,
+                "embedded_files_snapshot": self.embedded_files_snapshot,
+            }
+        )
+        return data
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
+        """
+        Load one MemoryRecord from a .ragmem block.
+
+        Supports both:
+        - new body-only .ragmem blocks
+        - older full .ragmem blocks that still contain metadata
+
+        Current metadata from .ragmeta.json is applied later by MemoryManager.
+        """
+        auto_keywords_raw = data.get("auto_keywords")
+
         return cls(
             input_text=str(data.get("input_text", "")),
             output_text=str(data.get("output_text", "")),
             source=str(data.get("source", "")),
-            parent_id=data.get("parent_id"),
+            parent_id=_optional_str(data.get("parent_id")),
             tag=str(data.get("tag", "Green")),
             user_keywords=list(data.get("user_keywords") or []),
-            active_project_name=data.get("active_project_name"),
+            active_project_name=_optional_str(data.get("active_project_name")),
             embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
+            retrieval_source_mode=str(data.get("retrieval_source_mode", "QA")),
+            direct_recall_key=str(data.get("direct_recall_key", "")),
             record_id=str(data.get("record_id") or uuid.uuid4().hex),
             created_at_utc=str(data.get("created_at_utc") or _utc_now()),
-            auto_keywords=list(data.get("auto_keywords") or []),
+            auto_keywords=(
+                list(auto_keywords_raw)
+                if isinstance(auto_keywords_raw, list)
+                else None
+            ),
             input_hash=data.get("input_hash"),
             output_hash=data.get("output_hash"),
         )
