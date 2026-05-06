@@ -23,15 +23,15 @@
       "QA": {
         "answer": 0.55,
         "question": 0.35,
-        "meta": 0.10
+        "meta": 0.1
       },
       "A": {
         "answer": 0.85,
-        "question": 0.00,
+        "question": 0.0,
         "meta": 0.15
       },
       "Q": {
-        "answer": 0.00,
+        "answer": 0.0,
         "question": 0.85,
         "meta": 0.15
       }

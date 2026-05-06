@@ -192,9 +192,6 @@ class MemoryManager:
         active_project_name: str | None = None,
         embedded_files_snapshot: list[str] | None = None,
     ) -> MemoryRecord:
-        if not self.title.strip():
-            raise ValueError("Memory title is required before the first memory record is saved.")
-
         record = MemoryRecord(
             input_text=input_text,
             output_text=output_text,
@@ -207,6 +204,13 @@ class MemoryManager:
             retrieval_source_mode="QA",
             direct_recall_key="",
         )
+
+        if not self.title.strip():
+            auto_title = self._build_auto_history_title(
+                record=record,
+                active_project_name=active_project_name,
+            )
+            self.start_new_history(auto_title)
 
         self.records.append(record)
         self._append_record_to_ragmem(record)
@@ -500,6 +504,19 @@ class MemoryManager:
             ).fetchone()
 
         return dict(row) if row else None
+
+    def _build_auto_history_title(
+        self,
+        record: MemoryRecord,
+        active_project_name: str | None = None,
+    ) -> str:
+        """
+        Build the first memory history title automatically.
+
+        The file name must stay generic and deterministic:
+        YYYY-MM-DD-HH-mm-memory-record.ragmem
+        """
+        return "memory-record"
 
     def _init_sqlite(self) -> None:
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

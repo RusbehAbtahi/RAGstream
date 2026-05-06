@@ -1,4 +1,4 @@
-# controller.py
+# ragstream/app/controller.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -34,7 +34,13 @@ from ragstream.ingestion.vector_store_splade import VectorStoreSplade
 # Deterministic Retrieval stage.
 from ragstream.retrieval.retriever import Retriever
 from ragstream.retrieval.reranker import Reranker
+
+# Added on 05.05.2026:
+# Memory Retrieval stage entry point.
+from ragstream.retrieval.retriever_mem import MemoryRetriever
+
 from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
 
 class AppController:
@@ -44,108 +50,144 @@ class AppController:
 
         Light initialization only.
 
-        - Loads PromptSchema once (for PreProcessing).
-        - Creates a shared AgentFactory + LLMClient.
-        - Creates the A2PromptShaper agent.
-        - Creates the A3NLIGate agent.
-        - Creates the A4Condenser agent.
+        - Loads PromptSchema once for PreProcessing.
+        - Creates shared AgentFactory + LLMClient.
+        - Creates A2, A3, A4 agent objects.
         - Prepares project/data paths.
+        - Loads runtime_config.json.
+        - Keeps MemoryRetriever optional until Streamlit provides MemoryManager
+          and MemoryVectorStore from session_state.
         """
-        # PreProcessing schema (OLD, working behaviour)
+        # PreProcessing schema.
         self.schema = PromptSchema(schema_path)
 
-        # Shared AgentFactory (for A2 and, later, other agents)
+        # Shared AgentFactory for LLM-based agents.
         self.agent_factory = AgentFactory()
 
-        # Shared LLMClient
+        # Shared LLM client.
         self.llm_client = LLMClient()
 
-        # A2 agent
+        # A2 agent.
         self.a2_promptshaper = A2PromptShaper(
             agent_factory=self.agent_factory,
             llm_client=self.llm_client,
         )
 
-        # A3 agent
+        # A3 agent.
         self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
             llm_client=self.llm_client,
         )
 
-        # A4 agent
+        # A4 agent.
         self.a4_condenser = A4Condenser(
             llm_client=self.llm_client,
         )
 
-        # Added on 10.03.2026:
-        # Keep project/document roots centralized in the controller so the GUI
-        # stays thin and the ingestion backend continues to receive explicit paths.
+        # Project/data roots.
         self.project_root = Path(__file__).resolve().parents[2]
         self.data_root = self.project_root / "data"
         self.doc_root = self.data_root / "doc_raw"
         self.chroma_root = self.data_root / "chroma_db"
         self.splade_root = self.data_root / "splade_db"
+        self.memory_root = self.data_root / "memory"
+        self.memory_sqlite_path = self.memory_root / "memory_index.sqlite3"
+
         self.doc_root.mkdir(parents=True, exist_ok=True)
         self.chroma_root.mkdir(parents=True, exist_ok=True)
         self.splade_root.mkdir(parents=True, exist_ok=True)
+        self.memory_root.mkdir(parents=True, exist_ok=True)
+
+        # Global runtime defaults.
+        self.runtime_config_path = self.project_root / "ragstream" / "config" / "runtime_config.json"
+        self.runtime_config: dict[str, Any] = self._load_runtime_config()
+
+        # Heavy components are created later in initialize_heavy_components().
+        self.retriever: Retriever | None = None
+        self.reranker: Reranker | None = None
+
+        # MemoryRetriever is configured by ui_streamlit.py after memory objects exist.
+        self.memory_retriever: MemoryRetriever | None = None
 
     def initialize_heavy_components(self) -> None:
         """
         Heavy initialization only.
 
-        - Creates the Retrieval stage object.
-        - Creates the ReRanker stage object.
+        - Creates the document Retrieval stage object.
+        - Creates the document ReRanker stage object.
         """
 
-        # Added on 15.03.2026:
-        # Retrieval is initialized once and re-used. It reads the active project
-        # Chroma DB and reconstructs real chunk text from doc_raw.
         self.retriever = Retriever(
             doc_root=str(self.doc_root),
             chroma_root=str(self.chroma_root),
         )
 
-        # Added on 31.03.2026:
-        # ReRanker is initialized once and re-used. It consumes the Retrieval
-        # candidates already stored in SuperPrompt and reorders them with the
-        # agreed cross-encoder model.
         self.reranker = Reranker()
+
+    def configure_memory_retrieval(
+        self,
+        *,
+        memory_manager: Any,
+        memory_vector_store: Any,
+        runtime_config: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Configure MemoryRetriever after Streamlit session_state has created:
+        - MemoryManager
+        - MemoryVectorStore
+
+        This keeps controller construction light and avoids putting Streamlit
+        objects inside AppController.__init__.
+        """
+        if runtime_config is not None:
+            self.runtime_config = runtime_config
+
+        self.memory_retriever = MemoryRetriever(
+            memory_manager=memory_manager,
+            memory_vector_store=memory_vector_store,
+            sqlite_path=self.memory_sqlite_path,
+            config=self.runtime_config,
+        )
+
+        logger(
+            "Memory Retrieval configured.",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            (
+                "Memory Retrieval configured\n"
+                f"memory_root={self.memory_root}\n"
+                f"sqlite_path={self.memory_sqlite_path}\n"
+                f"runtime_config={json.dumps(self.runtime_config.get('memory_retrieval', {}), ensure_ascii=False, indent=2, default=str)}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
 
     def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
         """
-        Keep EXACTLY the old behaviour:
+        Keep existing behavior:
         - Ignore empty/whitespace-only input.
-        - Otherwise run deterministic preprocessing, update sp in place.
+        - Otherwise run deterministic preprocessing and update SuperPrompt.
         """
         text = (user_text or "").strip()
         if not text:
             return sp
+
         logger("PreProcessing started.", "INFO", "PUBLIC")
         preprocess(text, sp, self.schema)
         logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 
     def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:
-        """
-        Run A2 on the current SuperPrompt.
-        """
+        """Run A2 on the current SuperPrompt."""
         return self.a2_promptshaper.run(sp)
 
     def run_a3(self, sp: SuperPrompt) -> SuperPrompt:
         """
         Run A3 on the current SuperPrompt.
-
-        Inputs:
-            sp:
-                Current evolving SuperPrompt, typically after ReRanker.
-
-        Returns:
-            Updated SuperPrompt after A3 has populated:
-            - views_by_stage["a3"]
-            - extras["a3_selection_band"]
-            - extras["a3_item_decisions"]
-            - final_selection_ids
-            - stage / history_of_stages
         """
         return self.a3_nli_gate.run(sp)
 
@@ -157,43 +199,20 @@ class AppController:
     ) -> SuperPrompt:
         """
         Run A4 on the current SuperPrompt.
-
-        Inputs:
-            sp:
-                Current evolving SuperPrompt, typically after A3.
-            effective_output_token_limit:
-                Optional external override for the final condenser output allowance.
-
-        Returns:
-            Updated SuperPrompt after A4 has populated:
-            - S_CTX_MD
-            - views_by_stage["a4"]
-            - final_selection_ids
-            - extras["a4_*"]
-            - stage / history_of_stages
         """
         return self.a4_condenser.run(
             sp,
             effective_output_token_limit=effective_output_token_limit,
         )
 
-    # Added on 18.03.2026:
-    # Small demo helper for the future memory view in the GUI.
-    # This does NOT change A2 logic. It only builds one simple input/output
-    # record that can be appended by the Streamlit session layer.
     def build_a2_memory_demo_entry(self, sp: SuperPrompt) -> dict[str, str]:
         """
         Build one demo memory entry for the A2 memory view.
-
-        The displayed INPUT contains only the three prompt parts that are
-        important for later retrieval-oriented memory usage:
-        TASK, PURPOSE, CONTEXT.
-
-        The displayed OUTPUT is intentionally dummy text for the demo phase.
         """
         input_text = self._build_a2_memory_demo_input(sp)
         if not input_text:
             input_text = "(empty)"
+
         return {
             "input_text": input_text,
             "output_text": "XXXXX",
@@ -203,12 +222,6 @@ class AppController:
     def _build_a2_memory_demo_input(self, sp: SuperPrompt) -> str:
         """
         Build a simple plain-text prompt for the memory demo.
-
-        Design rule:
-        - Use the current SuperPrompt body after A2 has shaped it.
-        - Keep only TASK / PURPOSE / CONTEXT.
-        - Exclude SYSTEM / DEPTH / retrieval context / other fields.
-        - Return plain text, not markdown-oriented formatting.
         """
         lines: list[str] = []
 
@@ -233,10 +246,6 @@ class AppController:
 
         return "\n".join(lines).strip()
 
-    # Added on 15.03.2026:
-    # Retrieval is a separate deterministic stage and must remain independent
-    # from ReRanker / A3. The controller only passes the current SuperPrompt,
-    # the active GUI project, and the GUI top-k value.
     def run_retrieval(
         self,
         sp: SuperPrompt,
@@ -246,38 +255,50 @@ class AppController:
         use_retrieval_splade: bool = True,
     ) -> SuperPrompt:
         """
-        Run Retrieval on the current SuperPrompt for the selected active project.
+        Run Retrieval on the current SuperPrompt.
 
-        Inputs:
-            sp:
-                Current evolving SuperPrompt.
-            project_name:
-                Active project selected in the GUI.
-            top_k:
-                Number of chunks to keep after retrieval ranking.
-            use_retrieval_splade:
-                If False, bypass the real SPLADE branch and duplicate the dense
-                ranking into the SPLADE input slot before RRF so the Retrieval
-                output contract stays unchanged.
+        Current behavior:
+        1. Run document retrieval.
+        2. Run memory retrieval if MemoryRetriever is configured.
+        3. Store raw document chunks and raw memory candidates in SuperPrompt.
 
-        Returns:
-            Updated SuperPrompt after Retrieval has populated:
-            - base_context_chunks
-            - views_by_stage["retrieval"]
-            - final_selection_ids
-            - stage / history_of_stages
+        This method does not run:
+        - ReRanker
+        - A3
+        - A4
+        - MemoryMerge
         """
+        if self.retriever is None:
+            raise RuntimeError("Document Retriever is not initialized yet.")
+
         project_name = self._normalize_project_name(project_name)
-        return self.retriever.run(
+
+        sp = self.retriever.run(
             sp=sp,
             project_name=project_name,
             top_k=int(top_k),
             use_retrieval_splade=bool(use_retrieval_splade),
         )
 
-    # Added on 31.03.2026:
-    # ReRanker is a separate deterministic stage after Retrieval. The controller
-    # only passes the current SuperPrompt and returns the same updated object.
+        if self.memory_retriever is not None:
+            try:
+                sp = self.memory_retriever.run(sp)
+            except Exception as e:
+                logger(f"Memory Retrieval failed: {e}", "ERROR", "PUBLIC")
+                logger_dev(
+                    f"Memory Retrieval exception during AppController.run_retrieval: {e}",
+                    "ERROR",
+                    "CONFIDENTIAL",
+                )
+        else:
+            logger(
+                "Memory Retrieval skipped: MemoryRetriever is not configured.",
+                "INFO",
+                "INTERNAL",
+            )
+
+        return sp
+
     def run_reranker(
         self,
         sp: SuperPrompt,
@@ -287,26 +308,17 @@ class AppController:
         """
         Run ReRanker on the current SuperPrompt.
 
-        Inputs:
-            sp:
-                Current evolving SuperPrompt, typically after Retrieval.
-            use_reranking_colbert:
-                If False, bypass real ColBERT scoring and copy the Retrieval
-                order into the reranked stage so A3 can run immediately.
-
-        Returns:
-            Updated SuperPrompt after ReRanker has populated:
-            - views_by_stage["reranked"]
-            - final_selection_ids
-            - stage / history_of_stages
+        ReRanker currently operates only on document retrieval results.
+        Memory candidates remain separately stored in SuperPrompt.
         """
+        if self.reranker is None:
+            raise RuntimeError("ReRanker is not initialized yet.")
+
         return self.reranker.run(
             sp,
             use_reranking_colbert=bool(use_reranking_colbert),
         )
 
-    # Added on 10.03.2026:
-    # Project-based ingestion helpers for the new Streamlit buttons.
     def list_projects(self) -> list[str]:
         doc_projects = {p.name for p in self.doc_root.iterdir() if p.is_dir()}
         chroma_projects = {p.name for p in self.chroma_root.iterdir() if p.is_dir()}
@@ -336,9 +348,6 @@ class AppController:
         project_name = self._normalize_project_name(project_name)
         paths = self.create_project(project_name)
 
-        # Added on 10.03.2026:
-        # The manifest file is standardized per requirement and stored inside
-        # the matching Chroma DB project folder.
         manifest_path = Path(paths["manifest_path"])
 
         manager = IngestionManager(doc_root=str(self.doc_root))
@@ -386,12 +395,11 @@ class AppController:
         copied_files: list[str] = []
         rejected_files: list[str] = []
 
-        # Added on 10.03.2026:
-        # Support browser uploads from Streamlit without changing ingestion internals.
         for uploaded in uploaded_files or []:
             filename = Path(getattr(uploaded, "name", "")).name
             if not filename:
                 continue
+
             if Path(filename).suffix.lower() not in allowed_suffixes:
                 rejected_files.append(f"{filename}  [only .txt/.md allowed]")
                 continue
@@ -421,9 +429,6 @@ class AppController:
         )
         return ingest_result
 
-    # Added on 10.03.2026:
-    # Read the standardized project manifest and return the file names that were
-    # actually ingested/embedded for the selected project.
     def get_embedded_files(self, project_name: str) -> dict[str, Any]:
         project_name = self._normalize_project_name(project_name)
         manifest_path = self.chroma_root / project_name / "file_manifest.json"
@@ -449,12 +454,8 @@ class AppController:
                     records = [r for r in manifest_records if isinstance(r, dict)]
                 elif isinstance(manifest_records, dict):
                     records = [r for r in manifest_records.values() if isinstance(r, dict)]
-                else:
-                    # Added on 10.03.2026:
-                    # Fallback in case the manifest itself is already a mapping
-                    # from file path to metadata record.
-                    if all(isinstance(v, dict) for v in manifest_data.values()):
-                        records = [r for r in manifest_data.values() if isinstance(r, dict)]
+                elif all(isinstance(v, dict) for v in manifest_data.values()):
+                    records = [r for r in manifest_data.values() if isinstance(r, dict)]
 
             elif isinstance(manifest_data, list):
                 records = [r for r in manifest_data if isinstance(r, dict)]
@@ -483,8 +484,54 @@ class AppController:
                 "message": str(e),
             }
 
-    # Added on 10.03.2026:
-    # Small validation/helper methods for project-scoped folder + manifest routing.
+    def reload_runtime_config(self) -> dict[str, Any]:
+        """
+        Reload runtime_config.json from disk.
+
+        Useful during development when limits are changed without restarting
+        the whole app process.
+        """
+        self.runtime_config = self._load_runtime_config()
+        return self.runtime_config
+
+    def _load_runtime_config(self) -> dict[str, Any]:
+        """
+        Load runtime_config.json.
+
+        If the file is missing or invalid, return an empty dictionary so the
+        stage defaults inside retrieval components can still run.
+        """
+        if not self.runtime_config_path.exists():
+            logger(
+                f"runtime_config.json not found: {self.runtime_config_path}",
+                "WARN",
+                "PUBLIC",
+            )
+            return {}
+
+        try:
+            with self.runtime_config_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                raise ValueError("runtime_config.json root must be a JSON object.")
+
+            logger(
+                "runtime_config.json loaded.",
+                "INFO",
+                "INTERNAL",
+            )
+
+            return data
+
+        except Exception as e:
+            logger(
+                f"Failed to load runtime_config.json: {e}",
+                "ERROR",
+                "PUBLIC",
+            )
+            return {}
+
     @staticmethod
     def _normalize_project_name(project_name: str) -> str:
         name = (project_name or "").strip()

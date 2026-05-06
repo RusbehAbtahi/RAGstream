@@ -8,7 +8,6 @@ Keep controller calls and session-state mutations here.
 from __future__ import annotations
 
 import copy
-import time
 
 from typing import Any
 
@@ -25,7 +24,7 @@ def do_preprocess() -> None:
     ctrl: AppController = st.session_state.controller
     user_text = st.session_state.get("prompt_text", "")
 
-    # Start a fresh pipeline run from clean SuperPrompt objects
+    # Start a fresh pipeline run from clean SuperPrompt objects.
     st.session_state.sp = SuperPrompt()
     st.session_state.sp_pre = SuperPrompt()
     st.session_state.sp_a2 = SuperPrompt()
@@ -67,47 +66,8 @@ def do_feed_memory_manually() -> None:
         logger("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
         return
 
-    memory_manager: MemoryManager = st.session_state.memory_manager
-
-    if not memory_manager.title.strip():
-        st.session_state["pending_manual_memory_pair"] = {
-            "input_text": prompt_text,
-            "output_text": output_text,
-        }
-        st.session_state["memory_title_required"] = True
-        logger("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
-        st.session_state["runtime_log_flash_until"] = time.time() + 5
-        st.rerun()
-
     _save_memory_pair(
         input_text=prompt_text,
-        output_text=output_text,
-    )
-
-
-def do_confirm_memory_title_and_save() -> None:
-    """Confirm first memory title and save pending manual memory pair."""
-    title = (st.session_state.get("memory_title_input", "") or "").strip()
-    if not title:
-        logger("Memory title must not be empty.", "WARN", "PUBLIC")
-        return
-
-    memory_manager: MemoryManager = st.session_state.memory_manager
-
-    if not memory_manager.title.strip():
-        memory_manager.start_new_history(title)
-        logger(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
-
-    pending_pair = st.session_state.get("pending_manual_memory_pair")
-    if pending_pair:
-        input_text = pending_pair.get("input_text", "")
-        output_text = pending_pair.get("output_text", "")
-    else:
-        input_text = st.session_state.get("prompt_text", "")
-        output_text = st.session_state.get("manual_memory_feed_text", "")
-
-    _save_memory_pair(
-        input_text=input_text,
         output_text=output_text,
     )
 
@@ -135,8 +95,6 @@ def _save_memory_pair(
         )
 
         if result.get("success"):
-            st.session_state["pending_manual_memory_pair"] = None
-            st.session_state["memory_title_required"] = False
             st.session_state["manual_memory_feed_text"] = ""
             st.rerun()
         else:
@@ -173,14 +131,17 @@ def _collect_memory_gui_state(memory_manager: MemoryManager) -> list[dict[str, A
         direct_recall_key = f"memory_direct_recall_key_{record.record_id}"
 
         tag = st.session_state.get(tag_key, record.tag)
+
         retrieval_source_mode = st.session_state.get(
             source_mode_key,
             getattr(record, "retrieval_source_mode", "QA"),
         )
+
         user_keywords_text = st.session_state.get(
             keywords_key,
             ", ".join(record.user_keywords),
         )
+
         direct_recall_value = st.session_state.get(
             direct_recall_key,
             getattr(record, "direct_recall_key", ""),
@@ -220,11 +181,43 @@ def _parse_user_keywords(text: str) -> list[str]:
     return result
 
 
+def _ensure_memory_retrieval_configured(ctrl: AppController) -> None:
+    """
+    Defensive wiring for development.
+
+    ui_streamlit.py normally configures MemoryRetriever at startup.
+    This helper guarantees that Retrieval button still wires memory retrieval
+    if the session was created before the new startup code existed.
+    """
+    if getattr(ctrl, "memory_retriever", None) is not None:
+        return
+
+    memory_manager = st.session_state.get("memory_manager")
+    memory_vector_store = st.session_state.get("memory_vector_store")
+    runtime_config = st.session_state.get("runtime_config", {})
+
+    if memory_manager is None or memory_vector_store is None:
+        logger(
+            "Memory Retrieval is not configured because memory objects are missing.",
+            "WARN",
+            "PUBLIC",
+        )
+        return
+
+    ctrl.configure_memory_retrieval(
+        memory_manager=memory_manager,
+        memory_vector_store=memory_vector_store,
+        runtime_config=runtime_config,
+    )
+
+
 def do_retrieval() -> None:
     """Retrieval button callback."""
     try:
         ctrl: AppController = st.session_state.controller
         sp: SuperPrompt = st.session_state.sp
+
+        _ensure_memory_retrieval_configured(ctrl)
 
         project_name = st.session_state.get("active_project")
         if not project_name:
@@ -246,6 +239,7 @@ def do_retrieval() -> None:
             top_k,
             use_retrieval_splade=use_retrieval_splade,
         )
+
         sp.compose_prompt_ready()
 
         st.session_state.sp = sp
@@ -268,6 +262,7 @@ def do_reranker() -> None:
             sp,
             use_reranking_colbert=use_reranking_colbert,
         )
+
         sp.compose_prompt_ready()
 
         st.session_state.sp = sp

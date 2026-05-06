@@ -29,7 +29,11 @@
 │   │   ├── controller.py
 │   │   ├── controller_legacy.py
 │   │   ├── ui_actions.py
+│   │   ├── ui_actions_files.py
+│   │   ├── ui_files.py
 │   │   ├── ui_layout.py
+│   │   ├── ui_metrics.py
+│   │   ├── ui_settings.py
 │   │   └── ui_streamlit.py
 │   ├── config
 │   │   ├── __init__.py
@@ -54,9 +58,13 @@
 │   │   ├── __pycache__
 │   │   ├── memory_actions.py
 │   │   ├── memory_chunker.py
+│   │   ├── memory_context_pack.py
+│   │   ├── memory_file_manager.py
+│   │   ├── memory_index_lookup.py
 │   │   ├── memory_ingestion_manager.py
 │   │   ├── memory_manager.py
 │   │   ├── memory_record.py
+│   │   ├── memory_scoring.py
 │   │   └── memory_vector_store.py
 │   ├── orchestration
 │   │   ├── __init__.py
@@ -89,6 +97,7 @@
 │   │   ├── reranker.py
 │   │   ├── retriever.py
 │   │   ├── retriever_emb.py
+│   │   ├── retriever_mem.py
 │   │   ├── retriever_splade.py
 │   │   ├── rrf_merger.py
 │   │   └── smart_query_splitter.py
@@ -149,12 +158,12 @@
     ├── logs
     │   ├── archive
     │   ├── backups
+    │   ├── developer
     │   ├── public_run
     │   └── sqlite
     ├── memory
     │   ├── files
     │   │   ├── 2026-04-28-17-54-Music_TEST_RAG.ragmeta.json
-    │   │   ├── 2026-04-28-17-55-Music2.ragmeta.json
     │   │   ├── 2026-04-28-18-12-MUSIC3.ragmeta.json
     │   │   ├── 2026-04-28-18-34-Another-Test.ragmeta.json
     │   │   ├── 2026-05-01-15-01-TEST1.ragmeta.json
@@ -165,9 +174,9 @@
     │   │   ├── 2026-05-04-16-56-TEST.ragmeta.json
     │   │   ├── 2026-05-04-17-03-Test.ragmeta.json
     │   │   ├── 2026-05-05-04-36-Test.ragmeta.json
-    │   │   ├── 2026-05-05-04-42-Test.ragmeta.json
-    │   │   ├── 2026-05-05-05-15-Test.ragmeta.json
-    │   │   └── 2026-05-05-05-29-TA.ragmeta.json
+    │   │   ├── 2026-05-05-05-29-RUSBEH.ragmeta.json
+    │   │   ├── 2026-05-05-16-40-AWS.ragmeta.json
+    │   │   └── 2026-05-06-11-25-memory-record.ragmeta.json
     │   └── vector_db
     │       ├── 36c58a2a-9b94-47e5-a496-e41f40090e5b
     ├── np_store

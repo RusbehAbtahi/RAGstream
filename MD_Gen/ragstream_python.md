@@ -41,7 +41,7 @@ class A4_Condenser:
 
 ### ~\ragstream\app\controller.py
 ```python
-# controller.py
+# ragstream/app/controller.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -77,7 +77,13 @@ from ragstream.ingestion.vector_store_splade import VectorStoreSplade
 # Deterministic Retrieval stage.
 from ragstream.retrieval.retriever import Retriever
 from ragstream.retrieval.reranker import Reranker
+
+# Added on 05.05.2026:
+# Memory Retrieval stage entry point.
+from ragstream.retrieval.retriever_mem import MemoryRetriever
+
 from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
 
 class AppController:
@@ -87,108 +93,144 @@ class AppController:
 
         Light initialization only.
 
-        - Loads PromptSchema once (for PreProcessing).
-        - Creates a shared AgentFactory + LLMClient.
-        - Creates the A2PromptShaper agent.
-        - Creates the A3NLIGate agent.
-        - Creates the A4Condenser agent.
+        - Loads PromptSchema once for PreProcessing.
+        - Creates shared AgentFactory + LLMClient.
+        - Creates A2, A3, A4 agent objects.
         - Prepares project/data paths.
+        - Loads runtime_config.json.
+        - Keeps MemoryRetriever optional until Streamlit provides MemoryManager
+          and MemoryVectorStore from session_state.
         """
-        # PreProcessing schema (OLD, working behaviour)
+        # PreProcessing schema.
         self.schema = PromptSchema(schema_path)
 
-        # Shared AgentFactory (for A2 and, later, other agents)
+        # Shared AgentFactory for LLM-based agents.
         self.agent_factory = AgentFactory()
 
-        # Shared LLMClient
+        # Shared LLM client.
         self.llm_client = LLMClient()
 
-        # A2 agent
+        # A2 agent.
         self.a2_promptshaper = A2PromptShaper(
             agent_factory=self.agent_factory,
             llm_client=self.llm_client,
         )
 
-        # A3 agent
+        # A3 agent.
         self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
             llm_client=self.llm_client,
         )
 
-        # A4 agent
+        # A4 agent.
         self.a4_condenser = A4Condenser(
             llm_client=self.llm_client,
         )
 
-        # Added on 10.03.2026:
-        # Keep project/document roots centralized in the controller so the GUI
-        # stays thin and the ingestion backend continues to receive explicit paths.
+        # Project/data roots.
         self.project_root = Path(__file__).resolve().parents[2]
         self.data_root = self.project_root / "data"
         self.doc_root = self.data_root / "doc_raw"
         self.chroma_root = self.data_root / "chroma_db"
         self.splade_root = self.data_root / "splade_db"
+        self.memory_root = self.data_root / "memory"
+        self.memory_sqlite_path = self.memory_root / "memory_index.sqlite3"
+
         self.doc_root.mkdir(parents=True, exist_ok=True)
         self.chroma_root.mkdir(parents=True, exist_ok=True)
         self.splade_root.mkdir(parents=True, exist_ok=True)
+        self.memory_root.mkdir(parents=True, exist_ok=True)
+
+        # Global runtime defaults.
+        self.runtime_config_path = self.project_root / "ragstream" / "config" / "runtime_config.json"
+        self.runtime_config: dict[str, Any] = self._load_runtime_config()
+
+        # Heavy components are created later in initialize_heavy_components().
+        self.retriever: Retriever | None = None
+        self.reranker: Reranker | None = None
+
+        # MemoryRetriever is configured by ui_streamlit.py after memory objects exist.
+        self.memory_retriever: MemoryRetriever | None = None
 
     def initialize_heavy_components(self) -> None:
         """
         Heavy initialization only.
 
-        - Creates the Retrieval stage object.
-        - Creates the ReRanker stage object.
+        - Creates the document Retrieval stage object.
+        - Creates the document ReRanker stage object.
         """
 
-        # Added on 15.03.2026:
-        # Retrieval is initialized once and re-used. It reads the active project
-        # Chroma DB and reconstructs real chunk text from doc_raw.
         self.retriever = Retriever(
             doc_root=str(self.doc_root),
             chroma_root=str(self.chroma_root),
         )
 
-        # Added on 31.03.2026:
-        # ReRanker is initialized once and re-used. It consumes the Retrieval
-        # candidates already stored in SuperPrompt and reorders them with the
-        # agreed cross-encoder model.
         self.reranker = Reranker()
+
+    def configure_memory_retrieval(
+        self,
+        *,
+        memory_manager: Any,
+        memory_vector_store: Any,
+        runtime_config: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Configure MemoryRetriever after Streamlit session_state has created:
+        - MemoryManager
+        - MemoryVectorStore
+
+        This keeps controller construction light and avoids putting Streamlit
+        objects inside AppController.__init__.
+        """
+        if runtime_config is not None:
+            self.runtime_config = runtime_config
+
+        self.memory_retriever = MemoryRetriever(
+            memory_manager=memory_manager,
+            memory_vector_store=memory_vector_store,
+            sqlite_path=self.memory_sqlite_path,
+            config=self.runtime_config,
+        )
+
+        logger(
+            "Memory Retrieval configured.",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            (
+                "Memory Retrieval configured\n"
+                f"memory_root={self.memory_root}\n"
+                f"sqlite_path={self.memory_sqlite_path}\n"
+                f"runtime_config={json.dumps(self.runtime_config.get('memory_retrieval', {}), ensure_ascii=False, indent=2, default=str)}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
 
     def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
         """
-        Keep EXACTLY the old behaviour:
+        Keep existing behavior:
         - Ignore empty/whitespace-only input.
-        - Otherwise run deterministic preprocessing, update sp in place.
+        - Otherwise run deterministic preprocessing and update SuperPrompt.
         """
         text = (user_text or "").strip()
         if not text:
             return sp
+
         logger("PreProcessing started.", "INFO", "PUBLIC")
         preprocess(text, sp, self.schema)
         logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 
     def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:
-        """
-        Run A2 on the current SuperPrompt.
-        """
+        """Run A2 on the current SuperPrompt."""
         return self.a2_promptshaper.run(sp)
 
     def run_a3(self, sp: SuperPrompt) -> SuperPrompt:
         """
         Run A3 on the current SuperPrompt.
-
-        Inputs:
-            sp:
-                Current evolving SuperPrompt, typically after ReRanker.
-
-        Returns:
-            Updated SuperPrompt after A3 has populated:
-            - views_by_stage["a3"]
-            - extras["a3_selection_band"]
-            - extras["a3_item_decisions"]
-            - final_selection_ids
-            - stage / history_of_stages
         """
         return self.a3_nli_gate.run(sp)
 
@@ -200,43 +242,20 @@ class AppController:
     ) -> SuperPrompt:
         """
         Run A4 on the current SuperPrompt.
-
-        Inputs:
-            sp:
-                Current evolving SuperPrompt, typically after A3.
-            effective_output_token_limit:
-                Optional external override for the final condenser output allowance.
-
-        Returns:
-            Updated SuperPrompt after A4 has populated:
-            - S_CTX_MD
-            - views_by_stage["a4"]
-            - final_selection_ids
-            - extras["a4_*"]
-            - stage / history_of_stages
         """
         return self.a4_condenser.run(
             sp,
             effective_output_token_limit=effective_output_token_limit,
         )
 
-    # Added on 18.03.2026:
-    # Small demo helper for the future memory view in the GUI.
-    # This does NOT change A2 logic. It only builds one simple input/output
-    # record that can be appended by the Streamlit session layer.
     def build_a2_memory_demo_entry(self, sp: SuperPrompt) -> dict[str, str]:
         """
         Build one demo memory entry for the A2 memory view.
-
-        The displayed INPUT contains only the three prompt parts that are
-        important for later retrieval-oriented memory usage:
-        TASK, PURPOSE, CONTEXT.
-
-        The displayed OUTPUT is intentionally dummy text for the demo phase.
         """
         input_text = self._build_a2_memory_demo_input(sp)
         if not input_text:
             input_text = "(empty)"
+
         return {
             "input_text": input_text,
             "output_text": "XXXXX",
@@ -246,12 +265,6 @@ class AppController:
     def _build_a2_memory_demo_input(self, sp: SuperPrompt) -> str:
         """
         Build a simple plain-text prompt for the memory demo.
-
-        Design rule:
-        - Use the current SuperPrompt body after A2 has shaped it.
-        - Keep only TASK / PURPOSE / CONTEXT.
-        - Exclude SYSTEM / DEPTH / retrieval context / other fields.
-        - Return plain text, not markdown-oriented formatting.
         """
         lines: list[str] = []
 
@@ -276,10 +289,6 @@ class AppController:
 
         return "\n".join(lines).strip()
 
-    # Added on 15.03.2026:
-    # Retrieval is a separate deterministic stage and must remain independent
-    # from ReRanker / A3. The controller only passes the current SuperPrompt,
-    # the active GUI project, and the GUI top-k value.
     def run_retrieval(
         self,
         sp: SuperPrompt,
@@ -289,38 +298,50 @@ class AppController:
         use_retrieval_splade: bool = True,
     ) -> SuperPrompt:
         """
-        Run Retrieval on the current SuperPrompt for the selected active project.
+        Run Retrieval on the current SuperPrompt.
 
-        Inputs:
-            sp:
-                Current evolving SuperPrompt.
-            project_name:
-                Active project selected in the GUI.
-            top_k:
-                Number of chunks to keep after retrieval ranking.
-            use_retrieval_splade:
-                If False, bypass the real SPLADE branch and duplicate the dense
-                ranking into the SPLADE input slot before RRF so the Retrieval
-                output contract stays unchanged.
+        Current behavior:
+        1. Run document retrieval.
+        2. Run memory retrieval if MemoryRetriever is configured.
+        3. Store raw document chunks and raw memory candidates in SuperPrompt.
 
-        Returns:
-            Updated SuperPrompt after Retrieval has populated:
-            - base_context_chunks
-            - views_by_stage["retrieval"]
-            - final_selection_ids
-            - stage / history_of_stages
+        This method does not run:
+        - ReRanker
+        - A3
+        - A4
+        - MemoryMerge
         """
+        if self.retriever is None:
+            raise RuntimeError("Document Retriever is not initialized yet.")
+
         project_name = self._normalize_project_name(project_name)
-        return self.retriever.run(
+
+        sp = self.retriever.run(
             sp=sp,
             project_name=project_name,
             top_k=int(top_k),
             use_retrieval_splade=bool(use_retrieval_splade),
         )
 
-    # Added on 31.03.2026:
-    # ReRanker is a separate deterministic stage after Retrieval. The controller
-    # only passes the current SuperPrompt and returns the same updated object.
+        if self.memory_retriever is not None:
+            try:
+                sp = self.memory_retriever.run(sp)
+            except Exception as e:
+                logger(f"Memory Retrieval failed: {e}", "ERROR", "PUBLIC")
+                logger_dev(
+                    f"Memory Retrieval exception during AppController.run_retrieval: {e}",
+                    "ERROR",
+                    "CONFIDENTIAL",
+                )
+        else:
+            logger(
+                "Memory Retrieval skipped: MemoryRetriever is not configured.",
+                "INFO",
+                "INTERNAL",
+            )
+
+        return sp
+
     def run_reranker(
         self,
         sp: SuperPrompt,
@@ -330,26 +351,17 @@ class AppController:
         """
         Run ReRanker on the current SuperPrompt.
 
-        Inputs:
-            sp:
-                Current evolving SuperPrompt, typically after Retrieval.
-            use_reranking_colbert:
-                If False, bypass real ColBERT scoring and copy the Retrieval
-                order into the reranked stage so A3 can run immediately.
-
-        Returns:
-            Updated SuperPrompt after ReRanker has populated:
-            - views_by_stage["reranked"]
-            - final_selection_ids
-            - stage / history_of_stages
+        ReRanker currently operates only on document retrieval results.
+        Memory candidates remain separately stored in SuperPrompt.
         """
+        if self.reranker is None:
+            raise RuntimeError("ReRanker is not initialized yet.")
+
         return self.reranker.run(
             sp,
             use_reranking_colbert=bool(use_reranking_colbert),
         )
 
-    # Added on 10.03.2026:
-    # Project-based ingestion helpers for the new Streamlit buttons.
     def list_projects(self) -> list[str]:
         doc_projects = {p.name for p in self.doc_root.iterdir() if p.is_dir()}
         chroma_projects = {p.name for p in self.chroma_root.iterdir() if p.is_dir()}
@@ -379,9 +391,6 @@ class AppController:
         project_name = self._normalize_project_name(project_name)
         paths = self.create_project(project_name)
 
-        # Added on 10.03.2026:
-        # The manifest file is standardized per requirement and stored inside
-        # the matching Chroma DB project folder.
         manifest_path = Path(paths["manifest_path"])
 
         manager = IngestionManager(doc_root=str(self.doc_root))
@@ -429,12 +438,11 @@ class AppController:
         copied_files: list[str] = []
         rejected_files: list[str] = []
 
-        # Added on 10.03.2026:
-        # Support browser uploads from Streamlit without changing ingestion internals.
         for uploaded in uploaded_files or []:
             filename = Path(getattr(uploaded, "name", "")).name
             if not filename:
                 continue
+
             if Path(filename).suffix.lower() not in allowed_suffixes:
                 rejected_files.append(f"{filename}  [only .txt/.md allowed]")
                 continue
@@ -464,9 +472,6 @@ class AppController:
         )
         return ingest_result
 
-    # Added on 10.03.2026:
-    # Read the standardized project manifest and return the file names that were
-    # actually ingested/embedded for the selected project.
     def get_embedded_files(self, project_name: str) -> dict[str, Any]:
         project_name = self._normalize_project_name(project_name)
         manifest_path = self.chroma_root / project_name / "file_manifest.json"
@@ -492,12 +497,8 @@ class AppController:
                     records = [r for r in manifest_records if isinstance(r, dict)]
                 elif isinstance(manifest_records, dict):
                     records = [r for r in manifest_records.values() if isinstance(r, dict)]
-                else:
-                    # Added on 10.03.2026:
-                    # Fallback in case the manifest itself is already a mapping
-                    # from file path to metadata record.
-                    if all(isinstance(v, dict) for v in manifest_data.values()):
-                        records = [r for r in manifest_data.values() if isinstance(r, dict)]
+                elif all(isinstance(v, dict) for v in manifest_data.values()):
+                    records = [r for r in manifest_data.values() if isinstance(r, dict)]
 
             elif isinstance(manifest_data, list):
                 records = [r for r in manifest_data if isinstance(r, dict)]
@@ -526,8 +527,54 @@ class AppController:
                 "message": str(e),
             }
 
-    # Added on 10.03.2026:
-    # Small validation/helper methods for project-scoped folder + manifest routing.
+    def reload_runtime_config(self) -> dict[str, Any]:
+        """
+        Reload runtime_config.json from disk.
+
+        Useful during development when limits are changed without restarting
+        the whole app process.
+        """
+        self.runtime_config = self._load_runtime_config()
+        return self.runtime_config
+
+    def _load_runtime_config(self) -> dict[str, Any]:
+        """
+        Load runtime_config.json.
+
+        If the file is missing or invalid, return an empty dictionary so the
+        stage defaults inside retrieval components can still run.
+        """
+        if not self.runtime_config_path.exists():
+            logger(
+                f"runtime_config.json not found: {self.runtime_config_path}",
+                "WARN",
+                "PUBLIC",
+            )
+            return {}
+
+        try:
+            with self.runtime_config_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                raise ValueError("runtime_config.json root must be a JSON object.")
+
+            logger(
+                "runtime_config.json loaded.",
+                "INFO",
+                "INTERNAL",
+            )
+
+            return data
+
+        except Exception as e:
+            logger(
+                f"Failed to load runtime_config.json: {e}",
+                "ERROR",
+                "PUBLIC",
+            )
+            return {}
+
     @staticmethod
     def _normalize_project_name(project_name: str) -> str:
         name = (project_name or "").strip()
@@ -1108,7 +1155,6 @@ Keep controller calls and session-state mutations here.
 from __future__ import annotations
 
 import copy
-import time
 
 from typing import Any
 
@@ -1125,7 +1171,7 @@ def do_preprocess() -> None:
     ctrl: AppController = st.session_state.controller
     user_text = st.session_state.get("prompt_text", "")
 
-    # Start a fresh pipeline run from clean SuperPrompt objects
+    # Start a fresh pipeline run from clean SuperPrompt objects.
     st.session_state.sp = SuperPrompt()
     st.session_state.sp_pre = SuperPrompt()
     st.session_state.sp_a2 = SuperPrompt()
@@ -1167,47 +1213,8 @@ def do_feed_memory_manually() -> None:
         logger("Manual memory response is empty. No memory record was created.", "WARN", "PUBLIC")
         return
 
-    memory_manager: MemoryManager = st.session_state.memory_manager
-
-    if not memory_manager.title.strip():
-        st.session_state["pending_manual_memory_pair"] = {
-            "input_text": prompt_text,
-            "output_text": output_text,
-        }
-        st.session_state["memory_title_required"] = True
-        logger("Enter a memory title to create the first memory file.", "INFO", "PUBLIC")
-        st.session_state["runtime_log_flash_until"] = time.time() + 5
-        st.rerun()
-
     _save_memory_pair(
         input_text=prompt_text,
-        output_text=output_text,
-    )
-
-
-def do_confirm_memory_title_and_save() -> None:
-    """Confirm first memory title and save pending manual memory pair."""
-    title = (st.session_state.get("memory_title_input", "") or "").strip()
-    if not title:
-        logger("Memory title must not be empty.", "WARN", "PUBLIC")
-        return
-
-    memory_manager: MemoryManager = st.session_state.memory_manager
-
-    if not memory_manager.title.strip():
-        memory_manager.start_new_history(title)
-        logger(f"Memory file created: {memory_manager.filename_ragmem}", "INFO", "PUBLIC")
-
-    pending_pair = st.session_state.get("pending_manual_memory_pair")
-    if pending_pair:
-        input_text = pending_pair.get("input_text", "")
-        output_text = pending_pair.get("output_text", "")
-    else:
-        input_text = st.session_state.get("prompt_text", "")
-        output_text = st.session_state.get("manual_memory_feed_text", "")
-
-    _save_memory_pair(
-        input_text=input_text,
         output_text=output_text,
     )
 
@@ -1235,8 +1242,6 @@ def _save_memory_pair(
         )
 
         if result.get("success"):
-            st.session_state["pending_manual_memory_pair"] = None
-            st.session_state["memory_title_required"] = False
             st.session_state["manual_memory_feed_text"] = ""
             st.rerun()
         else:
@@ -1273,14 +1278,17 @@ def _collect_memory_gui_state(memory_manager: MemoryManager) -> list[dict[str, A
         direct_recall_key = f"memory_direct_recall_key_{record.record_id}"
 
         tag = st.session_state.get(tag_key, record.tag)
+
         retrieval_source_mode = st.session_state.get(
             source_mode_key,
             getattr(record, "retrieval_source_mode", "QA"),
         )
+
         user_keywords_text = st.session_state.get(
             keywords_key,
             ", ".join(record.user_keywords),
         )
+
         direct_recall_value = st.session_state.get(
             direct_recall_key,
             getattr(record, "direct_recall_key", ""),
@@ -1320,11 +1328,43 @@ def _parse_user_keywords(text: str) -> list[str]:
     return result
 
 
+def _ensure_memory_retrieval_configured(ctrl: AppController) -> None:
+    """
+    Defensive wiring for development.
+
+    ui_streamlit.py normally configures MemoryRetriever at startup.
+    This helper guarantees that Retrieval button still wires memory retrieval
+    if the session was created before the new startup code existed.
+    """
+    if getattr(ctrl, "memory_retriever", None) is not None:
+        return
+
+    memory_manager = st.session_state.get("memory_manager")
+    memory_vector_store = st.session_state.get("memory_vector_store")
+    runtime_config = st.session_state.get("runtime_config", {})
+
+    if memory_manager is None or memory_vector_store is None:
+        logger(
+            "Memory Retrieval is not configured because memory objects are missing.",
+            "WARN",
+            "PUBLIC",
+        )
+        return
+
+    ctrl.configure_memory_retrieval(
+        memory_manager=memory_manager,
+        memory_vector_store=memory_vector_store,
+        runtime_config=runtime_config,
+    )
+
+
 def do_retrieval() -> None:
     """Retrieval button callback."""
     try:
         ctrl: AppController = st.session_state.controller
         sp: SuperPrompt = st.session_state.sp
+
+        _ensure_memory_retrieval_configured(ctrl)
 
         project_name = st.session_state.get("active_project")
         if not project_name:
@@ -1346,6 +1386,7 @@ def do_retrieval() -> None:
             top_k,
             use_retrieval_splade=use_retrieval_splade,
         )
+
         sp.compose_prompt_ready()
 
         st.session_state.sp = sp
@@ -1368,6 +1409,7 @@ def do_reranker() -> None:
             sp,
             use_reranking_colbert=use_reranking_colbert,
         )
+
         sp.compose_prompt_ready()
 
         st.session_state.sp = sp
@@ -1484,6 +1526,531 @@ def do_add_files() -> None:
         }
 ```
 
+### ~\ragstream\app\ui_actions_files.py
+```python
+# ragstream/app/ui_actions_files.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import streamlit as st
+
+from ragstream.memory.memory_file_manager import MemoryFileManager
+from ragstream.memory.memory_manager import MemoryManager
+from ragstream.textforge.RagLog import LogALL as logger
+
+
+def do_files_create_history() -> None:
+    """Create a new empty memory history and make it active."""
+    new_title = str(st.session_state.get("files_new_memory_title", "") or "").strip()
+
+    if not new_title:
+        _set_status("error", "New memory name must not be empty.")
+        return
+
+    try:
+        manager = _file_manager()
+        result = manager.create_history(new_title)
+
+        st.session_state["files_selected_file_id"] = result.get("file_id", "")
+
+        _clear_memory_widget_state()
+
+        _set_status(
+            "success",
+            f"Created memory history: {result.get('filename_ragmem', '')}",
+        )
+
+        logger(
+            f"Memory history created: {result.get('filename_ragmem', '')}",
+            "INFO",
+            "PUBLIC",
+        )
+
+        st.rerun()
+
+    except Exception as e:
+        _set_status("error", str(e))
+        logger(str(e), "ERROR", "PUBLIC")
+
+
+def do_files_load_history() -> None:
+    """Load selected memory history from server-side storage."""
+    file_id = _selected_file_id()
+    if not file_id:
+        _set_status("error", "No memory history selected.")
+        return
+
+    try:
+        manager = _file_manager()
+        result = manager.load_history(file_id)
+
+        _clear_memory_widget_state()
+
+        _set_status(
+            "success",
+            f"Loaded memory history: {result.get('filename_ragmem', '')}",
+        )
+
+        logger(
+            f"Memory history loaded: {result.get('filename_ragmem', '')}",
+            "INFO",
+            "PUBLIC",
+        )
+
+        st.rerun()
+
+    except Exception as e:
+        _set_status("error", str(e))
+        logger(str(e), "ERROR", "PUBLIC")
+
+
+def do_files_rename_history() -> None:
+    """Rename selected memory history through RAGstream only."""
+    file_id = _selected_file_id()
+    if not file_id:
+        _set_status("error", "No memory history selected.")
+        return
+
+    rename_key = _rename_key(file_id)
+    new_title = str(st.session_state.get(rename_key, "") or "").strip()
+
+    if not new_title:
+        _set_status("error", "New memory name must not be empty.")
+        return
+
+    try:
+        manager = _file_manager()
+        result = manager.rename_history(
+            file_id=file_id,
+            new_title=new_title,
+        )
+
+        _set_status(
+            "success",
+            f"Renamed memory history: {result.get('filename_ragmem', '')}",
+        )
+
+        logger(
+            f"Memory history renamed: {result.get('filename_ragmem', '')}",
+            "INFO",
+            "PUBLIC",
+        )
+
+        st.rerun()
+
+    except Exception as e:
+        _set_status("error", str(e))
+        logger(str(e), "ERROR", "PUBLIC")
+
+
+def do_files_delete_request() -> None:
+    """Show delete confirmation input for selected memory history."""
+    file_id = _selected_file_id()
+    if not file_id:
+        _set_status("error", "No memory history selected.")
+        return
+
+    st.session_state[_delete_pending_key(file_id)] = True
+    _set_status("error", 'Deletion pending. Type "delete" and press Confirm Delete.')
+    st.rerun()
+
+
+def do_files_confirm_delete_history() -> None:
+    """Delete selected memory history after typed confirmation."""
+    file_id = _selected_file_id()
+    if not file_id:
+        _set_status("error", "No memory history selected.")
+        return
+
+    confirm_key = _delete_confirm_key(file_id)
+    typed_value = str(st.session_state.get(confirm_key, "") or "").strip()
+
+    if typed_value != "delete":
+        _set_status("error", 'Deletion confirmation must be exactly: delete')
+        return
+
+    try:
+        manager = _file_manager()
+        result = manager.delete_history(file_id)
+
+        st.session_state["files_selected_file_id"] = ""
+
+        _clear_memory_widget_state()
+
+        _set_status(
+            "success",
+            (
+                "Deleted memory history: "
+                f"{result.get('filename_ragmem', '')} | "
+                f"vectors deleted: {result.get('vectors_deleted', 0)}"
+            ),
+        )
+
+        logger(
+            (
+                "Memory history deleted: "
+                f"{result.get('filename_ragmem', '')} | "
+                f"vectors={result.get('vectors_deleted', 0)}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
+        st.rerun()
+
+    except Exception as e:
+        _set_status("error", str(e))
+        logger(str(e), "ERROR", "PUBLIC")
+
+
+def _file_manager() -> MemoryFileManager:
+    memory_manager: MemoryManager = st.session_state.memory_manager
+    memory_vector_store = st.session_state.get("memory_vector_store")
+
+    return MemoryFileManager(
+        memory_manager=memory_manager,
+        memory_vector_store=memory_vector_store,
+    )
+
+
+def _selected_file_id() -> str:
+    return str(st.session_state.get("files_selected_file_id", "") or "").strip()
+
+
+def _rename_key(file_id: str) -> str:
+    return f"files_rename_title_{file_id}"
+
+
+def _delete_pending_key(file_id: str) -> str:
+    return f"files_delete_pending_{file_id}"
+
+
+def _delete_confirm_key(file_id: str) -> str:
+    return f"files_delete_confirm_text_{file_id}"
+
+
+def _set_status(status_type: str, message: str) -> None:
+    st.session_state["files_action_status"] = {
+        "type": status_type,
+        "message": message,
+    }
+
+
+def _clear_memory_widget_state() -> None:
+    prefixes = (
+        "memory_tag_",
+        "memory_retrieval_source_mode_",
+        "memory_user_keywords_",
+        "memory_direct_recall_key_",
+    )
+
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(prefixes):
+            st.session_state.pop(key, None)
+```
+
+### ~\ragstream\app\ui_files.py
+```python
+# ragstream/app/ui_files.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from ragstream.app.ui_actions_files import (
+    do_files_confirm_delete_history,
+    do_files_create_history,
+    do_files_delete_request,
+    do_files_load_history,
+    do_files_rename_history,
+)
+
+
+TABLE_STRIPE_COLOR = "#E2FBD8"
+
+# Same visual width as: [New memory name] [New]
+# The remaining right side stays empty.
+CONTENT_COLS = [3.0, 4.5]
+
+
+def render_files_tab() -> None:
+    """Server-side FILES tab for memory history management."""
+    st.markdown("## Files")
+
+    memory_manager = st.session_state.memory_manager
+    histories = memory_manager.list_histories()
+
+    _repair_selected_file_id(histories)
+    _render_new_memory_area()
+
+    if not histories:
+        st.info("No memory histories found.")
+        _render_status()
+        return
+
+    _render_history_table(histories)
+
+    selected_file_id = str(st.session_state.get("files_selected_file_id", "") or "").strip()
+    selected = _history_by_file_id(histories, selected_file_id)
+
+    st.markdown("### Selected Memory History")
+
+    if not selected:
+        st.info("Select one memory history from the table above.")
+        _render_status()
+        return
+
+    _render_selected_card(selected)
+    _render_action_area(selected)
+    _render_status()
+
+
+def _render_new_memory_area() -> None:
+    """Render compact New Memory action."""
+    st.markdown("### New Memory")
+
+    name_col, btn_col, gap_col = st.columns([2.2, 0.8, 4.5], gap="small")
+
+    with name_col:
+        st.text_input(
+            "New memory name",
+            key="files_new_memory_title",
+            placeholder="New memory name",
+            label_visibility="collapsed",
+        )
+
+    with btn_col:
+        if st.button("New", key="btn_files_new", use_container_width=True):
+            do_files_create_history()
+
+    with gap_col:
+        st.empty()
+
+
+def _render_history_table(histories: list[dict]) -> None:
+    """
+    Render memory histories as a selectable dataframe.
+
+    User selects one row in the table, then uses the action buttons below.
+    """
+    st.markdown("### Memory Histories")
+
+    rows: list[dict[str, str]] = []
+
+    for item in histories:
+        rows.append(
+            {
+                "Filename": str(item.get("filename_ragmem", "") or ""),
+                "Created": str(item.get("created_at_utc", "") or ""),
+                "Updated": str(item.get("updated_at_utc", "") or ""),
+                "Records": str(int(item.get("record_count", 0) or 0)),
+                "_file_id": str(item.get("file_id", "") or ""),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        st.info("No memory histories found.")
+        return
+
+    visible_df = df[["Filename", "Created", "Updated", "Records"]].copy()
+    styled_df = visible_df.style.apply(_stripe_table_rows, axis=1)
+
+    table_col, spacer_col = st.columns(CONTENT_COLS, gap="small")
+
+    with table_col:
+        event = st.dataframe(
+            styled_df,
+            key="files_history_table",
+            use_container_width=True,
+            hide_index=True,
+            height=320,
+            on_select="rerun",
+            selection_mode="single-row",
+            column_config={
+                "Filename": st.column_config.TextColumn(
+                    "Filename",
+                    width="medium",
+                ),
+                "Created": st.column_config.TextColumn(
+                    "Created",
+                    width="small",
+                ),
+                "Updated": st.column_config.TextColumn(
+                    "Updated",
+                    width="small",
+                ),
+                "Records": st.column_config.TextColumn(
+                    "Records",
+                    width="small",
+                ),
+            },
+        )
+
+    with spacer_col:
+        st.empty()
+
+    selected_rows = _get_selected_rows(event)
+    if selected_rows:
+        row_index = int(selected_rows[0])
+        if 0 <= row_index < len(df):
+            st.session_state["files_selected_file_id"] = str(df.iloc[row_index]["_file_id"])
+
+
+def _render_selected_card(selected: dict) -> None:
+    """Render compact selected-file information."""
+    filename = str(selected.get("filename_ragmem", "") or "")
+    file_id = str(selected.get("file_id", "") or "")
+    created = str(selected.get("created_at_utc", "") or "")
+    updated = str(selected.get("updated_at_utc", "") or "")
+    records = int(selected.get("record_count", 0) or 0)
+
+    card_col, gap_col = st.columns(CONTENT_COLS, gap="small")
+
+    with card_col:
+        st.markdown(
+            f"""
+            <div style="
+                border:1px solid #d8d8d8;
+                border-radius:0.55rem;
+                padding:0.65rem 0.85rem;
+                background-color:#fafafa;
+            ">
+                <div style="font-weight:700; font-size:1.02rem;">{filename}</div>
+                <div style="font-size:0.84rem; color:#555;">file_id: {file_id}</div>
+                <div style="font-size:0.84rem; color:#555;">created: {created}</div>
+                <div style="font-size:0.84rem; color:#555;">updated: {updated}</div>
+                <div style="font-size:0.84rem; color:#555;">records: {records}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with gap_col:
+        st.empty()
+
+
+def _render_action_area(selected: dict) -> None:
+    """Render Load / New / Rename / Delete actions for the selected history."""
+    file_id = str(selected.get("file_id", "") or "").strip()
+
+    rename_key = f"files_rename_title_{file_id}"
+    delete_pending_key = f"files_delete_pending_{file_id}"
+    delete_confirm_key = f"files_delete_confirm_text_{file_id}"
+
+    st.markdown("### Actions")
+
+    action_col, gap_col = st.columns(CONTENT_COLS, gap="small")
+
+    with action_col:
+        if st.button("Load", key=f"btn_files_load_{file_id}", use_container_width=True):
+            do_files_load_history()
+
+        rename_text_col, rename_btn_col = st.columns([2.1, 1.0], gap="small")
+        with rename_text_col:
+            st.text_input(
+                "Rename field",
+                key=rename_key,
+                placeholder="New name",
+                label_visibility="collapsed",
+            )
+        with rename_btn_col:
+            if st.button("Rename", key=f"btn_files_rename_{file_id}", use_container_width=True):
+                do_files_rename_history()
+
+        if not st.session_state.get(delete_pending_key, False):
+            if st.button("Delete", key=f"btn_files_delete_request_{file_id}", use_container_width=True):
+                do_files_delete_request()
+        else:
+            st.warning('Type "delete" to confirm deletion.')
+            confirm_text_col, confirm_btn_col = st.columns([2.1, 1.0], gap="small")
+
+            with confirm_text_col:
+                st.text_input(
+                    "Delete confirmation",
+                    key=delete_confirm_key,
+                    placeholder='type "delete"',
+                    label_visibility="collapsed",
+                )
+
+            with confirm_btn_col:
+                if st.button(
+                    "Confirm Delete",
+                    key=f"btn_files_confirm_delete_{file_id}",
+                    use_container_width=True,
+                ):
+                    do_files_confirm_delete_history()
+
+    with gap_col:
+        st.empty()
+
+
+def _render_status() -> None:
+    """Render latest FILES action status."""
+    status = st.session_state.get("files_action_status")
+    if not status:
+        return
+
+    status_col, gap_col = st.columns(CONTENT_COLS, gap="small")
+
+    with status_col:
+        if status.get("type") == "success":
+            st.success(status.get("message", ""))
+        else:
+            st.error(status.get("message", ""))
+
+    with gap_col:
+        st.empty()
+
+
+def _repair_selected_file_id(histories: list[dict]) -> None:
+    """
+    Keep selected file_id only if it still exists.
+
+    Important:
+    - Do not auto-select newest file.
+    - User selection must be explicit.
+    """
+    selected_file_id = str(st.session_state.get("files_selected_file_id", "") or "").strip()
+    if not selected_file_id:
+        return
+
+    existing_ids = {str(item.get("file_id", "") or "").strip() for item in histories}
+    if selected_file_id not in existing_ids:
+        st.session_state["files_selected_file_id"] = ""
+
+
+def _history_by_file_id(histories: list[dict], file_id: str) -> dict | None:
+    clean_file_id = str(file_id or "").strip()
+
+    for item in histories:
+        if str(item.get("file_id", "") or "").strip() == clean_file_id:
+            return item
+
+    return None
+
+
+def _get_selected_rows(event: object) -> list[int]:
+    """Extract selected dataframe row indexes from Streamlit event object."""
+    try:
+        rows = event.selection.rows
+    except Exception:
+        return []
+
+    if not rows:
+        return []
+
+    return [int(row) for row in rows]
+
+
+def _stripe_table_rows(row: pd.Series) -> list[str]:
+    """Apply soft alternating row colors."""
+    color = TABLE_STRIPE_COLOR if int(row.name) % 2 == 1 else "white"
+    return [f"background-color: {color}" for _ in row]
+```
+
 ### ~\ragstream\app\ui_layout.py
 ```python
 # ragstream/app/ui_layout.py
@@ -1506,7 +2073,6 @@ from ragstream.app.ui_actions import (
     do_a3_nli_gate,
     do_a4_condenser,
     do_add_files,
-    do_confirm_memory_title_and_save,
     do_create_project,
     do_feed_memory_manually,
     do_preprocess,
@@ -1909,9 +2475,6 @@ def render_memory_records(height: int = 420) -> None:
         unsafe_allow_html=True,
     )
 
-    if st.session_state.get("memory_title_required"):
-        render_memory_title_form()
-
     memory_entries = memory_manager.records
 
     try:
@@ -2026,20 +2589,6 @@ def render_memory_records(height: int = 420) -> None:
                 st.markdown("<div style='height:0.40rem'></div>", unsafe_allow_html=True)
 
 
-def render_memory_title_form() -> None:
-    """Ask for first memory title before creating the first .ragmem file."""
-    with st.form("memory_title_form", clear_on_submit=False):
-        st.text_input(
-            "Memory Title",
-            key="memory_title_input",
-            placeholder="Example: Memory Design",
-        )
-        submitted = st.form_submit_button("Create Memory File", use_container_width=True)
-
-        if submitted:
-            do_confirm_memory_title_and_save()
-
-
 def render_project_area(ctrl: AppController) -> None:
     """Project selector, embedded files, Create Project and Add Files forms."""
     projects = ctrl.list_projects()
@@ -2147,6 +2696,36 @@ def render_project_area(ctrl: AppController) -> None:
             st.caption(detail)
 ```
 
+### ~\ragstream\app\ui_metrics.py
+```python
+# ragstream/app/ui_metrics.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import streamlit as st
+
+
+def render_metrics_tab() -> None:
+    """METRICS tab placeholder."""
+    st.markdown("## Metrics")
+    st.info("Metrics tab placeholder.")
+```
+
+### ~\ragstream\app\ui_settings.py
+```python
+# ragstream/app/ui_settings.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import streamlit as st
+
+
+def render_settings_tab() -> None:
+    """GENERAL SETTINGS tab placeholder."""
+    st.markdown("## General Settings")
+    st.info("General Settings tab placeholder.")
+```
+
 ### ~\ragstream\app\ui_streamlit.py
 ```python
 # ragstream/app/ui_streamlit.py
@@ -2158,14 +2737,19 @@ Run on a free port, e.g.:
 
 from __future__ import annotations
 
+import json
 import threading
 
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
 from ragstream.app.controller import AppController
 from ragstream.app.ui_layout import inject_base_css, render_page
+from ragstream.app.ui_files import render_files_tab
+from ragstream.app.ui_metrics import render_metrics_tab
+from ragstream.app.ui_settings import render_settings_tab
 from ragstream.ingestion.embedder import Embedder
 from ragstream.memory.memory_chunker import MemoryChunker
 from ragstream.memory.memory_ingestion_manager import MemoryIngestionManager
@@ -2173,10 +2757,59 @@ from ragstream.memory.memory_manager import MemoryManager
 from ragstream.memory.memory_vector_store import MemoryVectorStore
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+def _load_runtime_config(project_root: Path) -> dict[str, Any]:
+    """
+    Read ragstream/config/runtime_config.json during Streamlit startup.
+
+    This config is used for Memory Retrieval limits and later runtime defaults.
+    """
+    config_path = project_root / "ragstream" / "config" / "runtime_config.json"
+
+    if not config_path.exists():
+        logger(f"runtime_config.json not found: {config_path}", "WARN", "PUBLIC")
+        return {}
+
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError("runtime_config.json root must be a JSON object.")
+
+        logger("runtime_config.json loaded in Streamlit session.", "INFO", "INTERNAL")
+
+        logger_dev(
+            "runtime_config.json loaded in Streamlit session\n"
+            + json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return data
+
+    except Exception as e:
+        logger(f"Failed to load runtime_config.json: {e}", "ERROR", "PUBLIC")
+        return {}
 
 
 def init_session_state() -> None:
-    """Create one controller + one SuperPrompt set per user session."""
+    """
+    Create one controller + one SuperPrompt set per user session.
+
+    Startup also initializes:
+    - MemoryManager
+    - MemoryVectorStore
+    - MemoryIngestionManager
+    - MemoryRetriever wiring through AppController.configure_memory_retrieval(...)
+    """
+    project_root = Path(__file__).resolve().parents[2]
+
+    if "runtime_config" not in st.session_state:
+        st.session_state.runtime_config = _load_runtime_config(project_root)
+
     if "controller" not in st.session_state:
         ctrl = AppController()
         st.session_state.controller = ctrl
@@ -2185,7 +2818,6 @@ def init_session_state() -> None:
         st.session_state["textforge_gui_log"] = ""
 
     if "memory_manager" not in st.session_state:
-        project_root = Path(__file__).resolve().parents[2]
         memory_root = project_root / "data" / "memory"
         sqlite_path = memory_root / "memory_index.sqlite3"
 
@@ -2195,25 +2827,26 @@ def init_session_state() -> None:
             title="",
         )
 
-    if "memory_ingestion_manager" not in st.session_state:
-        project_root = Path(__file__).resolve().parents[2]
+    if "memory_vector_store" not in st.session_state:
         memory_root = project_root / "data" / "memory"
         memory_vector_root = memory_root / "vector_db"
 
-        memory_chunker = MemoryChunker()
-
         memory_embedder = Embedder(model="text-embedding-3-large")
 
-        memory_vector_store = MemoryVectorStore(
+        st.session_state.memory_vector_store = MemoryVectorStore(
             persist_dir=str(memory_vector_root),
             collection_name="memory_vectors",
             embedder=memory_embedder,
         )
 
+    if "memory_chunker" not in st.session_state:
+        st.session_state.memory_chunker = MemoryChunker()
+
+    if "memory_ingestion_manager" not in st.session_state:
         st.session_state.memory_ingestion_manager = MemoryIngestionManager(
             memory_manager=st.session_state.memory_manager,
-            memory_chunker=memory_chunker,
-            memory_vector_store=memory_vector_store,
+            memory_chunker=st.session_state.memory_chunker,
+            memory_vector_store=st.session_state.memory_vector_store,
         )
 
         logger(
@@ -2222,11 +2855,23 @@ def init_session_state() -> None:
             "PUBLIC",
         )
 
+    if "memory_retrieval_configured" not in st.session_state:
+        st.session_state["memory_retrieval_configured"] = False
+
+    if not st.session_state["memory_retrieval_configured"]:
+        ctrl: AppController = st.session_state.controller
+        ctrl.configure_memory_retrieval(
+            memory_manager=st.session_state.memory_manager,
+            memory_vector_store=st.session_state.memory_vector_store,
+            runtime_config=st.session_state.runtime_config,
+        )
+        st.session_state["memory_retrieval_configured"] = True
+
     if "heavy_init_started" not in st.session_state:
         st.session_state["heavy_init_started"] = False
 
     if not st.session_state["heavy_init_started"]:
-        ctrl: AppController = st.session_state.controller
+        ctrl = st.session_state.controller
 
         t = threading.Thread(
             target=ctrl.initialize_heavy_components,
@@ -2261,7 +2906,6 @@ def init_session_state() -> None:
         st.session_state["new_project_name"] = ""
 
     if "pending_active_project" not in st.session_state:
-        # Temporary project switch key
         st.session_state["pending_active_project"] = None
 
     if "retrieval_top_k" not in st.session_state:
@@ -2276,30 +2920,51 @@ def init_session_state() -> None:
     if "manual_memory_feed_text" not in st.session_state:
         st.session_state["manual_memory_feed_text"] = ""
 
-    if "memory_title_required" not in st.session_state:
-        st.session_state["memory_title_required"] = False
+def render_tabs() -> None:
+    """
+    Top-level Streamlit tabs.
 
-    if "pending_manual_memory_pair" not in st.session_state:
-        st.session_state["pending_manual_memory_pair"] = None
+    MAIN keeps the existing RAGstream page.
+    Other tabs are separated into their own UI modules so ui_layout.py
+    does not become overloaded.
+    """
+    tab_main, tab_files, tab_hard_rules, tab_metrics, tab_settings = st.tabs(
+        [
+            "MAIN",
+            "FILES",
+            "HARD RULES",
+            "METRICS",
+            "GENERAL SETTINGS",
+        ]
+    )
 
-    if "memory_title_input" not in st.session_state:
-        st.session_state["memory_title_input"] = ""
+    with tab_main:
+        render_page()
+
+    with tab_files:
+        render_files_tab()
+
+    with tab_hard_rules:
+        st.markdown("## Hard Rules")
+        st.info("Hard Rules tab placeholder.")
+
+    with tab_metrics:
+        render_metrics_tab()
+
+    with tab_settings:
+        render_settings_tab()
 
 
 def main() -> None:
     st.set_page_config(page_title="RAGstream", layout="wide")
 
-    # Base CSS / compact styles
     inject_base_css()
 
-    # Page title
     st.title("RAGstream")
 
-    # Session bootstrap / background heavy init
     init_session_state()
 
-    # Page layout
-    render_page()
+    render_tabs()
 
 
 if __name__ == "__main__":
@@ -5050,22 +5715,16 @@ class PromptBuilder:
 
 ### ~\ragstream\orchestration\super_prompt.py
 ```python
-# super_prompt.py
+# ragstream/orchestration/super_prompt.py
 # -*- coding: utf-8 -*-
 """
-SuperPrompt (v1) — central prompt object (manual __init__, no dataclass).
-Place at: ragstream/orchestration/super_prompt.py
-
-Notes (agreed pipeline choices; for reference only):
-- Retrieval aggregation: LogAvgExp (length-normalized LogSumExp) with τ = 9 over per-piece cosine sims.
-- Re-ranker: cross-encoder/ms-marco-MiniLM-L-6-v2 on (Prompt_MD, chunk_text).
+SuperPrompt — central prompt object.
 
 Stage refactor note:
 - SuperPrompt remains the authoritative shared state object.
-- Projection / render / text-extraction support logic has been moved to
+- Projection / render / text-extraction support logic lives in
   superprompt_projector.py.
-- compose_prompt_ready() remains here as the stable public wrapper so that
-  external call sites do not need to change.
+- compose_prompt_ready() remains here as the stable public wrapper.
 """
 
 from __future__ import annotations
@@ -5075,7 +5734,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 
-# Lifecycle stages for this SuperPrompt (fixed vocabulary)
+# Lifecycle stages for this SuperPrompt.
 Stage = Literal["raw", "preprocessed", "a2", "retrieval", "reranked", "a3", "a4", "a5"]
 
 
@@ -5088,28 +5747,31 @@ class A3ChunkStatus(str, Enum):
 class SuperPrompt:
     __slots__ = (
         # session / lifecycle
-        "stage",                 # string in Stage: current lifecycle state (e.g., "retrieval", "a3")
-        "model_target",          # string or None: target LLM/model name for this session
-        "history_of_stages",     # list[str]: append-only history of visited stages (e.g., ["raw","preprocessed","a2",...])
+        "stage",
+        "model_target",
+        "history_of_stages",
 
         # canonical prompt data
-        "body",                  # dict: canonical fields from user (system, task, audience, tone, depth, context, purpose, format, text)
-        "extras",                # dict: user-defined fields
+        "body",
+        "extras",
 
-        # retrieval artifacts
-        "base_context_chunks",   # list[Chunk]: authoritative set of retrieved Chunk objects (combined from history + long-term memory)
-        "views_by_stage",        # dict[str, list[tuple[str, float, A3ChunkStatus]]]: per stage, ordered (chunk_id, stage_score, stage_status)
-        "final_selection_ids",   # list[str]: current chosen chunk_ids (from latest view after filters + token budget)
+        # document retrieval artifacts
+        "base_context_chunks",
+        "views_by_stage",
+        "final_selection_ids",
 
-        # recent conversation (separate block)
-        "recentConversation",    # dict: e.g., {"body": full transcript string, "pairs_count": N, "range": (start_idx, end_idx)}
+        # memory retrieval artifacts
+        "memory_context_pack",
 
-        # rendered strings (set externally when sending to LLM; may be kept empty until render time)
-        "System_MD",             # string: high-authority system/config block rendered from body (role/tone/depth/rules)
-        "Prompt_MD",             # string: normalized user ask rendered from body (task/purpose/context/format)
-        "S_CTX_MD",              # string: short distilled summary from final_selection_ids (facts/constraints/open issues)
-        "Attachments_MD",        # string: formatted raw excerpts with provenance fences from final_selection_ids
-        "prompt_ready"           # string: fully composed prompt ready to display/send.
+        # recent conversation
+        "recentConversation",
+
+        # rendered strings
+        "System_MD",
+        "Prompt_MD",
+        "S_CTX_MD",
+        "Attachments_MD",
+        "prompt_ready",
     )
 
     def __init__(
@@ -5118,15 +5780,15 @@ class SuperPrompt:
         stage: Stage = "raw",
         model_target: Optional[str] = None,
     ) -> None:
-        # session / lifecycle
+        # Session / lifecycle.
         self.stage: Stage = stage
         self.model_target: Optional[str] = model_target
-        self.history_of_stages: List[str] = []  # filled by caller/controller as stages are completed
+        self.history_of_stages: List[str] = []
 
-        # canonical prompt data (each instance gets its own dict)
+        # Canonical prompt data.
         self.body: Dict[str, Optional[str]] = {
-            "system": "consultant",   # must-use default
-            "task": None,             # must be set by caller
+            "system": "consultant",
+            "task": None,
             "audience": None,
             "role": None,
             "tone": "neutral",
@@ -5136,51 +5798,38 @@ class SuperPrompt:
             "format": None,
             "text": None,
         }
-        self.extras: Dict[str, Any] = {}        # free-form, user-defined metadata
 
-        # retrieval artifacts
-        self.base_context_chunks: List["Chunk"] = []  # authoritative working set of Chunk objects (no duplicates)
+        # Free-form diagnostics and stage metadata.
+        self.extras: Dict[str, Any] = {}
 
-        # stage name -> ordered list of per-chunk stage snapshots:
+        # Document retrieval artifacts.
+        self.base_context_chunks: List["Chunk"] = []
+
+        # stage -> ordered rows:
         # (chunk_id, stage_score, stage_status)
-        #
-        # Intended stage-local meaning:
-        # - Retrieval:
-        #     stage_score  = cosine similarity score
-        #     stage_status = A3ChunkStatus.SELECTED
-        #
-        # - ReRanker:
-        #     stage_score  = reranker score
-        #     stage_status = A3ChunkStatus.SELECTED for kept chunks,
-        #                    optionally A3ChunkStatus.DISCARDED for cut-off chunks
-        #
-        # - A3:
-        #     stage_score  = 1.0 for pass / keep, 0.0 for reject
-        #     stage_status = A3ChunkStatus.SELECTED / DISCARDED / DUPLICATED
-        #
-        # The list is always ordered according to the active stage view.
         self.views_by_stage: Dict[str, List[tuple[str, float, A3ChunkStatus]]] = {}
 
-        self.final_selection_ids: List[str] = []        # the ids chosen for render after all filters/budgets
+        # Current selected document chunk ids.
+        self.final_selection_ids: List[str] = []
 
-        # recent conversation block (kept separate from retrieved context)
-        self.recentConversation: Dict[str, Any] = {}    # e.g., {"body": "...", "pairs_count": 3, "range": (12,14)}
+        # Memory retrieval artifact.
+        # Runtime object created by MemoryRetriever.
+        # It is not durable memory truth.
+        self.memory_context_pack: Any | None = None
 
-        # rendered strings (filled by the caller at send time; may remain empty otherwise)
-        self.System_MD: str = ""       # rendered from body (system/role/tone/depth)
-        self.Prompt_MD: str = ""       # rendered from body (task/purpose/context/format)
-        self.S_CTX_MD: str = ""        # rendered summary from final_selection_ids
-        self.Attachments_MD: str = ""  # rendered excerpts from final_selection_ids with provenance
-        self.prompt_ready: str = ""    # fully composed prompt ready to display/send
+        # Recent conversation block.
+        self.recentConversation: Dict[str, Any] = {}
+
+        # Rendered strings.
+        self.System_MD: str = ""
+        self.Prompt_MD: str = ""
+        self.S_CTX_MD: str = ""
+        self.Attachments_MD: str = ""
+        self.prompt_ready: str = ""
 
     def compose_prompt_ready(self) -> str:
         """
         Stable public wrapper for the central SuperPrompt render path.
-
-        Important compatibility rule:
-        - External code may continue to call sp.compose_prompt_ready() exactly
-          as before.
-        - The real render / projection logic lives in SuperPromptProjector.
         """
         return SuperPromptProjector(self).compose_prompt_ready()
 
@@ -5190,7 +5839,7 @@ class SuperPrompt:
 
 ### ~\ragstream\orchestration\superprompt_projector.py
 ```python
-# superprompt_projector.py
+# ragstream/orchestration/superprompt_projector.py
 # -*- coding: utf-8 -*-
 """
 superprompt_projector.py
@@ -5363,10 +6012,11 @@ class SuperPromptProjector:
         """
         Render retrieved/condensed context for GUI-visible SuperPrompt preview.
 
-        This is intentionally neutral and reusable:
-        - A4 only produces S_CTX_MD.
-        - This projector decides how S_CTX_MD is displayed.
-        - Later PromptBuilder can reuse the same structure.
+        Retrieval stage now has two raw candidate pools:
+        - document chunks
+        - memory candidates
+
+        Both are rendered here as inspection/debug material.
         """
         lines: List[str] = []
 
@@ -5390,13 +6040,31 @@ class SuperPromptProjector:
         if raw_evidence_md:
             lines.append(raw_evidence_md)
 
+        raw_memory_md = self._render_raw_memory_retrieval_md()
+        if raw_memory_md:
+            lines.append("")
+            lines.append(raw_memory_md)
+
         return "\n".join(lines).strip()
+
+    def _render_raw_memory_retrieval_md(self) -> str:
+        """
+        Render raw memory retrieval candidates.
+
+        MemoryRetriever writes the raw debug markdown into:
+            sp.extras["memory_debug_markdown"]
+
+        This is GUI inspection material only.
+        It is not final compressed memory context.
+        """
+        extras = getattr(self.sp, "extras", {}) or {}
+        memory_debug_md = str(extras.get("memory_debug_markdown", "") or "").strip()
+        return memory_debug_md
 
     def _render_raw_retrieved_evidence_md(self) -> str:
         """
-        Render raw retrieved chunks as nested evidence.
+        Render raw retrieved document chunks as nested evidence.
 
-        Important:
         Source Markdown headings inside chunks are converted to [H1]/[H2]/[H3]
         so they do not compete with the visible SuperPrompt structure.
         """
@@ -5557,10 +6225,6 @@ class SuperPromptProjector:
     def _render_related_context_md(self) -> str:
         """
         Backward-compatible wrapper.
-
-        Older callers may still refer to _render_related_context_md().
-        The visible GUI format now uses Raw Retrieved Evidence instead of
-        the older Related Context block.
         """
         return self._render_raw_retrieved_evidence_md()
 
@@ -5568,9 +6232,11 @@ class SuperPromptProjector:
     def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:
         if not isinstance(meta, dict):
             return None
+
         value = meta.get(key)
         if value is None:
             return None
+
         try:
             return float(value)
         except (TypeError, ValueError):
@@ -7425,6 +8091,708 @@ class RetrieverEmb:
         return rows[: min(k, len(rows))]
 ```
 
+### ~\ragstream\retrieval\retriever_mem.py
+```python
+# ragstream/retrieval/retriever_mem.py
+# -*- coding: utf-8 -*-
+"""
+MemoryRetriever
+===============
+Memory Retrieval stage orchestrator.
+
+This file is the retrieval-side entry point for the Memory subsystem.
+
+It reads:
+- current SuperPrompt
+- current active MemoryManager
+- dedicated MemoryVectorStore
+- memory_index.sqlite3 through MemoryIndexLookup
+- runtime_config["memory_retrieval"]
+
+It writes:
+- raw MemoryContextPack into SuperPrompt
+
+It does NOT run:
+- A3
+- A4
+- MemoryMerge
+- PromptBuilder
+"""
+
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+from typing import Any
+
+from ragstream.memory.memory_context_pack import MemoryContextPack
+from ragstream.memory.memory_index_lookup import MemoryIndexLookup
+from ragstream.memory.memory_scoring import MemoryScorer
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+class MemoryRetriever:
+    """
+    Main Memory Retrieval orchestrator.
+
+    This class is intentionally thin:
+    - vector querying is delegated to MemoryVectorStore / Chroma access
+    - SQLite lookup is delegated to MemoryIndexLookup
+    - scoring is delegated to MemoryScorer
+    - candidate storage is delegated to MemoryContextPack
+    """
+
+    def __init__(
+        self,
+        memory_manager: Any,
+        memory_vector_store: Any,
+        sqlite_path: str | Path,
+        config: dict[str, Any],
+    ) -> None:
+        self.memory_manager = memory_manager
+        self.memory_vector_store = memory_vector_store
+
+        # Accept either the full runtime_config or only runtime_config["memory_retrieval"].
+        if "memory_retrieval" in (config or {}):
+            self.config = dict(config.get("memory_retrieval", {}) or {})
+        else:
+            self.config = dict(config or {})
+
+        memory_root = getattr(memory_manager, "memory_root", None)
+        self.index_lookup = MemoryIndexLookup(
+            sqlite_path=sqlite_path,
+            memory_root=memory_root,
+        )
+        self.scorer = MemoryScorer(self.config)
+
+    def run(
+        self,
+        sp: Any,
+    ) -> Any:
+        """
+        Run Memory Retrieval for the current SuperPrompt.
+
+        The method mutates and returns the same SuperPrompt object.
+        """
+        if self.config.get("enabled", True) is False:
+            logger("Memory Retrieval skipped: disabled in runtime_config.", "INFO", "INTERNAL")
+            return sp
+
+        active_file_id = str(getattr(self.memory_manager, "file_id", "") or "").strip()
+        if not active_file_id:
+            logger("Memory Retrieval skipped: no active memory file.", "INFO", "INTERNAL")
+            return self._write_empty_pack(sp, reason="no_active_memory_file")
+
+        query_text = self._build_query_text(sp)
+        if not query_text:
+            logger("Memory Retrieval skipped: empty query text.", "WARN", "PUBLIC")
+            return self._write_empty_pack(sp, reason="empty_query_text")
+
+        direct_recall_key = self._extract_direct_recall_key(sp)
+
+        logger(
+            f"Memory Retrieval started: file={active_file_id[:8]}",
+            "INFO",
+            "PUBLIC",
+        )
+
+        logger_dev(
+            (
+                "Memory Retrieval input\n"
+                f"active_file_id={active_file_id}\n"
+                f"memory_title={getattr(self.memory_manager, 'title', '')}\n"
+                f"query_text={query_text}\n"
+                f"direct_recall_key={direct_recall_key}\n"
+                f"config={json.dumps(self.config, ensure_ascii=False, indent=2, default=str)}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        semantic_result = self._run_semantic_pass(
+            query_text=query_text,
+            active_file_id=active_file_id,
+        )
+
+        index_candidates = self._collect_index_candidates(
+            active_file_id=active_file_id,
+            direct_recall_key=direct_recall_key,
+        )
+
+        pack = self._build_context_pack(
+            semantic_chunks=semantic_result["semantic_chunks"],
+            episodic_candidates=semantic_result["episodic_candidates"],
+            working_candidates=index_candidates["working_memory"],
+            direct_recall_candidate=index_candidates["direct_recall"],
+            gold_candidates=index_candidates["gold"],
+            diagnostics={
+                "query_text": query_text,
+                "active_file_id": active_file_id,
+                "direct_recall_key": direct_recall_key,
+                "raw_vector_hit_count": len(semantic_result["raw_hits"]),
+                "scored_vector_hit_count": len(semantic_result["scored_hits"]),
+                "parent_score_count": len(semantic_result["parent_scores"]),
+                "index_counts": {
+                    "working_memory": len(index_candidates["working_memory"]),
+                    "gold": len(index_candidates["gold"]),
+                    "direct_recall": 1 if index_candidates["direct_recall"] else 0,
+                },
+            },
+        )
+
+        self._write_to_superprompt(sp, pack)
+
+        self._log_developer_diagnostics(
+            query_text=query_text,
+            active_file_id=active_file_id,
+            semantic_result=semantic_result,
+            index_candidates=index_candidates,
+            pack=pack,
+        )
+
+        logger(
+            (
+                "Memory Retrieval finished: "
+                f"working={len(pack.working_memory_candidates)}, "
+                f"episodic={len(pack.episodic_candidates)}, "
+                f"semantic_chunks={len(pack.semantic_memory_chunks)}, "
+                f"direct_recall={1 if pack.direct_recall_candidate else 0}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
+        return sp
+
+    def _build_query_text(
+        self,
+        sp: Any,
+    ) -> str:
+        """
+        Build memory retrieval query text from SuperPrompt.
+
+        We intentionally use the same conceptual fields that document retrieval
+        already cares about: task, purpose, context, and fallback prompt_ready.
+        """
+        body = getattr(sp, "body", {}) or {}
+
+        parts: list[str] = []
+
+        for key in ("task", "purpose", "context", "text"):
+            value = str(body.get(key, "") or "").strip()
+            if value:
+                parts.append(value)
+
+        if not parts:
+            prompt_ready = str(getattr(sp, "prompt_ready", "") or "").strip()
+            if prompt_ready:
+                parts.append(prompt_ready)
+
+        return "\n\n".join(parts).strip()
+
+    def _run_semantic_pass(
+        self,
+        query_text: str,
+        active_file_id: str,
+    ) -> dict[str, Any]:
+        """
+        Run memory vector search and parent aggregation.
+        """
+        semantic_cfg = self.config.get("semantic_memory_chunks", {}) or {}
+        if semantic_cfg.get("enabled", True) is False:
+            return {
+                "raw_hits": [],
+                "scored_hits": [],
+                "parent_scores": [],
+                "semantic_chunks": [],
+                "episodic_candidates": [],
+            }
+
+        max_memory_chunks = int(semantic_cfg.get("max_memory_chunks", 5))
+
+        # Retrieve more raw hits than final memory chunks because parent scoring
+        # needs enough question/answer/handle evidence.
+        raw_hit_limit = max(max_memory_chunks * 6, 20)
+
+        raw_hits = self._query_memory_vectors(
+            query_text=query_text,
+            active_file_id=active_file_id,
+            n_results=raw_hit_limit,
+        )
+
+        metadata_by_record = self._metadata_by_live_record()
+        scored_hits = self.scorer.score_vector_hits(raw_hits)
+        parent_scores = self.scorer.aggregate_parent_scores(
+            scored_hits=scored_hits,
+            metadata_by_record=metadata_by_record,
+        )
+
+        semantic_chunks = self.scorer.select_semantic_chunks(
+            scored_hits=scored_hits,
+            max_memory_chunks=max_memory_chunks,
+        )
+
+        episodic_candidates = self._parent_scores_to_episodic_candidates(
+            parent_scores=parent_scores,
+            active_file_id=active_file_id,
+        )
+
+        return {
+            "raw_hits": raw_hits,
+            "scored_hits": scored_hits,
+            "parent_scores": parent_scores,
+            "semantic_chunks": semantic_chunks,
+            "episodic_candidates": episodic_candidates,
+        }
+
+    def _collect_index_candidates(
+        self,
+        active_file_id: str,
+        direct_recall_key: str,
+    ) -> dict[str, Any]:
+        """
+        Collect deterministic non-vector memory candidates.
+        """
+        working_memory = self.index_lookup.get_working_memory(
+            file_id=active_file_id,
+            cfg=self.config,
+        )
+
+        gold = self.index_lookup.get_latest_gold(
+            file_id=active_file_id,
+            cfg=self.config,
+        )
+
+        direct_recall = self.index_lookup.get_direct_recall(
+            direct_recall_key=direct_recall_key,
+            cfg=self.config,
+        )
+
+        working_memory = self._enrich_candidates_from_live_records(working_memory)
+        gold = self._enrich_candidates_from_live_records(gold)
+
+        if direct_recall:
+            direct_recall = self._enrich_candidates_from_live_records([direct_recall])[0]
+
+        return {
+            "working_memory": working_memory,
+            "gold": gold,
+            "direct_recall": direct_recall,
+        }
+
+    def _build_context_pack(
+        self,
+        semantic_chunks: list[dict[str, Any]],
+        episodic_candidates: list[dict[str, Any]],
+        working_candidates: list[dict[str, Any]],
+        direct_recall_candidate: dict[str, Any] | None,
+        gold_candidates: list[dict[str, Any]],
+        diagnostics: dict[str, Any],
+    ) -> MemoryContextPack:
+        """
+        Combine all raw memory candidates into one runtime pack.
+        """
+        pack = MemoryContextPack()
+
+        for candidate in working_candidates:
+            pack.add_working_memory(candidate)
+
+        episodic_final = self._merge_episodic_candidates(
+            semantic_episodic=episodic_candidates,
+            gold_candidates=gold_candidates,
+        )
+
+        for candidate in episodic_final:
+            pack.add_episodic_candidate(candidate)
+
+        for candidate in semantic_chunks:
+            pack.add_semantic_chunk(candidate)
+
+        pack.set_direct_recall(direct_recall_candidate)
+
+        pack.set_selection_diagnostics(diagnostics)
+        pack.set_token_budget_report(self._estimate_token_budget(pack))
+
+        return pack
+
+    def _write_to_superprompt(
+        self,
+        sp: Any,
+        pack: MemoryContextPack,
+    ) -> None:
+        """
+        Store MemoryContextPack into SuperPrompt.
+
+        This keeps raw memory candidates available for GUI and later stages.
+        """
+        setattr(sp, "memory_context_pack", pack)
+
+        if not hasattr(sp, "extras") or getattr(sp, "extras") is None:
+            setattr(sp, "extras", {})
+
+        sp.extras["memory_context_pack"] = pack.to_dict()
+        sp.extras["memory_debug_markdown"] = pack.to_debug_markdown()
+        sp.extras["memory_retrieval_counts"] = pack.counts()
+
+    def _query_memory_vectors(
+        self,
+        query_text: str,
+        active_file_id: str,
+        n_results: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Query the underlying Chroma memory vector collection.
+
+        Current MemoryVectorStore owns the Chroma collection internally.
+        This method uses that object without changing the existing store API.
+        A later cleanup can move this method into MemoryVectorStore directly.
+        """
+        collection = getattr(self.memory_vector_store, "_collection", None)
+        embedder = getattr(self.memory_vector_store, "embedder", None)
+
+        if collection is None or embedder is None:
+            logger("Memory vector search unavailable: store has no collection/embedder.", "WARN", "PUBLIC")
+            return []
+
+        query_embedding = self._embed_query(query_text, embedder)
+
+        where = {"file_id": active_file_id} if active_file_id else None
+
+        try:
+            result = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=int(n_results),
+                where=where,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception as first_error:
+            logger(
+                f"Memory vector search with file_id filter failed; retrying without filter: {first_error}",
+                "WARN",
+                "INTERNAL",
+            )
+            result = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=int(n_results),
+                include=["documents", "metadatas", "distances"],
+            )
+
+        raw_hits = self._normalize_chroma_query_result(result)
+
+        logger_dev(
+            "Raw memory vector hits\n"
+            + json.dumps(raw_hits, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return raw_hits
+
+    def _embed_query(
+        self,
+        query_text: str,
+        embedder: Any,
+    ) -> list[float]:
+        """
+        Create one dense vector for memory query text.
+        """
+        vectors = embedder.embed([query_text])
+        vector = vectors[0]
+
+        if hasattr(vector, "tolist"):
+            vector = vector.tolist()
+
+        return [float(value) for value in vector]
+
+    def _normalize_chroma_query_result(
+        self,
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Convert Chroma query result shape into a flat list of hit dictionaries.
+        """
+        ids = (result.get("ids") or [[]])[0] or []
+        documents = (result.get("documents") or [[]])[0] or []
+        metadatas = (result.get("metadatas") or [[]])[0] or []
+        distances = (result.get("distances") or [[]])[0] or []
+
+        hits: list[dict[str, Any]] = []
+
+        for idx, vector_id in enumerate(ids):
+            metadata = metadatas[idx] if idx < len(metadatas) and metadatas[idx] else {}
+            document = documents[idx] if idx < len(documents) else ""
+            distance = distances[idx] if idx < len(distances) else None
+
+            hits.append(
+                {
+                    "id": vector_id,
+                    "document": document,
+                    "metadata": metadata,
+                    "distance": distance,
+                    "rank": idx + 1,
+                }
+            )
+
+        return hits
+
+    def _metadata_by_live_record(self) -> dict[str, dict[str, Any]]:
+        """
+        Build record metadata map from live MemoryManager.records.
+
+        Live records contain body + current metadata after .ragmeta overlay.
+        """
+        result: dict[str, dict[str, Any]] = {}
+
+        for record in getattr(self.memory_manager, "records", []) or []:
+            record_id = str(getattr(record, "record_id", "") or "").strip()
+            if not record_id:
+                continue
+
+            if hasattr(record, "to_full_dict"):
+                result[record_id] = record.to_full_dict()
+            elif hasattr(record, "to_index_dict"):
+                result[record_id] = record.to_index_dict()
+            else:
+                result[record_id] = {
+                    "record_id": record_id,
+                    "tag": getattr(record, "tag", ""),
+                    "retrieval_source_mode": getattr(record, "retrieval_source_mode", "QA"),
+                }
+
+        return result
+
+    def _parent_scores_to_episodic_candidates(
+        self,
+        parent_scores: list[dict[str, Any]],
+        active_file_id: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Convert ranked parent scores into episodic candidates with Q/A body.
+        """
+        episodic_cfg = self.config.get("episodic_memory", {}) or {}
+        if episodic_cfg.get("enabled", True) is False:
+            return []
+
+        max_total_records = int(episodic_cfg.get("max_total_records", 3))
+        selected_scores = parent_scores[:max_total_records]
+
+        live_by_id = self._live_records_by_id()
+        candidates: list[dict[str, Any]] = []
+
+        for parent in selected_scores:
+            record_id = str(parent.get("record_id", "")).strip()
+            candidate = dict(parent)
+
+            live_record = live_by_id.get(record_id)
+            if live_record is not None:
+                candidate.update(self._record_to_candidate(live_record, active_file_id))
+            else:
+                # Fallback to SQLite/.ragmem if the record is not in live RAM.
+                indexed = self.index_lookup.get_records_by_ids(active_file_id, [record_id])
+                if indexed:
+                    candidate.update(indexed[0])
+
+            candidates.append(candidate)
+
+        candidates = self._enrich_candidates_from_live_records(candidates)
+
+        return candidates
+
+    def _merge_episodic_candidates(
+        self,
+        semantic_episodic: list[dict[str, Any]],
+        gold_candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Merge Gold and semantic episodic candidates without duplicate record_ids.
+        """
+        episodic_cfg = self.config.get("episodic_memory", {}) or {}
+        max_total_records = int(episodic_cfg.get("max_total_records", 3))
+
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for source_name, candidates in (
+            ("gold", gold_candidates),
+            ("semantic", semantic_episodic),
+        ):
+            for candidate in candidates:
+                record_id = str(candidate.get("record_id", "")).strip()
+                if not record_id or record_id in seen:
+                    continue
+
+                merged = dict(candidate)
+                merged["episodic_source"] = source_name
+                result.append(merged)
+                seen.add(record_id)
+
+                if len(result) >= max_total_records:
+                    return result
+
+        return result
+
+    def _enrich_candidates_from_live_records(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Overlay live MemoryRecord body/metadata onto candidate dicts when possible.
+        """
+        live_by_id = self._live_records_by_id()
+
+        enriched: list[dict[str, Any]] = []
+
+        for candidate in candidates:
+            record_id = str(candidate.get("record_id", "")).strip()
+            live_record = live_by_id.get(record_id)
+
+            if live_record is not None:
+                enriched_candidate = dict(candidate)
+                enriched_candidate.update(
+                    self._record_to_candidate(
+                        live_record,
+                        file_id=str(candidate.get("file_id", getattr(self.memory_manager, "file_id", ""))),
+                    )
+                )
+                enriched.append(enriched_candidate)
+            else:
+                enriched.append(candidate)
+
+        return enriched
+
+    def _record_to_candidate(
+        self,
+        record: Any,
+        file_id: str,
+    ) -> dict[str, Any]:
+        """
+        Convert a live MemoryRecord object into a candidate dictionary.
+        """
+        if hasattr(record, "to_full_dict"):
+            data = record.to_full_dict()
+        elif hasattr(record, "to_index_dict"):
+            data = record.to_index_dict()
+            data["input_text"] = getattr(record, "input_text", "")
+            data["output_text"] = getattr(record, "output_text", "")
+        else:
+            data = {
+                "record_id": getattr(record, "record_id", ""),
+                "input_text": getattr(record, "input_text", ""),
+                "output_text": getattr(record, "output_text", ""),
+                "tag": getattr(record, "tag", ""),
+                "retrieval_source_mode": getattr(record, "retrieval_source_mode", "QA"),
+                "direct_recall_key": getattr(record, "direct_recall_key", ""),
+            }
+
+        data["file_id"] = file_id
+        data["filename_ragmem"] = getattr(self.memory_manager, "filename_ragmem", "")
+        data["filename_meta"] = getattr(self.memory_manager, "filename_meta", "")
+        data["memory_title"] = getattr(self.memory_manager, "title", "")
+
+        return data
+
+    def _live_records_by_id(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+
+        for record in getattr(self.memory_manager, "records", []) or []:
+            record_id = str(getattr(record, "record_id", "") or "").strip()
+            if record_id:
+                result[record_id] = record
+
+        return result
+
+    def _extract_direct_recall_key(
+        self,
+        sp: Any,
+    ) -> str:
+        """
+        Extract an optional Direct Recall Key from SuperPrompt.
+
+        Current GUI does not yet require a separate direct-recall query field.
+        This keeps the hook ready without forcing new UI behavior.
+        """
+        extras = getattr(sp, "extras", {}) or {}
+        body = getattr(sp, "body", {}) or {}
+
+        for source in (extras, body):
+            for key in ("direct_recall_key", "memory_direct_recall_key"):
+                value = str(source.get(key, "") or "").strip()
+                if value:
+                    return value
+
+        return ""
+
+    def _estimate_token_budget(
+        self,
+        pack: MemoryContextPack,
+    ) -> dict[str, Any]:
+        """
+        Rough token estimate for diagnostics.
+
+        MemoryMerge later owns exact trimming/compression.
+        """
+        data = pack.to_dict()
+        text = json.dumps(data, ensure_ascii=False, default=str)
+
+        estimated_tokens = max(1, len(text) // 4)
+
+        return {
+            "estimated_raw_memory_tokens": estimated_tokens,
+            "method": "len(json)//4 rough estimate",
+            "limits": {
+                "working_memory": self.config.get("working_memory", {}),
+                "episodic_memory": self.config.get("episodic_memory", {}),
+                "direct_recall": self.config.get("direct_recall", {}),
+                "semantic_memory_chunks": self.config.get("semantic_memory_chunks", {}),
+            },
+        }
+
+    def _write_empty_pack(
+        self,
+        sp: Any,
+        reason: str,
+    ) -> Any:
+        pack = MemoryContextPack()
+        pack.set_selection_diagnostics({"empty_reason": reason})
+        self._write_to_superprompt(sp, pack)
+        return sp
+
+    def _log_developer_diagnostics(
+        self,
+        query_text: str,
+        active_file_id: str,
+        semantic_result: dict[str, Any],
+        index_candidates: dict[str, Any],
+        pack: MemoryContextPack,
+    ) -> None:
+        """
+        Write a complete retrieval snapshot for later manual analysis.
+        """
+        payload = {
+            "query_text": query_text,
+            "active_file_id": active_file_id,
+            "memory_manager": {
+                "file_id": getattr(self.memory_manager, "file_id", ""),
+                "title": getattr(self.memory_manager, "title", ""),
+                "filename_ragmem": getattr(self.memory_manager, "filename_ragmem", ""),
+                "filename_meta": getattr(self.memory_manager, "filename_meta", ""),
+                "record_count": len(getattr(self.memory_manager, "records", []) or []),
+            },
+            "semantic_result": semantic_result,
+            "index_candidates": index_candidates,
+            "memory_context_pack": pack.to_dict(),
+        }
+
+        logger_dev(
+            "FULL MEMORY RETRIEVAL DIAGNOSTIC SNAPSHOT\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+```
+
 ### ~\ragstream\retrieval\retriever_splade.py
 ```python
 # retriever_splade.py
@@ -8295,6 +9663,1119 @@ class MemoryChunker:
         return "; ".join(cleaned)
 ```
 
+### ~\ragstream\memory\memory_context_pack.py
+```python
+# ragstream/memory/memory_context_pack.py
+# -*- coding: utf-8 -*-
+"""
+MemoryContextPack
+=================
+Runtime container for Memory Retrieval results.
+
+This object is NOT durable memory truth.
+It is only the run-local candidate package written into SuperPrompt after
+the Retrieval button has run.
+
+It keeps raw memory candidates visible before later stages perform:
+- A3 / A4 semantic filtering and condensation
+- MemoryMerge
+- final PromptBuilder rendering
+"""
+
+from __future__ import annotations
+
+import json
+
+from typing import Any
+
+
+
+class MemoryContextPack:
+    """
+    Structured runtime result of Memory Retrieval.
+
+    The pack separates memory candidates by retrieval role so later stages can
+    decide what to do with each group independently.
+    """
+
+    def __init__(self) -> None:
+        # Recent non-Black records from the active memory file.
+        self.working_memory_candidates: list[dict[str, Any]] = []
+
+        # Parent MemoryRecord candidates selected from semantic scoring and Gold lookup.
+        self.episodic_candidates: list[dict[str, Any]] = []
+
+        # Raw question/answer vector-hit chunks selected for later A3/A4 mixing.
+        self.semantic_memory_chunks: list[dict[str, Any]] = []
+
+        # One Direct Recall candidate, usually selected by exact key lookup.
+        self.direct_recall_candidate: dict[str, Any] | None = None
+
+        # Human/developer-readable explanation of selections and exclusions.
+        self.selection_diagnostics: dict[str, Any] = {}
+
+        # Token information is only estimated here; MemoryMerge later owns trimming.
+        self.token_budget_report: dict[str, Any] = {}
+
+    def add_working_memory(self, candidate: dict[str, Any]) -> None:
+        """Add one recent working-memory candidate."""
+        if candidate:
+            self.working_memory_candidates.append(candidate)
+
+    def add_episodic_candidate(self, candidate: dict[str, Any]) -> None:
+        """Add one episodic parent MemoryRecord candidate."""
+        if candidate:
+            self.episodic_candidates.append(candidate)
+
+    def add_semantic_chunk(self, candidate: dict[str, Any]) -> None:
+        """Add one raw semantic memory chunk candidate."""
+        if candidate:
+            self.semantic_memory_chunks.append(candidate)
+
+    def set_direct_recall(self, candidate: dict[str, Any] | None) -> None:
+        """Set the Direct Recall candidate for this run."""
+        self.direct_recall_candidate = candidate if candidate else None
+
+    def set_selection_diagnostics(self, diagnostics: dict[str, Any]) -> None:
+        """Store diagnostic information explaining the retrieval result."""
+        self.selection_diagnostics = diagnostics or {}
+
+    def set_token_budget_report(self, report: dict[str, Any]) -> None:
+        """Store estimated token usage before later MemoryMerge compression."""
+        self.token_budget_report = report or {}
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert the pack into a plain dictionary for SuperPrompt.extras."""
+        return {
+            "working_memory_candidates": self.working_memory_candidates,
+            "episodic_candidates": self.episodic_candidates,
+            "semantic_memory_chunks": self.semantic_memory_chunks,
+            "direct_recall_candidate": self.direct_recall_candidate,
+            "selection_diagnostics": self.selection_diagnostics,
+            "token_budget_report": self.token_budget_report,
+            "counts": self.counts(),
+        }
+
+    def counts(self) -> dict[str, int]:
+        """Return compact candidate counts for logs and GUI status."""
+        return {
+            "working_memory_candidates": len(self.working_memory_candidates),
+            "episodic_candidates": len(self.episodic_candidates),
+            "semantic_memory_chunks": len(self.semantic_memory_chunks),
+            "direct_recall_candidate": 1 if self.direct_recall_candidate else 0,
+        }
+
+    def to_debug_markdown(self) -> str:
+        """
+        Render raw memory candidates for GUI inspection.
+
+        This is intentionally not final prompt context.
+        It is a development/audit view after Retrieval.
+        """
+        lines: list[str] = []
+
+        lines.append("### Raw Memory Retrieval Candidates")
+        lines.append("")
+        lines.append("These are raw memory candidates produced by the Retrieval stage.")
+        lines.append("They are not compressed memory and not final prompt context.")
+        lines.append("")
+
+        self._append_working_memory(lines)
+        self._append_episodic_memory(lines)
+        self._append_semantic_chunks(lines)
+        self._append_direct_recall(lines)
+        self._append_diagnostics(lines)
+
+        return "\n".join(lines).strip()
+
+    def _append_working_memory(self, lines: list[str]) -> None:
+        lines.append("#### Working Memory Candidates")
+        if not self.working_memory_candidates:
+            lines.append("(none)")
+            lines.append("")
+            return
+
+        for idx, candidate in enumerate(self.working_memory_candidates, start=1):
+            lines.append(f"**W{idx}. record_id:** `{candidate.get('record_id', '')}`")
+            lines.append(f"- tag: `{candidate.get('tag', '')}`")
+            lines.append(f"- retrieval_source_mode: `{candidate.get('retrieval_source_mode', '')}`")
+            lines.append("")
+            lines.append(self._format_qa(candidate))
+            lines.append("")
+
+    def _append_episodic_memory(self, lines: list[str]) -> None:
+        lines.append("#### Episodic Candidates")
+        if not self.episodic_candidates:
+            lines.append("(none)")
+            lines.append("")
+            return
+
+        for idx, candidate in enumerate(self.episodic_candidates, start=1):
+            score = candidate.get("final_parent_score", candidate.get("score", ""))
+            lines.append(f"**E{idx}. record_id:** `{candidate.get('record_id', '')}`")
+            lines.append(f"- tag: `{candidate.get('tag', '')}`")
+            lines.append(f"- score: `{score}`")
+            lines.append(f"- retrieval_source_mode: `{candidate.get('retrieval_source_mode', '')}`")
+            lines.append("")
+            lines.append(self._format_qa(candidate))
+            lines.append("")
+
+    def _append_semantic_chunks(self, lines: list[str]) -> None:
+        lines.append("#### Semantic Memory Chunks")
+        if not self.semantic_memory_chunks:
+            lines.append("(none)")
+            lines.append("")
+            return
+
+        for idx, candidate in enumerate(self.semantic_memory_chunks, start=1):
+            lines.append(f"**M{idx}. vector_id:** `{candidate.get('vector_id', candidate.get('id', ''))}`")
+            lines.append(f"- record_id: `{candidate.get('record_id', '')}`")
+            lines.append(f"- role: `{candidate.get('role', '')}`")
+            lines.append(f"- score: `{candidate.get('score', '')}`")
+            lines.append("")
+            text = str(candidate.get("document", candidate.get("text", ""))).strip()
+            if text:
+                lines.append("```text")
+                lines.append(text)
+                lines.append("```")
+            lines.append("")
+
+    def _append_direct_recall(self, lines: list[str]) -> None:
+        lines.append("#### Direct Recall Candidate")
+        if not self.direct_recall_candidate:
+            lines.append("(none)")
+            lines.append("")
+            return
+
+        candidate = self.direct_recall_candidate
+        lines.append(f"**record_id:** `{candidate.get('record_id', '')}`")
+        lines.append(f"- file_id: `{candidate.get('file_id', '')}`")
+        lines.append(f"- tag: `{candidate.get('tag', '')}`")
+        lines.append(f"- direct_recall_key: `{candidate.get('direct_recall_key', '')}`")
+        lines.append("")
+        lines.append(self._format_qa(candidate))
+        lines.append("")
+
+    def _append_diagnostics(self, lines: list[str]) -> None:
+        lines.append("#### Selection Diagnostics")
+        if not self.selection_diagnostics:
+            lines.append("(none)")
+            lines.append("")
+            return
+
+        lines.append("```json")
+        lines.append(json.dumps(self.selection_diagnostics, ensure_ascii=False, indent=2, default=str))
+        lines.append("```")
+        lines.append("")
+
+    @staticmethod
+    def _format_qa(candidate: dict[str, Any]) -> str:
+        input_text = str(candidate.get("input_text", "") or "").strip()
+        output_text = str(candidate.get("output_text", "") or "").strip()
+
+        lines: list[str] = []
+
+        if input_text:
+            lines.append("INPUT")
+            lines.append("```text")
+            lines.append(input_text)
+            lines.append("```")
+
+        if output_text:
+            lines.append("OUTPUT")
+            lines.append("```text")
+            lines.append(output_text)
+            lines.append("```")
+
+        return "\n".join(lines).strip() if lines else "(no Q/A body available)"
+```
+
+### ~\ragstream\memory\memory_file_manager.py
+```python
+# ragstream/memory/memory_file_manager.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import uuid
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from ragstream.memory.memory_manager import MemoryManager
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _safe_title(title: str) -> str:
+    value = (title or "").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-._")
+    return value or "Memory"
+
+
+class MemoryFileManager:
+    """
+    Server-side manager for memory history files.
+
+    Owns file-level operations:
+    - list histories
+    - create history
+    - load history
+    - rename history
+    - delete history
+
+    Identity rule:
+    - file_id is stable identity.
+    - filename_ragmem / filename_meta are mutable path/display fields.
+    """
+
+    def __init__(
+        self,
+        memory_manager: MemoryManager,
+        memory_vector_store: Any | None = None,
+    ) -> None:
+        self.memory_manager = memory_manager
+        self.memory_vector_store = memory_vector_store
+
+    def list_histories(self) -> list[dict[str, Any]]:
+        """Return all memory histories from SQLite."""
+        return self.memory_manager.list_histories()
+
+    def create_history(self, title: str) -> dict[str, Any]:
+        """
+        Create a new empty memory history and make it active.
+
+        Creates:
+        - empty .ragmem file
+        - .ragmeta.json file
+        - SQLite memory_files row
+        """
+        clean_title = str(title or "").strip()
+        if not clean_title:
+            raise ValueError("title must not be empty.")
+
+        self.memory_manager.start_new_history(clean_title)
+
+        now = _utc_now()
+
+        self.memory_manager.files_root.mkdir(parents=True, exist_ok=True)
+        self.memory_manager.ragmem_path.touch(exist_ok=False)
+
+        metainfo = {
+            "file_id": self.memory_manager.file_id,
+            "title": self.memory_manager.title,
+            "filename_ragmem": self.memory_manager.filename_ragmem,
+            "filename_meta": self.memory_manager.filename_meta,
+            "created_at_utc": now,
+            "updated_at_utc": now,
+            "record_count": 0,
+            "record_ids": [],
+            "parent_ids": [],
+            "tag_summary": {},
+            "auto_keywords": [],
+            "user_keywords": [],
+            "records": [],
+        }
+
+        self.memory_manager.metainfo = metainfo
+        self.memory_manager.b_file_created = True
+
+        with self.memory_manager.meta_path.open("w", encoding="utf-8") as f:
+            json.dump(metainfo, f, ensure_ascii=False, indent=2)
+
+        self._insert_empty_file_row(
+            file_id=self.memory_manager.file_id,
+            title=self.memory_manager.title,
+            filename_ragmem=self.memory_manager.filename_ragmem,
+            filename_meta=self.memory_manager.filename_meta,
+            created_at_utc=now,
+            updated_at_utc=now,
+        )
+
+        logger_dev(
+            (
+                "MemoryFileManager.create_history\n"
+                f"file_id={self.memory_manager.file_id}\n"
+                f"title={self.memory_manager.title}\n"
+                f"filename_ragmem={self.memory_manager.filename_ragmem}\n"
+                f"filename_meta={self.memory_manager.filename_meta}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "success": True,
+            "file_id": self.memory_manager.file_id,
+            "title": self.memory_manager.title,
+            "filename_ragmem": self.memory_manager.filename_ragmem,
+            "filename_meta": self.memory_manager.filename_meta,
+            "record_count": 0,
+        }
+
+    def load_history(self, file_id: str) -> dict[str, Any]:
+        """Load one memory history into the active MemoryManager."""
+        clean_file_id = self._clean_file_id(file_id)
+        self.memory_manager.load_history(clean_file_id)
+
+        return {
+            "success": True,
+            "file_id": self.memory_manager.file_id,
+            "title": self.memory_manager.title,
+            "filename_ragmem": self.memory_manager.filename_ragmem,
+            "filename_meta": self.memory_manager.filename_meta,
+            "record_count": len(self.memory_manager.records),
+        }
+
+    def rename_history(
+        self,
+        file_id: str,
+        new_title: str,
+    ) -> dict[str, Any]:
+        """
+        Rename one memory history.
+
+        Updates:
+        - physical .ragmem filename
+        - physical .ragmeta.json filename
+        - SQLite memory_files row
+        - file-level fields inside .ragmeta.json
+        """
+        clean_file_id = self._clean_file_id(file_id)
+        clean_title = (new_title or "").strip()
+
+        if not clean_title:
+            raise ValueError("new_title must not be empty.")
+
+        row = self._lookup_file(clean_file_id)
+        if not row:
+            raise ValueError(f"Memory history not found: {clean_file_id}")
+
+        old_ragmem = self.memory_manager.files_root / row["filename_ragmem"]
+        old_meta = self.memory_manager.files_root / row["filename_meta"]
+
+        timestamp_prefix = self._extract_timestamp_prefix(row["filename_ragmem"])
+        stem = f"{timestamp_prefix}-{_safe_title(clean_title)}"
+
+        new_ragmem_name = f"{stem}.ragmem"
+        new_meta_name = f"{stem}.ragmeta.json"
+
+        new_ragmem = self.memory_manager.files_root / new_ragmem_name
+        new_meta = self.memory_manager.files_root / new_meta_name
+
+        if new_ragmem.exists() or new_meta.exists():
+            stem = f"{stem}-{clean_file_id[:8]}"
+            new_ragmem_name = f"{stem}.ragmem"
+            new_meta_name = f"{stem}.ragmeta.json"
+            new_ragmem = self.memory_manager.files_root / new_ragmem_name
+            new_meta = self.memory_manager.files_root / new_meta_name
+
+        if old_ragmem.exists():
+            old_ragmem.rename(new_ragmem)
+
+        if old_meta.exists():
+            old_meta.rename(new_meta)
+
+        now = _utc_now()
+
+        self._update_sqlite_file_row(
+            file_id=clean_file_id,
+            title=clean_title,
+            filename_ragmem=new_ragmem_name,
+            filename_meta=new_meta_name,
+            updated_at_utc=now,
+        )
+
+        if self.memory_manager.file_id == clean_file_id:
+            self.memory_manager.title = clean_title
+            self.memory_manager.filename_ragmem = new_ragmem_name
+            self.memory_manager.filename_meta = new_meta_name
+            self.memory_manager.save_metainfo()
+            self.memory_manager.refresh_sqlite_index()
+        else:
+            self._update_meta_json_file_fields(
+                meta_path=new_meta,
+                title=clean_title,
+                filename_ragmem=new_ragmem_name,
+                filename_meta=new_meta_name,
+                updated_at_utc=now,
+            )
+
+        logger_dev(
+            (
+                "MemoryFileManager.rename_history\n"
+                f"file_id={clean_file_id}\n"
+                f"old_ragmem={row['filename_ragmem']}\n"
+                f"new_ragmem={new_ragmem_name}\n"
+                f"old_meta={row['filename_meta']}\n"
+                f"new_meta={new_meta_name}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "success": True,
+            "file_id": clean_file_id,
+            "title": clean_title,
+            "filename_ragmem": new_ragmem_name,
+            "filename_meta": new_meta_name,
+        }
+
+    def delete_history(self, file_id: str) -> dict[str, Any]:
+        """
+        Delete one memory history.
+
+        Deletes:
+        - physical .ragmem
+        - physical .ragmeta.json
+        - SQLite memory_files row
+        - SQLite memory_records rows
+        - memory vectors by file_id
+        """
+        clean_file_id = self._clean_file_id(file_id)
+        row = self._lookup_file(clean_file_id)
+
+        if not row:
+            raise ValueError(f"Memory history not found: {clean_file_id}")
+
+        ragmem_path = self.memory_manager.files_root / row["filename_ragmem"]
+        meta_path = self.memory_manager.files_root / row["filename_meta"]
+
+        vectors_deleted = 0
+        if self.memory_vector_store is not None and hasattr(self.memory_vector_store, "delete_file"):
+            vector_result = self.memory_vector_store.delete_file(clean_file_id)
+            vectors_deleted = int(vector_result.get("deleted_vectors", 0) or 0)
+
+        self._delete_sqlite_rows(clean_file_id)
+
+        if ragmem_path.exists():
+            ragmem_path.unlink()
+
+        if meta_path.exists():
+            meta_path.unlink()
+
+        if self.memory_manager.file_id == clean_file_id:
+            self._reset_active_memory_manager()
+
+        logger_dev(
+            (
+                "MemoryFileManager.delete_history\n"
+                f"file_id={clean_file_id}\n"
+                f"filename_ragmem={row['filename_ragmem']}\n"
+                f"filename_meta={row['filename_meta']}\n"
+                f"vectors_deleted={vectors_deleted}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "success": True,
+            "file_id": clean_file_id,
+            "title": row["title"],
+            "filename_ragmem": row["filename_ragmem"],
+            "filename_meta": row["filename_meta"],
+            "vectors_deleted": vectors_deleted,
+        }
+
+    def _lookup_file(self, file_id: str) -> dict[str, Any] | None:
+        with sqlite3.connect(self.memory_manager.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT file_id, title, filename_ragmem, filename_meta,
+                       created_at_utc, updated_at_utc, record_count
+                FROM memory_files
+                WHERE file_id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def _insert_empty_file_row(
+        self,
+        *,
+        file_id: str,
+        title: str,
+        filename_ragmem: str,
+        filename_meta: str,
+        created_at_utc: str,
+        updated_at_utc: str,
+    ) -> None:
+        with sqlite3.connect(self.memory_manager.sqlite_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_files (
+                    file_id, title, filename_ragmem, filename_meta,
+                    created_at_utc, updated_at_utc, record_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    title = excluded.title,
+                    filename_ragmem = excluded.filename_ragmem,
+                    filename_meta = excluded.filename_meta,
+                    created_at_utc = excluded.created_at_utc,
+                    updated_at_utc = excluded.updated_at_utc,
+                    record_count = excluded.record_count
+                """,
+                (
+                    file_id,
+                    title,
+                    filename_ragmem,
+                    filename_meta,
+                    created_at_utc,
+                    updated_at_utc,
+                ),
+            )
+            conn.commit()
+
+    def _update_sqlite_file_row(
+        self,
+        *,
+        file_id: str,
+        title: str,
+        filename_ragmem: str,
+        filename_meta: str,
+        updated_at_utc: str,
+    ) -> None:
+        with sqlite3.connect(self.memory_manager.sqlite_path) as conn:
+            conn.execute(
+                """
+                UPDATE memory_files
+                SET title = ?,
+                    filename_ragmem = ?,
+                    filename_meta = ?,
+                    updated_at_utc = ?
+                WHERE file_id = ?
+                """,
+                (
+                    title,
+                    filename_ragmem,
+                    filename_meta,
+                    updated_at_utc,
+                    file_id,
+                ),
+            )
+            conn.commit()
+
+    def _delete_sqlite_rows(self, file_id: str) -> None:
+        with sqlite3.connect(self.memory_manager.sqlite_path) as conn:
+            conn.execute(
+                "DELETE FROM memory_records WHERE file_id = ?",
+                (file_id,),
+            )
+            conn.execute(
+                "DELETE FROM memory_files WHERE file_id = ?",
+                (file_id,),
+            )
+            conn.commit()
+
+    @staticmethod
+    def _update_meta_json_file_fields(
+        *,
+        meta_path: Path,
+        title: str,
+        filename_ragmem: str,
+        filename_meta: str,
+        updated_at_utc: str,
+    ) -> None:
+        if not meta_path.exists():
+            return
+
+        try:
+            with meta_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        data["title"] = title
+        data["filename_ragmem"] = filename_ragmem
+        data["filename_meta"] = filename_meta
+        data["updated_at_utc"] = updated_at_utc
+
+        with meta_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _reset_active_memory_manager(self) -> None:
+        self.memory_manager.file_id = uuid.uuid4().hex
+        self.memory_manager.title = ""
+        self.memory_manager.filename_ragmem = ""
+        self.memory_manager.filename_meta = ""
+        self.memory_manager.records = []
+        self.memory_manager.metainfo = {}
+        self.memory_manager.b_file_created = False
+
+    @staticmethod
+    def _extract_timestamp_prefix(filename_ragmem: str) -> str:
+        text = str(filename_ragmem or "").strip()
+        match = re.match(r"^(\d{4}-\d{2}-\d{2}-\d{2}-\d{2})-", text)
+        if match:
+            return match.group(1)
+
+        return datetime.now().strftime("%Y-%m-%d-%H-%M")
+
+    @staticmethod
+    def _clean_file_id(file_id: str) -> str:
+        clean_file_id = str(file_id or "").strip()
+        if not clean_file_id:
+            raise ValueError("file_id must not be empty.")
+        return clean_file_id
+```
+
+### ~\ragstream\memory\memory_index_lookup.py
+```python
+# ragstream/memory/memory_index_lookup.py
+# -*- coding: utf-8 -*-
+"""
+MemoryIndexLookup
+=================
+Deterministic lookup layer for Memory Retrieval.
+
+This class reads memory_index.sqlite3 and, when needed, reconstructs Q/A body
+text from the corresponding .ragmem file.
+
+It does not perform vector search.
+It does not score semantic hits.
+It does not modify memory truth.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+
+from pathlib import Path
+from typing import Any
+
+from ragstream.memory.memory_record import RECORD_END, RECORD_START
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+class MemoryIndexLookup:
+    """
+    SQLite-backed deterministic lookup helper.
+
+    The SQLite table mirrors .ragmeta.json metadata.
+    Full Q/A body is loaded from .ragmem only when needed for candidates.
+    """
+
+    def __init__(
+        self,
+        sqlite_path: str | Path,
+        memory_root: str | Path | None = None,
+    ) -> None:
+        self.sqlite_path: Path = Path(sqlite_path)
+        self.memory_root: Path | None = Path(memory_root) if memory_root is not None else None
+
+    def get_working_memory(
+        self,
+        file_id: str,
+        cfg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Return latest non-Black records from the active memory file.
+
+        This is the current-log working memory.
+        """
+        clean_file_id = str(file_id or "").strip()
+        if not clean_file_id:
+            return []
+
+        working_cfg = cfg.get("working_memory", {}) if isinstance(cfg, dict) else {}
+        if working_cfg.get("enabled", True) is False:
+            return []
+
+        max_pairs = int(working_cfg.get("max_pairs", 2))
+        exclude_tags = self._as_list(working_cfg.get("exclude_tags", ["Black"]))
+
+        query = """
+            SELECT *
+            FROM memory_records
+            WHERE file_id = ?
+        """
+        params: list[Any] = [clean_file_id]
+
+        if exclude_tags:
+            placeholders = ",".join("?" for _ in exclude_tags)
+            query += f" AND tag NOT IN ({placeholders})"
+            params.extend(exclude_tags)
+
+        query += " ORDER BY created_at_utc DESC LIMIT ?"
+        params.append(max_pairs)
+
+        rows = self._fetch_rows(query, params)
+        candidates = [self._row_to_candidate(row) for row in rows]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        logger(
+            f"Memory working lookup: file={clean_file_id[:8]} | candidates={len(candidates)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory working lookup result\n"
+            + json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return candidates
+
+    def get_latest_gold(
+        self,
+        file_id: str,
+        cfg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Return latest Gold candidates from the active memory file.
+
+        Gold is still bounded by config; it is not unlimited context.
+        """
+        clean_file_id = str(file_id or "").strip()
+        if not clean_file_id:
+            return []
+
+        episodic_cfg = cfg.get("episodic_memory", {}) if isinstance(cfg, dict) else {}
+        if episodic_cfg.get("enabled", True) is False:
+            return []
+
+        max_gold_records = int(episodic_cfg.get("max_gold_records", 1))
+
+        rows = self._fetch_rows(
+            """
+            SELECT *
+            FROM memory_records
+            WHERE file_id = ?
+              AND tag = 'Gold'
+            ORDER BY created_at_utc DESC
+            LIMIT ?
+            """,
+            [clean_file_id, max_gold_records],
+        )
+
+        candidates = [self._row_to_candidate(row) for row in rows]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        logger(
+            f"Memory Gold lookup: file={clean_file_id[:8]} | candidates={len(candidates)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory Gold lookup result\n"
+            + json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return candidates
+
+    def get_direct_recall(
+        self,
+        direct_recall_key: str,
+        cfg: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """
+        Lookup a Direct Recall candidate across all memory histories.
+
+        Automatic retrieval stays current-file only, but Direct Recall is allowed
+        to cross histories through exact key lookup.
+        """
+        key = str(direct_recall_key or "").strip()
+        if not key:
+            return None
+
+        direct_cfg = cfg.get("direct_recall", {}) if isinstance(cfg, dict) else {}
+        if direct_cfg.get("enabled", True) is False:
+            return None
+
+        exclude_tags = self._as_list(direct_cfg.get("exclude_tags", ["Black"]))
+
+        query = """
+            SELECT *
+            FROM memory_records
+            WHERE direct_recall_key = ?
+        """
+        params: list[Any] = [key]
+
+        if exclude_tags:
+            placeholders = ",".join("?" for _ in exclude_tags)
+            query += f" AND tag NOT IN ({placeholders})"
+            params.extend(exclude_tags)
+
+        query += """
+            ORDER BY
+              CASE tag WHEN 'Gold' THEN 0 WHEN 'Green' THEN 1 ELSE 2 END,
+              created_at_utc DESC
+            LIMIT 1
+        """
+
+        rows = self._fetch_rows(query, params)
+        if not rows:
+            logger(f"Direct Recall lookup found no match: key={key}", "INFO", "INTERNAL")
+            return None
+
+        candidates = [self._row_to_candidate(rows[0])]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        candidate = candidates[0] if candidates else None
+
+        logger(
+            f"Direct Recall lookup matched: key={key} | record={candidate.get('record_id', '')[:8] if candidate else ''}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Direct Recall lookup result\n"
+            + json.dumps(candidate, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return candidate
+
+    def get_records_by_ids(
+        self,
+        file_id: str,
+        record_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """
+        Load metadata rows for selected parent MemoryRecord ids.
+        """
+        clean_file_id = str(file_id or "").strip()
+        clean_ids = [str(record_id).strip() for record_id in record_ids if str(record_id).strip()]
+
+        if not clean_file_id or not clean_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in clean_ids)
+
+        rows = self._fetch_rows(
+            f"""
+            SELECT *
+            FROM memory_records
+            WHERE file_id = ?
+              AND record_id IN ({placeholders})
+            """,
+            [clean_file_id, *clean_ids],
+        )
+
+        candidates = [self._row_to_candidate(row) for row in rows]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        return candidates
+
+    def get_file_row(
+        self,
+        file_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one row from memory_files."""
+        clean_file_id = str(file_id or "").strip()
+        if not clean_file_id:
+            return None
+
+        rows = self._fetch_rows(
+            """
+            SELECT *
+            FROM memory_files
+            WHERE file_id = ?
+            """,
+            [clean_file_id],
+            table_name="memory_files",
+        )
+
+        return dict(rows[0]) if rows else None
+
+    def _fetch_rows(
+        self,
+        query: str,
+        params: list[Any],
+        *,
+        table_name: str = "memory_records",
+    ) -> list[sqlite3.Row]:
+        if not self.sqlite_path.exists():
+            logger(f"Memory SQLite not found: {self.sqlite_path}", "WARN", "PUBLIC")
+            return []
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(query, params).fetchall()
+
+        logger_dev(
+            (
+                "MemoryIndexLookup SQL result\n"
+                f"table={table_name}\n"
+                f"query={query.strip()}\n"
+                f"params={params}\n"
+                f"rows={len(rows)}"
+            ),
+            "TRACE",
+            "CONFIDENTIAL",
+        )
+
+        return rows
+
+    def _row_to_candidate(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+
+        candidate: dict[str, Any] = {
+            "file_id": data.get("file_id", ""),
+            "record_id": data.get("record_id", ""),
+            "parent_id": data.get("parent_id", ""),
+            "created_at_utc": data.get("created_at_utc", ""),
+            "source": data.get("source", ""),
+            "tag": data.get("tag", ""),
+            "retrieval_source_mode": data.get("retrieval_source_mode", "QA"),
+            "direct_recall_key": data.get("direct_recall_key", ""),
+            "auto_keywords": self._json_list(data.get("auto_keywords_json")),
+            "user_keywords": self._json_list(data.get("user_keywords_json")),
+            "active_project_name": data.get("active_project_name", ""),
+            "embedded_files_snapshot": self._json_list(data.get("embedded_files_snapshot_json")),
+            "input_hash": data.get("input_hash", ""),
+            "output_hash": data.get("output_hash", ""),
+            "sqlite_metadata": data,
+        }
+
+        return candidate
+
+    def _attach_file_rows(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        file_cache: dict[str, dict[str, Any]] = {}
+
+        for candidate in candidates:
+            file_id = str(candidate.get("file_id", "")).strip()
+            if not file_id:
+                continue
+
+            if file_id not in file_cache:
+                file_cache[file_id] = self.get_file_row(file_id) or {}
+
+            file_row = file_cache[file_id]
+            candidate["file_row"] = file_row
+            candidate["title"] = file_row.get("title", "")
+            candidate["filename_ragmem"] = file_row.get("filename_ragmem", "")
+            candidate["filename_meta"] = file_row.get("filename_meta", "")
+
+        return candidates
+
+    def _attach_ragmem_bodies(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Attach stable Q/A body from .ragmem.
+
+        SQLite intentionally stores metadata only, so Q/A body comes from
+        the durable .ragmem file.
+        """
+        if self.memory_root is None:
+            return candidates
+
+        body_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+        for candidate in candidates:
+            file_id = str(candidate.get("file_id", "")).strip()
+            record_id = str(candidate.get("record_id", "")).strip()
+
+            if not file_id or not record_id:
+                continue
+
+            cache_key = (file_id, record_id)
+            if cache_key not in body_cache:
+                body_cache[cache_key] = self._load_ragmem_body(candidate)
+
+            body = body_cache[cache_key]
+            candidate["input_text"] = body.get("input_text", "")
+            candidate["output_text"] = body.get("output_text", "")
+            candidate["ragmem_body"] = body
+
+        return candidates
+
+    def _load_ragmem_body(
+        self,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.memory_root is None:
+            return {}
+
+        filename_ragmem = str(candidate.get("filename_ragmem", "")).strip()
+        record_id = str(candidate.get("record_id", "")).strip()
+
+        if not filename_ragmem or not record_id:
+            return {}
+
+        ragmem_path = self.memory_root / "files" / filename_ragmem
+        if not ragmem_path.exists():
+            return {}
+
+        text = ragmem_path.read_text(encoding="utf-8")
+        pattern = re.compile(
+            rf"{re.escape(RECORD_START)}\n(.*?)\n{re.escape(RECORD_END)}",
+            re.DOTALL,
+        )
+
+        for match in pattern.finditer(text):
+            raw_block = match.group(1)
+            try:
+                data = json.loads(raw_block)
+            except Exception:
+                continue
+
+            if isinstance(data, dict) and str(data.get("record_id", "")) == record_id:
+                return data
+
+        return {}
+
+    @staticmethod
+    def _json_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+
+        if value is None:
+            return []
+
+        try:
+            parsed = json.loads(str(value))
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _as_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        if value is None:
+            return []
+
+        text = str(value).strip()
+        return [text] if text else []
+```
+
 ### ~\ragstream\memory\memory_ingestion_manager.py
 ```python
 # ragstream/memory/memory_ingestion_manager.py
@@ -8725,9 +11206,6 @@ class MemoryManager:
         active_project_name: str | None = None,
         embedded_files_snapshot: list[str] | None = None,
     ) -> MemoryRecord:
-        if not self.title.strip():
-            raise ValueError("Memory title is required before the first memory record is saved.")
-
         record = MemoryRecord(
             input_text=input_text,
             output_text=output_text,
@@ -8740,6 +11218,13 @@ class MemoryManager:
             retrieval_source_mode="QA",
             direct_recall_key="",
         )
+
+        if not self.title.strip():
+            auto_title = self._build_auto_history_title(
+                record=record,
+                active_project_name=active_project_name,
+            )
+            self.start_new_history(auto_title)
 
         self.records.append(record)
         self._append_record_to_ragmem(record)
@@ -9033,6 +11518,19 @@ class MemoryManager:
             ).fetchone()
 
         return dict(row) if row else None
+
+    def _build_auto_history_title(
+        self,
+        record: MemoryRecord,
+        active_project_name: str | None = None,
+    ) -> str:
+        """
+        Build the first memory history title automatically.
+
+        The file name must stay generic and deterministic:
+        YYYY-MM-DD-HH-mm-memory-record.ragmem
+        """
+        return "memory-record"
 
     def _init_sqlite(self) -> None:
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9426,6 +11924,345 @@ class MemoryRecord:
         )
 ```
 
+### ~\ragstream\memory\memory_scoring.py
+```python
+# ragstream/memory/memory_scoring.py
+# -*- coding: utf-8 -*-
+"""
+MemoryScorer
+============
+Scoring and aggregation logic for Memory Retrieval.
+
+It receives raw vector hits and converts them into:
+- normalized hit scores
+- parent MemoryRecord scores
+- selected semantic memory chunks
+
+This class does not read SQLite.
+This class does not query Chroma.
+This class does not mutate SuperPrompt.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+
+from typing import Any
+
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+class MemoryScorer:
+    """
+    Memory retrieval scoring helper.
+
+    Role-separated scoring:
+    - question hits represent similarity to an old problem
+    - answer hits represent similarity to an old solution
+    - record_handle hits represent metadata/keyword/anchor discovery
+    """
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+    ) -> None:
+        self.config: dict[str, Any] = config or {}
+        self.parent_score_weights: dict[str, dict[str, float]] = dict(
+            self.config.get("parent_score_weights", {}) or {}
+        )
+
+        self.default_weights: dict[str, float] = {
+            "answer": 0.55,
+            "question": 0.35,
+            "meta": 0.10,
+        }
+
+    def score_vector_hits(
+        self,
+        raw_hits: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Normalize raw vector-store hits.
+
+        Chroma usually returns distance, where smaller means better.
+        This method converts distance into a simple similarity-like score.
+        """
+        scored_hits: list[dict[str, Any]] = []
+
+        for rank, hit in enumerate(raw_hits, start=1):
+            metadata = dict(hit.get("metadata", {}) or {})
+            role = str(metadata.get("role", hit.get("role", "")) or "").strip()
+
+            distance = hit.get("distance")
+            score = hit.get("score")
+
+            if score is None:
+                score = self._distance_to_score(distance)
+
+            scored_hit = {
+                "rank": rank,
+                "vector_id": hit.get("id", hit.get("vector_id", "")),
+                "record_id": metadata.get("record_id", hit.get("record_id", "")),
+                "role": role,
+                "score": float(score),
+                "distance": distance,
+                "document": hit.get("document", ""),
+                "metadata": metadata,
+                "raw_hit": hit,
+            }
+
+            scored_hits.append(scored_hit)
+
+        logger(
+            f"Memory vector hits scored: {len(scored_hits)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory scored vector hits\n"
+            + json.dumps(scored_hits, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return scored_hits
+
+    def aggregate_parent_scores(
+        self,
+        scored_hits: list[dict[str, Any]],
+        metadata_by_record: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Aggregate vector-hit scores by parent MemoryRecord.
+
+        The parent score is the main episodic score.
+        Individual chunks remain available separately for A3/A4 later.
+        """
+        metadata_by_record = metadata_by_record or {}
+        grouped: dict[str, dict[str, Any]] = {}
+
+        for hit in scored_hits:
+            record_id = str(hit.get("record_id", "")).strip()
+            if not record_id:
+                continue
+
+            role = str(hit.get("role", "")).strip()
+            score = float(hit.get("score", 0.0))
+
+            if record_id not in grouped:
+                metadata = dict(metadata_by_record.get(record_id, {}) or {})
+                grouped[record_id] = {
+                    "record_id": record_id,
+                    "tag": metadata.get("tag", ""),
+                    "retrieval_source_mode": metadata.get("retrieval_source_mode", "QA"),
+                    "question_score": 0.0,
+                    "answer_score": 0.0,
+                    "meta_score": 0.0,
+                    "final_parent_score": 0.0,
+                    "hit_count": 0,
+                    "hits": [],
+                    "metadata": metadata,
+                }
+
+            parent = grouped[record_id]
+            parent["hit_count"] += 1
+            parent["hits"].append(hit)
+
+            if role == "question":
+                parent["question_score"] = max(float(parent["question_score"]), score)
+            elif role == "answer":
+                parent["answer_score"] = max(float(parent["answer_score"]), score)
+            else:
+                parent["meta_score"] = max(float(parent["meta_score"]), score)
+
+        parents = list(grouped.values())
+        parents = self.apply_retrieval_source_mode(parents)
+        parents = self.apply_tag_rules(parents)
+        parents = self.rank_parents(parents)
+
+        logger(
+            f"Memory parent scores aggregated: {len(parents)} parents",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory parent score aggregation\n"
+            + json.dumps(parents, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return parents
+
+    def apply_retrieval_source_mode(
+        self,
+        parent_scores: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Apply QA/Q/A weighting to parent MemoryRecord scores.
+        """
+        for parent in parent_scores:
+            mode = str(parent.get("retrieval_source_mode", "QA") or "QA").strip().upper()
+            if mode not in {"QA", "Q", "A"}:
+                mode = "QA"
+
+            weights = self.parent_score_weights.get(mode, self.default_weights)
+
+            answer_score = float(parent.get("answer_score", 0.0))
+            question_score = float(parent.get("question_score", 0.0))
+            meta_score = float(parent.get("meta_score", 0.0))
+
+            parent["final_parent_score"] = (
+                answer_score * float(weights.get("answer", 0.0))
+                + question_score * float(weights.get("question", 0.0))
+                + meta_score * float(weights.get("meta", 0.0))
+            )
+
+            parent["applied_weights"] = weights
+            parent["retrieval_source_mode"] = mode
+
+        return parent_scores
+
+    def apply_tag_rules(
+        self,
+        parent_scores: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Apply current retrieval tag rules.
+
+        Black records are excluded from automatic Memory Retrieval.
+        Gold records receive a small priority lift but still remain bounded.
+        """
+        excluded_tags = self._collect_excluded_tags()
+        result: list[dict[str, Any]] = []
+
+        for parent in parent_scores:
+            tag = str(parent.get("tag", "") or "").strip()
+
+            if tag in excluded_tags:
+                parent["excluded"] = True
+                parent["exclude_reason"] = f"tag={tag}"
+                continue
+
+            if tag == "Gold":
+                parent["final_parent_score"] = float(parent.get("final_parent_score", 0.0)) + 0.05
+                parent["gold_priority_applied"] = True
+            else:
+                parent["gold_priority_applied"] = False
+
+            result.append(parent)
+
+        return result
+
+    def rank_parents(
+        self,
+        parent_scores: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return parent MemoryRecords sorted by final score."""
+        return sorted(
+            parent_scores,
+            key=lambda item: float(item.get("final_parent_score", 0.0)),
+            reverse=True,
+        )
+
+    def select_semantic_chunks(
+        self,
+        scored_hits: list[dict[str, Any]],
+        max_memory_chunks: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Select raw semantic memory chunks for later A3/A4.
+
+        record_handle hits are not selected here because they are discovery
+        handles, not semantic evidence chunks.
+        """
+        candidates: list[dict[str, Any]] = []
+
+        for hit in scored_hits:
+            role = str(hit.get("role", "")).strip()
+            if role not in {"question", "answer"}:
+                continue
+
+            metadata = dict(hit.get("metadata", {}) or {})
+            tag = str(metadata.get("tag", "") or "").strip()
+            if tag in self._collect_excluded_tags():
+                continue
+
+            candidates.append(
+                {
+                    "vector_id": hit.get("vector_id", ""),
+                    "record_id": hit.get("record_id", ""),
+                    "role": role,
+                    "score": float(hit.get("score", 0.0)),
+                    "distance": hit.get("distance"),
+                    "document": hit.get("document", ""),
+                    "metadata": metadata,
+                    "rank": hit.get("rank"),
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: float(item.get("score", 0.0)),
+            reverse=True,
+        )
+
+        selected = candidates[: max(0, int(max_memory_chunks))]
+
+        logger(
+            f"Semantic memory chunks selected: {len(selected)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Selected semantic memory chunks\n"
+            + json.dumps(selected, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return selected
+
+    def _collect_excluded_tags(self) -> set[str]:
+        tags: set[str] = set()
+
+        for section_name in ("working_memory", "episodic_memory", "direct_recall"):
+            section = self.config.get(section_name, {})
+            for tag in section.get("exclude_tags", []) or []:
+                clean = str(tag).strip()
+                if clean:
+                    tags.add(clean)
+
+        if not tags:
+            tags.add("Black")
+
+        return tags
+
+    @staticmethod
+    def _distance_to_score(distance: Any) -> float:
+        """
+        Convert Chroma distance into a bounded similarity-like score.
+
+        Smaller distance means better match.
+        """
+        try:
+            d = float(distance)
+        except Exception:
+            return 0.0
+
+        if math.isnan(d) or math.isinf(d):
+            return 0.0
+
+        if d < 0:
+            d = 0.0
+
+        return 1.0 / (1.0 + d)
+```
+
 ### ~\ragstream\memory\memory_vector_store.py
 ```python
 # ragstream/memory/memory_vector_store.py
@@ -9438,9 +12275,29 @@ from pathlib import Path
 from typing import Any
 
 from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
 
 class MemoryVectorStore:
+    """
+    Dedicated memory Chroma vector store.
+
+    This store is separate from document Chroma stores.
+
+    It owns:
+    - memory vector persistence
+    - record vector replacement
+    - record vector deletion
+    - file/history vector deletion by file_id
+    - raw vector search for MemoryRetriever
+
+    It does not own:
+    - MemoryRecord truth
+    - SQLite metadata truth
+    - memory scoring
+    - MemoryContextPack creation
+    """
+
     def __init__(
         self,
         persist_dir: str,
@@ -9512,6 +12369,17 @@ class MemoryVectorStore:
             "INTERNAL",
         )
 
+        logger_dev(
+            (
+                "MemoryVectorStore.replace_record_entries\n"
+                f"record_id={clean_record_id}\n"
+                f"ids={json.dumps(ids, ensure_ascii=False, indent=2)}\n"
+                f"metadatas={json.dumps(metadatas, ensure_ascii=False, indent=2, default=str)}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
         return {
             "success": True,
             "record_id": clean_record_id,
@@ -9522,7 +12390,64 @@ class MemoryVectorStore:
             "persist_dir": self.persist_dir,
         }
 
+    def query(
+        self,
+        query_text: str,
+        n_results: int = 10,
+        where: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Search memory vectors and return flat hit dictionaries.
+
+        Returned hit format:
+        {
+            "id": str,
+            "document": str,
+            "metadata": dict,
+            "distance": float | None,
+            "rank": int
+        }
+        """
+        text = str(query_text or "").strip()
+        if not text:
+            return []
+
+        query_embedding = self._embed_documents([text])[0]
+
+        query_kwargs: dict[str, Any] = {
+            "query_embeddings": [query_embedding],
+            "n_results": int(n_results),
+            "include": ["documents", "metadatas", "distances"],
+        }
+
+        if where:
+            query_kwargs["where"] = self._sanitize_where(where)
+
+        result = self._collection.query(**query_kwargs)
+        hits = self._normalize_query_result(result)
+
+        logger(
+            f"MemoryVectorStore query finished: hits={len(hits)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            (
+                "MemoryVectorStore.query\n"
+                f"query_text={text}\n"
+                f"n_results={n_results}\n"
+                f"where={json.dumps(where or {}, ensure_ascii=False, indent=2, default=str)}\n"
+                f"hits={json.dumps(hits, ensure_ascii=False, indent=2, default=str)}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return hits
+
     def delete_record(self, record_id: str) -> dict[str, Any]:
+        """Delete all memory vectors belonging to one MemoryRecord."""
         clean_record_id = (record_id or "").strip()
         if not clean_record_id:
             return {
@@ -9539,20 +12464,100 @@ class MemoryVectorStore:
 
         new_count = self.count_record(clean_record_id)
 
+        deleted_vectors = max(old_count - new_count, 0)
+
+        logger_dev(
+            (
+                "MemoryVectorStore.delete_record\n"
+                f"record_id={clean_record_id}\n"
+                f"old_count={old_count}\n"
+                f"new_count={new_count}\n"
+                f"deleted_vectors={deleted_vectors}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
         return {
             "success": True,
             "record_id": clean_record_id,
-            "deleted_vectors": max(old_count - new_count, 0),
+            "deleted_vectors": deleted_vectors,
             "record_vector_count": new_count,
         }
 
+    def delete_file(self, file_id: str) -> dict[str, Any]:
+        """
+        Delete all memory vectors belonging to one memory history.
+
+        This is used by FILES tab Delete.
+        """
+        clean_file_id = (file_id or "").strip()
+        if not clean_file_id:
+            return {
+                "success": False,
+                "file_id": file_id,
+                "deleted_vectors": 0,
+                "message": "file_id is empty.",
+            }
+
+        old_count = self.count_file(clean_file_id)
+
+        if old_count > 0:
+            self._collection.delete(where={"file_id": clean_file_id})
+
+        new_count = self.count_file(clean_file_id)
+        deleted_vectors = max(old_count - new_count, 0)
+
+        logger(
+            (
+                "Memory vectors deleted by file_id: "
+                f"file={clean_file_id[:8]} | deleted={deleted_vectors}"
+            ),
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            (
+                "MemoryVectorStore.delete_file\n"
+                f"file_id={clean_file_id}\n"
+                f"old_count={old_count}\n"
+                f"new_count={new_count}\n"
+                f"deleted_vectors={deleted_vectors}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "success": True,
+            "file_id": clean_file_id,
+            "deleted_vectors": deleted_vectors,
+            "file_vector_count": new_count,
+            "collection_name": self.collection_name,
+            "persist_dir": self.persist_dir,
+        }
+
     def count_record(self, record_id: str) -> int:
+        """Count vectors belonging to one MemoryRecord."""
         clean_record_id = (record_id or "").strip()
         if not clean_record_id:
             return 0
 
         try:
             result = self._collection.get(where={"record_id": clean_record_id})
+            return len(result.get("ids", []))
+        except Exception:
+            return 0
+
+    def count_file(self, file_id: str) -> int:
+        """Count vectors belonging to one memory history."""
+        clean_file_id = (file_id or "").strip()
+        if not clean_file_id:
+            return 0
+
+        try:
+            result = self._collection.get(where={"file_id": clean_file_id})
             return len(result.get("ids", []))
         except Exception:
             return 0
@@ -9570,6 +12575,53 @@ class MemoryVectorStore:
             result.append([float(value) for value in vector])
 
         return result
+
+    @staticmethod
+    def _normalize_query_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+        ids = (result.get("ids") or [[]])[0] or []
+        documents = (result.get("documents") or [[]])[0] or []
+        metadatas = (result.get("metadatas") or [[]])[0] or []
+        distances = (result.get("distances") or [[]])[0] or []
+
+        hits: list[dict[str, Any]] = []
+
+        for idx, vector_id in enumerate(ids):
+            metadata = metadatas[idx] if idx < len(metadatas) and metadatas[idx] else {}
+            document = documents[idx] if idx < len(documents) else ""
+            distance = distances[idx] if idx < len(distances) else None
+
+            hits.append(
+                {
+                    "id": vector_id,
+                    "document": document,
+                    "metadata": metadata,
+                    "distance": distance,
+                    "rank": idx + 1,
+                }
+            )
+
+        return hits
+
+    @staticmethod
+    def _sanitize_where(where: dict[str, Any]) -> dict[str, str | int | float | bool]:
+        clean: dict[str, str | int | float | bool] = {}
+
+        for key, value in (where or {}).items():
+            if value is None:
+                continue
+
+            clean_key = str(key)
+
+            if isinstance(value, bool):
+                clean[clean_key] = value
+            elif isinstance(value, int):
+                clean[clean_key] = value
+            elif isinstance(value, float):
+                clean[clean_key] = value
+            else:
+                clean[clean_key] = str(value)
+
+        return clean
 
     @staticmethod
     def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:

@@ -1,4 +1,4 @@
-# superprompt_projector.py
+# ragstream/orchestration/superprompt_projector.py
 # -*- coding: utf-8 -*-
 """
 superprompt_projector.py
@@ -171,10 +171,11 @@ class SuperPromptProjector:
         """
         Render retrieved/condensed context for GUI-visible SuperPrompt preview.
 
-        This is intentionally neutral and reusable:
-        - A4 only produces S_CTX_MD.
-        - This projector decides how S_CTX_MD is displayed.
-        - Later PromptBuilder can reuse the same structure.
+        Retrieval stage now has two raw candidate pools:
+        - document chunks
+        - memory candidates
+
+        Both are rendered here as inspection/debug material.
         """
         lines: List[str] = []
 
@@ -198,13 +199,31 @@ class SuperPromptProjector:
         if raw_evidence_md:
             lines.append(raw_evidence_md)
 
+        raw_memory_md = self._render_raw_memory_retrieval_md()
+        if raw_memory_md:
+            lines.append("")
+            lines.append(raw_memory_md)
+
         return "\n".join(lines).strip()
+
+    def _render_raw_memory_retrieval_md(self) -> str:
+        """
+        Render raw memory retrieval candidates.
+
+        MemoryRetriever writes the raw debug markdown into:
+            sp.extras["memory_debug_markdown"]
+
+        This is GUI inspection material only.
+        It is not final compressed memory context.
+        """
+        extras = getattr(self.sp, "extras", {}) or {}
+        memory_debug_md = str(extras.get("memory_debug_markdown", "") or "").strip()
+        return memory_debug_md
 
     def _render_raw_retrieved_evidence_md(self) -> str:
         """
-        Render raw retrieved chunks as nested evidence.
+        Render raw retrieved document chunks as nested evidence.
 
-        Important:
         Source Markdown headings inside chunks are converted to [H1]/[H2]/[H3]
         so they do not compete with the visible SuperPrompt structure.
         """
@@ -365,10 +384,6 @@ class SuperPromptProjector:
     def _render_related_context_md(self) -> str:
         """
         Backward-compatible wrapper.
-
-        Older callers may still refer to _render_related_context_md().
-        The visible GUI format now uses Raw Retrieved Evidence instead of
-        the older Related Context block.
         """
         return self._render_raw_retrieved_evidence_md()
 
@@ -376,9 +391,11 @@ class SuperPromptProjector:
     def _get_meta_float(meta: Dict[str, Any] | None, key: str) -> float | None:
         if not isinstance(meta, dict):
             return None
+
         value = meta.get(key)
         if value is None:
             return None
+
         try:
             return float(value)
         except (TypeError, ValueError):

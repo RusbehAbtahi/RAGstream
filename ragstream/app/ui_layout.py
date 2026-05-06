@@ -18,7 +18,6 @@ from ragstream.app.ui_actions import (
     do_a3_nli_gate,
     do_a4_condenser,
     do_add_files,
-    do_confirm_memory_title_and_save,
     do_create_project,
     do_feed_memory_manually,
     do_preprocess,
@@ -421,9 +420,6 @@ def render_memory_records(height: int = 420) -> None:
         unsafe_allow_html=True,
     )
 
-    if st.session_state.get("memory_title_required"):
-        render_memory_title_form()
-
     memory_entries = memory_manager.records
 
     try:
@@ -536,20 +532,6 @@ def render_memory_records(height: int = 420) -> None:
                 )
 
                 st.markdown("<div style='height:0.40rem'></div>", unsafe_allow_html=True)
-
-
-def render_memory_title_form() -> None:
-    """Ask for first memory title before creating the first .ragmem file."""
-    with st.form("memory_title_form", clear_on_submit=False):
-        st.text_input(
-            "Memory Title",
-            key="memory_title_input",
-            placeholder="Example: Memory Design",
-        )
-        submitted = st.form_submit_button("Create Memory File", use_container_width=True)
-
-        if submitted:
-            do_confirm_memory_title_and_save()
 
 
 def render_project_area(ctrl: AppController) -> None:
