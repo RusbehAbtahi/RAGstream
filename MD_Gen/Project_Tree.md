@@ -56,16 +56,31 @@
 │   ├── memory
 │   │   ├── __init__.py
 │   │   ├── __pycache__
+│   │   ├── compression
+│   │   │   ├── __init__.py
+│   │   │   ├── __pycache__
+│   │   │   ├── memory_active_retrieval_brief.py
+│   │   │   ├── memory_activebrief_relevance_gate.py
+│   │   │   └── memory_sentence_reducer.py
+│   │   ├── ingestion
+│   │   │   ├── __init__.py
+│   │   │   ├── __pycache__
+│   │   │   ├── memory_chunker.py
+│   │   │   ├── memory_ingestion_manager.py
+│   │   │   └── memory_vector_store.py
 │   │   ├── memory_actions.py
-│   │   ├── memory_chunker.py
-│   │   ├── memory_context_pack.py
-│   │   ├── memory_file_manager.py
-│   │   ├── memory_index_lookup.py
-│   │   ├── memory_ingestion_manager.py
 │   │   ├── memory_manager.py
 │   │   ├── memory_record.py
-│   │   ├── memory_scoring.py
-│   │   └── memory_vector_store.py
+│   │   ├── retrieval
+│   │   │   ├── __init__.py
+│   │   │   ├── __pycache__
+│   │   │   ├── memory_context_pack.py
+│   │   │   ├── memory_index_lookup.py
+│   │   │   └── memory_scoring.py
+│   │   └── storage
+│   │       ├── __init__.py
+│   │       ├── __pycache__
+│   │       └── memory_file_manager.py
 │   ├── orchestration
 │   │   ├── __init__.py
 │   │   ├── __pycache__
@@ -138,23 +153,28 @@
     │   │   └── a3_catalogs
     │   │       ├── 001_option_catalogs_labels.json
     │   │       └── 002_option_catalogs_labels.json
-    │   └── a4_condenser
-    │       ├── chunk_classifier
-    │       │   └── a4_2_001.json
-    │       ├── chunk_phraser
-    │       │   └── a4_1_001.json
-    │       └── final_condenser
-    │           └── a4_3_001.json
+    │   ├── a4_condenser
+    │   │   ├── chunk_classifier
+    │   │   │   └── a4_2_001.json
+    │   │   ├── chunk_phraser
+    │   │   │   └── a4_1_001.json
+    │   │   └── final_condenser
+    │   │       └── a4_3_001.json
+    │   └── memory_activebrief_qa_summarizer
+    │       ├── memory_activebrief_qa_summarizer_init_001.json
+    │       └── memory_activebrief_qa_summarizer_update_001.json
     ├── chroma_db
-    │   ├── TEST1
-    │   │   ├── 7d1b9acf-cab6-4940-a157-075a9750a3b6
+    │   ├── MOVIES
+    │   │   ├── 5a90e8ef-39b2-44be-9e13-c87268f9e221
     │   │   └── file_manifest.json
-    │   └── TEST2
-    │       ├── 7db632b2-b157-46cc-99ab-f97431e72fd6
+    │   └── TESt2
+    │       ├── c46756c6-1e4c-44a9-8685-e3023a9551d7
     │       └── file_manifest.json
     ├── doc_raw
-    │   ├── TEST1
-    │   └── TEST2
+    │   ├── MOVIES
+    │   │   └── Movie_Scarface.txt
+    │   └── TESt2
+    │       ├── Movie_Scarface.txt
     ├── logs
     │   ├── archive
     │   ├── backups
@@ -163,26 +183,17 @@
     │   └── sqlite
     ├── memory
     │   ├── files
-    │   │   ├── 2026-04-28-17-54-Music_TEST_RAG.ragmeta.json
-    │   │   ├── 2026-04-28-18-12-MUSIC3.ragmeta.json
-    │   │   ├── 2026-04-28-18-34-Another-Test.ragmeta.json
-    │   │   ├── 2026-05-01-15-01-TEST1.ragmeta.json
-    │   │   ├── 2026-05-01-15-19-MUSIC_SChostakovitch.ragmeta.json
-    │   │   ├── 2026-05-03-13-45-TEST.ragmeta.json
-    │   │   ├── 2026-05-03-13-55-T.ragmeta.json
-    │   │   ├── 2026-05-04-16-22-Test.ragmeta.json
-    │   │   ├── 2026-05-04-16-56-TEST.ragmeta.json
-    │   │   ├── 2026-05-04-17-03-Test.ragmeta.json
-    │   │   ├── 2026-05-05-04-36-Test.ragmeta.json
-    │   │   ├── 2026-05-05-05-29-RUSBEH.ragmeta.json
-    │   │   ├── 2026-05-05-16-40-AWS.ragmeta.json
-    │   │   └── 2026-05-06-11-25-memory-record.ragmeta.json
+    │   │   ├── 2026-05-07-16-14-memory-record.ragmeta.json
+    │   │   ├── 2026-05-07-16-33-memory-record.ragmeta.json
+    │   │   ├── 2026-05-07-17-01-memory-record.ragmeta.json
+    │   │   ├── 2026-05-07-17-59-memory-record.ragmeta.json
+    │   │   └── 2026-05-07-18-24-memory-record.ragmeta.json
     │   └── vector_db
-    │       ├── 36c58a2a-9b94-47e5-a496-e41f40090e5b
+    │       ├── 1128b4bb-998c-47e7-81fc-244ccb598bf9
     ├── np_store
     │   └── project1
     ├── project1
     └── splade_db
-        ├── TEST1
-        └── TEST2
+        ├── MOVIES
+        └── TESt2
 ```

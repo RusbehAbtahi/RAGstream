@@ -26,6 +26,7 @@ import re
 
 from .prompt_schema import PromptSchema
 from .name_matcher import NameMatcher
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 
 
 # ------- helper: deterministic markdown section parser for '# ', '## ', '### ' (last-wins)
@@ -61,6 +62,7 @@ def preprocess(user_text: str, sp: Any, schema: PromptSchema) -> None:
 
     Outputs:
       - sp.body[...] updated for keys present in our limited set
+      - sp.effective_retrieval_query_text set from TASK / PURPOSE / CONTEXT
       - sp.prompt_ready set to composed Markdown
       - sp.history_of_stages += ["preprocessed"]
       - sp.stage = "preprocessed"
@@ -76,6 +78,7 @@ def preprocess(user_text: str, sp: Any, schema: PromptSchema) -> None:
         # write to body
         sp.body["task"] = task_text
         # clear context explicitly not required by spec; we leave as-is
+        _update_effective_retrieval_query_text(sp)
         # ---------------- Step 6: compose prompt_ready and mark stage ----------------
         sp.prompt_ready = _compose_prompt_ready({
             "system": sp.body.get("system"),
@@ -143,6 +146,8 @@ def preprocess(user_text: str, sp: Any, schema: PromptSchema) -> None:
     if "context" in mapped and (mapped.get("context") == ""):
         sp.body["context"] = None  # empty → not shown
 
+    _update_effective_retrieval_query_text(sp)
+
     # ---------------- Step 6: compose prompt_ready and mark stage -------------------
     sp.prompt_ready = _compose_prompt_ready({
         "system": sp.body.get("system"),
@@ -158,6 +163,16 @@ def preprocess(user_text: str, sp: Any, schema: PromptSchema) -> None:
 
     sp.history_of_stages.append("preprocessed")
     sp.stage = "preprocessed"
+
+
+def _update_effective_retrieval_query_text(sp: Any) -> None:
+    """
+    Build the current retrieval query from TASK / PURPOSE / CONTEXT.
+
+    Later this function can be extended to use a weak/strong prompt decision
+    and include ActiveRetrievalBrief when needed.
+    """
+    sp.effective_retrieval_query_text = SuperPromptProjector.build_query_text(sp)
 
 
 # ------- helper: compose the right-box Super-Prompt exactly from present values

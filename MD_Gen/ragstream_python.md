@@ -83,7 +83,14 @@ from ragstream.retrieval.reranker import Reranker
 from ragstream.retrieval.retriever_mem import MemoryRetriever
 
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 
 class AppController:
@@ -397,7 +404,7 @@ class AppController:
         store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
         sparse_store = VectorStoreSplade(persist_dir=str(self.splade_root / project_name))
         chunker = Chunker()
-        embedder = Embedder(model="text-embedding-3-large")
+        embedder = Embedder(model="text-embedding-3-small")
         sparse_embedder = SpladeEmbedder(device="cpu")
 
         stats = manager.run(
@@ -1534,7 +1541,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from ragstream.memory.memory_file_manager import MemoryFileManager
+from ragstream.memory.storage.memory_file_manager import MemoryFileManager
 from ragstream.memory.memory_manager import MemoryManager
 from ragstream.textforge.RagLog import LogALL as logger
 
@@ -2751,13 +2758,20 @@ from ragstream.app.ui_files import render_files_tab
 from ragstream.app.ui_metrics import render_metrics_tab
 from ragstream.app.ui_settings import render_settings_tab
 from ragstream.ingestion.embedder import Embedder
-from ragstream.memory.memory_chunker import MemoryChunker
-from ragstream.memory.memory_ingestion_manager import MemoryIngestionManager
+from ragstream.memory.ingestion.memory_chunker import MemoryChunker
+from ragstream.memory.ingestion.memory_ingestion_manager import MemoryIngestionManager
 from ragstream.memory.memory_manager import MemoryManager
-from ragstream.memory.memory_vector_store import MemoryVectorStore
+from ragstream.memory.ingestion.memory_vector_store import MemoryVectorStore
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 
 def _load_runtime_config(project_root: Path) -> dict[str, Any]:
@@ -3317,7 +3331,7 @@ from openai import OpenAI
 
 class Embedder:
     """High-level embedding interface using OpenAI API."""
-    def __init__(self, model: str = "text-embedding-3-large"):
+    def __init__(self, model: str = "text-embedding-3-small"):
         load_dotenv()  # Load .env file
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -7590,7 +7604,7 @@ class Retriever:
         # SPLADE DB is kept parallel to chroma_db under the same data root.
         self.splade_root = self.chroma_root.parent / "splade_db"
 
-        self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-large")
+        self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-small")
         self.chunker = chunker if chunker is not None else Chunker()
 
         # Keep the chunk class explicit so hydration remains readable and testable.
@@ -8126,9 +8140,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ragstream.memory.memory_context_pack import MemoryContextPack
-from ragstream.memory.memory_index_lookup import MemoryIndexLookup
-from ragstream.memory.memory_scoring import MemoryScorer
+from ragstream.memory.retrieval.memory_context_pack import MemoryContextPack
+from ragstream.memory.retrieval.memory_index_lookup import MemoryIndexLookup
+from ragstream.memory.retrieval.memory_scoring import MemoryScorer
 from ragstream.textforge.RagLog import LogALL as logger
 from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
@@ -8239,6 +8253,7 @@ class MemoryRetriever:
                     "gold": len(index_candidates["gold"]),
                     "direct_recall": 1 if index_candidates["direct_recall"] else 0,
                 },
+                "scoring_policy": self.scorer.describe_policy(),
             },
         )
 
@@ -8323,6 +8338,7 @@ class MemoryRetriever:
         )
 
         metadata_by_record = self._metadata_by_live_record()
+
         scored_hits = self.scorer.score_vector_hits(raw_hits)
         parent_scores = self.scorer.aggregate_parent_scores(
             scored_hits=scored_hits,
@@ -8332,6 +8348,7 @@ class MemoryRetriever:
         semantic_chunks = self.scorer.select_semantic_chunks(
             scored_hits=scored_hits,
             max_memory_chunks=max_memory_chunks,
+            metadata_by_record=metadata_by_record,
         )
 
         episodic_candidates = self._parent_scores_to_episodic_candidates(
@@ -8541,25 +8558,39 @@ class MemoryRetriever:
         """
         Build record metadata map from live MemoryManager.records.
 
-        Live records contain body + current metadata after .ragmeta overlay.
+        Adds episode-distance metadata:
+        - latest record gets episode_distance_k = 0
+        - one older record gets episode_distance_k = 1
+        - and so on
+
+        This is intentionally K-based, not clock-time-based.
         """
         result: dict[str, dict[str, Any]] = {}
 
-        for record in getattr(self.memory_manager, "records", []) or []:
+        records = list(getattr(self.memory_manager, "records", []) or [])
+        total_records = len(records)
+
+        for idx, record in enumerate(records):
             record_id = str(getattr(record, "record_id", "") or "").strip()
             if not record_id:
                 continue
 
             if hasattr(record, "to_full_dict"):
-                result[record_id] = record.to_full_dict()
+                data = record.to_full_dict()
             elif hasattr(record, "to_index_dict"):
-                result[record_id] = record.to_index_dict()
+                data = record.to_index_dict()
             else:
-                result[record_id] = {
+                data = {
                     "record_id": record_id,
                     "tag": getattr(record, "tag", ""),
                     "retrieval_source_mode": getattr(record, "retrieval_source_mode", "QA"),
                 }
+
+            data["episode_index"] = idx
+            data["episode_distance_k"] = max(0, total_records - 1 - idx)
+            data["episode_count_in_active_file"] = total_records
+
+            result[record_id] = data
 
         return result
 
@@ -8607,6 +8638,9 @@ class MemoryRetriever:
     ) -> list[dict[str, Any]]:
         """
         Merge Gold and semantic episodic candidates without duplicate record_ids.
+
+        Gold candidates remain a priority/bypass path and are inserted before
+        normal Green semantic episodic candidates.
         """
         episodic_cfg = self.config.get("episodic_memory", {}) or {}
         max_total_records = int(episodic_cfg.get("max_total_records", 3))
@@ -8641,6 +8675,7 @@ class MemoryRetriever:
         Overlay live MemoryRecord body/metadata onto candidate dicts when possible.
         """
         live_by_id = self._live_records_by_id()
+        metadata_by_record = self._metadata_by_live_record()
 
         enriched: list[dict[str, Any]] = []
 
@@ -8656,6 +8691,7 @@ class MemoryRetriever:
                         file_id=str(candidate.get("file_id", getattr(self.memory_manager, "file_id", ""))),
                     )
                 )
+                enriched_candidate.update(metadata_by_record.get(record_id, {}))
                 enriched.append(enriched_candidate)
             else:
                 enriched.append(candidate)
@@ -8783,6 +8819,7 @@ class MemoryRetriever:
             "semantic_result": semantic_result,
             "index_candidates": index_candidates,
             "memory_context_pack": pack.to_dict(),
+            "scoring_policy": self.scorer.describe_policy(),
         }
 
         logger_dev(
@@ -9338,7 +9375,2818 @@ def capture_memory_pair(
     }
 ```
 
-### ~\ragstream\memory\memory_chunker.py
+### ~\ragstream\memory\memory_manager.py
+```python
+# ragstream/memory/memory_manager.py
+# -*- coding: utf-8 -*-
+"""
+MemoryManager
+=============
+Owns one active memory history file, its MemoryRecords, MetaInfo,
+.ragmem persistence, .ragmeta.json persistence, and SQLite indexing.
+
+Authority split:
+- .ragmem is append-only and stores stable memory body fields only.
+- .ragmeta.json stores current editable/readable metadata.
+- SQLite mirrors .ragmeta.json for fast lookup/indexing.
+
+ActiveBrief pending-topic buffer:
+- RAM-only.
+- Not written to .ragmem, .ragmeta.json, or SQLite.
+- Used only to detect whether consecutive skipped Q/A pairs form a new topic.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import uuid
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from ragstream.memory.memory_record import (
+    MemoryRecord,
+    RECORD_END,
+    RECORD_START,
+)
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _filename_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d-%H-%M")
+
+
+def _safe_title(title: str) -> str:
+    value = (title or "").strip()
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-._")
+    return value or "Untitled"
+
+
+def _unique(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for value in values:
+        item = str(value).strip()
+        if not item:
+            continue
+
+        key = item.lower()
+        if key in seen:
+            continue
+
+        result.append(item)
+        seen.add(key)
+
+    return result
+
+
+def _clean_retrieval_source_mode(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    mode = str(value or "").strip().upper()
+    if mode in {"QA", "Q", "A"}:
+        return mode
+
+    return "QA"
+
+
+def _clean_direct_recall_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    return str(value or "").strip()
+
+
+class MemoryManager:
+    def __init__(
+        self,
+        memory_root: Path,
+        sqlite_path: Path,
+        title: str = "",
+    ) -> None:
+        self.file_id: str = uuid.uuid4().hex
+        self.title: str = ""
+        self.filename_ragmem: str = ""
+        self.filename_meta: str = ""
+
+        self.memory_root: Path = Path(memory_root)
+        self.sqlite_path: Path = Path(sqlite_path)
+
+        self.records: list[MemoryRecord] = []
+        self.metainfo: dict[str, Any] = {}
+
+        # RAM-only buffer for topic-shift detection.
+        # If Q/A is skipped as unrelated to the current ActiveBrief,
+        # its reduced text and vectors are kept here.
+        # The next skipped Q/A is compared to this buffer.
+        self.pending_activebrief_topic_buffer: dict[str, Any] = {}
+
+        self.tag_catalog: list[str] = ["Gold", "Green", "Black"]
+        self.b_file_created: bool = False
+
+        self.memory_root.mkdir(parents=True, exist_ok=True)
+        self.files_root.mkdir(parents=True, exist_ok=True)
+        self._init_sqlite()
+
+        if title.strip():
+            self.start_new_history(title)
+
+    @property
+    def files_root(self) -> Path:
+        return self.memory_root / "files"
+
+    @property
+    def ragmem_path(self) -> Path:
+        return self.files_root / self.filename_ragmem
+
+    @property
+    def meta_path(self) -> Path:
+        return self.files_root / self.filename_meta
+
+    def start_new_history(self, title: str) -> None:
+        clean_title = (title or "").strip()
+        if not clean_title:
+            raise ValueError("Memory title must not be empty.")
+
+        self.file_id = uuid.uuid4().hex
+        self.title = clean_title
+        self.records = []
+        self.metainfo = {}
+        self.pending_activebrief_topic_buffer = {}
+        self.b_file_created = False
+
+        stem = f"{_filename_timestamp()}-{_safe_title(clean_title)}"
+        filename_ragmem = f"{stem}.ragmem"
+        filename_meta = f"{stem}.ragmeta.json"
+
+        if (self.files_root / filename_ragmem).exists():
+            stem = f"{stem}-{self.file_id[:8]}"
+            filename_ragmem = f"{stem}.ragmem"
+            filename_meta = f"{stem}.ragmeta.json"
+
+        self.filename_ragmem = filename_ragmem
+        self.filename_meta = filename_meta
+
+    def load_history(self, file_id: str) -> None:
+        file_row = self._lookup_file(file_id)
+        if not file_row:
+            raise ValueError(f"Memory history not found: {file_id}")
+
+        self.file_id = file_row["file_id"]
+        self.title = file_row["title"]
+        self.filename_ragmem = file_row["filename_ragmem"]
+        self.filename_meta = file_row["filename_meta"]
+
+        self.records = self._read_ragmem_records(self.ragmem_path)
+        self.pending_activebrief_topic_buffer = {}
+        self.b_file_created = self.ragmem_path.exists()
+
+        if self.meta_path.exists():
+            with self.meta_path.open("r", encoding="utf-8") as f:
+                loaded_meta = json.load(f)
+            self.metainfo = loaded_meta if isinstance(loaded_meta, dict) else {}
+            self._apply_metainfo_overlay_to_records()
+        else:
+            self.save_metainfo()
+
+        self.refresh_sqlite_index()
+
+    def list_histories(self) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT file_id, title, filename_ragmem, filename_meta,
+                       created_at_utc, updated_at_utc, record_count
+                FROM memory_files
+                ORDER BY updated_at_utc DESC
+                """
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def capture_pair(
+        self,
+        input_text: str,
+        output_text: str,
+        source: str,
+        parent_id: str | None = None,
+        user_keywords: list[str] | None = None,
+        active_project_name: str | None = None,
+        embedded_files_snapshot: list[str] | None = None,
+    ) -> MemoryRecord:
+        record = MemoryRecord(
+            input_text=input_text,
+            output_text=output_text,
+            source=source,
+            parent_id=parent_id,
+            tag="Green",
+            user_keywords=user_keywords,
+            active_project_name=active_project_name,
+            embedded_files_snapshot=embedded_files_snapshot,
+            retrieval_source_mode="QA",
+            direct_recall_key="",
+        )
+
+        if not self.title.strip():
+            auto_title = self._build_auto_history_title(
+                record=record,
+                active_project_name=active_project_name,
+            )
+            self.start_new_history(auto_title)
+
+        self._update_active_retrieval_brief(record)
+
+        self.records.append(record)
+        self._append_record_to_ragmem(record)
+        self.save_metainfo()
+        self.refresh_sqlite_index()
+
+        return record
+
+    def sync_gui_edits(
+        self,
+        gui_records_state: list[dict[str, Any]],
+    ) -> None:
+        if not gui_records_state:
+            return
+
+        records_by_id = {record.record_id: record for record in self.records}
+        changed = False
+
+        for item in gui_records_state:
+            record_id = str(item.get("record_id", "")).strip()
+            if not record_id or record_id not in records_by_id:
+                continue
+
+            record = records_by_id[record_id]
+
+            tag = item.get("tag")
+            if tag is not None:
+                tag = str(tag).strip()
+                if tag not in self.tag_catalog:
+                    tag = None
+
+            user_keywords = item.get("user_keywords")
+            if user_keywords is not None and not isinstance(user_keywords, list):
+                user_keywords = []
+
+            retrieval_source_mode = _clean_retrieval_source_mode(item.get("retrieval_source_mode"))
+            direct_recall_key = _clean_direct_recall_key(item.get("direct_recall_key"))
+
+            before = record.to_index_dict()
+            record.update_editable_metadata(
+                tag=tag,
+                user_keywords=user_keywords,
+                retrieval_source_mode=retrieval_source_mode,
+                direct_recall_key=direct_recall_key,
+            )
+            after = record.to_index_dict()
+
+            if before != after:
+                changed = True
+
+        if changed:
+            self.save_metainfo()
+            self.refresh_sqlite_index()
+
+    def save_metainfo(self) -> None:
+        self.metainfo = self._build_metainfo()
+
+        if not self.filename_meta:
+            return
+
+        self.files_root.mkdir(parents=True, exist_ok=True)
+        with self.meta_path.open("w", encoding="utf-8") as f:
+            json.dump(self.metainfo, f, ensure_ascii=False, indent=2)
+
+    def refresh_sqlite_index(self) -> None:
+        self._init_sqlite()
+
+        if not self.file_id or not self.filename_ragmem:
+            return
+
+        metainfo = self._build_metainfo()
+        now = _utc_now()
+
+        created_at_utc = metainfo.get("created_at_utc") or now
+        updated_at_utc = metainfo.get("updated_at_utc") or now
+        record_count = int(metainfo.get("record_count", 0))
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_files (
+                    file_id, title, filename_ragmem, filename_meta,
+                    created_at_utc, updated_at_utc, record_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_id) DO UPDATE SET
+                    title = excluded.title,
+                    filename_ragmem = excluded.filename_ragmem,
+                    filename_meta = excluded.filename_meta,
+                    created_at_utc = excluded.created_at_utc,
+                    updated_at_utc = excluded.updated_at_utc,
+                    record_count = excluded.record_count
+                """,
+                (
+                    self.file_id,
+                    self.title,
+                    self.filename_ragmem,
+                    self.filename_meta,
+                    created_at_utc,
+                    updated_at_utc,
+                    record_count,
+                ),
+            )
+
+            for record in self.records:
+                index_data = record.to_index_dict()
+
+                conn.execute(
+                    """
+                    INSERT INTO memory_records (
+                        file_id, record_id, parent_id, created_at_utc,
+                        source, tag, retrieval_source_mode, direct_recall_key,
+                        auto_keywords_json, user_keywords_json,
+                        active_project_name, embedded_files_snapshot_json,
+                        input_hash, output_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(file_id, record_id) DO UPDATE SET
+                        parent_id = excluded.parent_id,
+                        created_at_utc = excluded.created_at_utc,
+                        source = excluded.source,
+                        tag = excluded.tag,
+                        retrieval_source_mode = excluded.retrieval_source_mode,
+                        direct_recall_key = excluded.direct_recall_key,
+                        auto_keywords_json = excluded.auto_keywords_json,
+                        user_keywords_json = excluded.user_keywords_json,
+                        active_project_name = excluded.active_project_name,
+                        embedded_files_snapshot_json = excluded.embedded_files_snapshot_json,
+                        input_hash = excluded.input_hash,
+                        output_hash = excluded.output_hash
+                    """,
+                    (
+                        self.file_id,
+                        index_data["record_id"],
+                        index_data["parent_id"],
+                        index_data["created_at_utc"],
+                        index_data["source"],
+                        index_data["tag"],
+                        index_data["retrieval_source_mode"],
+                        index_data["direct_recall_key"],
+                        json.dumps(index_data["auto_keywords"], ensure_ascii=False),
+                        json.dumps(index_data["user_keywords"], ensure_ascii=False),
+                        index_data["active_project_name"],
+                        json.dumps(index_data["embedded_files_snapshot"], ensure_ascii=False),
+                        index_data["input_hash"],
+                        index_data["output_hash"],
+                    ),
+                )
+
+            self._delete_sqlite_rows_not_in_memory(conn)
+            conn.commit()
+
+    def _build_metainfo(self) -> dict[str, Any]:
+        record_ids = [record.record_id for record in self.records]
+        parent_ids = _unique([record.parent_id for record in self.records if record.parent_id])
+
+        tag_summary: dict[str, int] = {}
+        auto_keywords: list[str] = []
+        user_keywords: list[str] = []
+
+        for record in self.records:
+            tag_summary[record.tag] = tag_summary.get(record.tag, 0) + 1
+            auto_keywords.extend(record.auto_keywords)
+            user_keywords.extend(record.user_keywords)
+
+        created_at_utc = self.records[0].created_at_utc if self.records else ""
+        updated_at_utc = _utc_now() if self.records else ""
+
+        return {
+            "file_id": self.file_id,
+            "title": self.title,
+            "filename_ragmem": self.filename_ragmem,
+            "filename_meta": self.filename_meta,
+            "created_at_utc": created_at_utc,
+            "updated_at_utc": updated_at_utc,
+            "record_count": len(self.records),
+            "record_ids": record_ids,
+            "parent_ids": parent_ids,
+            "tag_summary": tag_summary,
+            "auto_keywords": _unique(auto_keywords),
+            "user_keywords": _unique(user_keywords),
+            "records": [record.to_index_dict() for record in self.records],
+        }
+
+    def close(self) -> None:
+        self.save_metainfo()
+        self.refresh_sqlite_index()
+
+    def _update_active_retrieval_brief(self, record: MemoryRecord) -> None:
+        """
+        Build the ActiveRetrievalBrief for the new MemoryRecord.
+
+        This happens before the record is first written to .ragmem so that
+        active_retrieval_brief remains part of the stable body block.
+
+        The pending-topic buffer is updated here too, because it belongs to
+        the active memory history, not to Streamlit and not to the builder.
+        """
+        try:
+            from ragstream.memory.compression.memory_active_retrieval_brief import (
+                MemoryActiveRetrievalBriefBuilder,
+            )
+
+            builder = MemoryActiveRetrievalBriefBuilder()
+            result = builder.build_for_record(
+                record=record,
+                previous_records=list(self.records),
+                pending_topic_buffer=dict(self.pending_activebrief_topic_buffer or {}),
+            )
+
+            active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
+            contributor_ids = list(result.get("active_retrieval_brief_contributor_ids") or [])
+
+            record.update_active_retrieval_brief(
+                active_retrieval_brief=active_brief,
+                contributor_ids=contributor_ids,
+            )
+
+            new_buffer = result.get("pending_activebrief_topic_buffer", {})
+            self.pending_activebrief_topic_buffer = new_buffer if isinstance(new_buffer, dict) else {}
+
+            logger_dev(
+                "MemoryManager ActiveBrief update result\n"
+                + json.dumps(
+                    {
+                        "record_id": record.record_id,
+                        "activebrief_llm_skipped": bool(result.get("activebrief_llm_skipped", False)),
+                        "activebrief_gate_route": str(result.get("activebrief_gate_route", "") or ""),
+                        "active_retrieval_brief_contributor_ids": contributor_ids,
+                        "pending_activebrief_topic_buffer": self._pending_buffer_log_view(
+                            self.pending_activebrief_topic_buffer
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
+
+        except Exception as e:
+            logger_dev(
+                "ActiveRetrievalBrief generation failed\n"
+                + json.dumps(
+                    {
+                        "record_id": record.record_id,
+                        "error": str(e),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "ERROR",
+                "CONFIDENTIAL",
+            )
+
+    def _append_record_to_ragmem(self, record: MemoryRecord) -> None:
+        if not self.filename_ragmem:
+            raise ValueError("Memory filename is not initialized.")
+
+        self.files_root.mkdir(parents=True, exist_ok=True)
+
+        with self.ragmem_path.open("a", encoding="utf-8") as f:
+            f.write(record.to_ragmem_block())
+            f.write("\n")
+
+        self.b_file_created = True
+
+    def _read_ragmem_records(self, path: Path) -> list[MemoryRecord]:
+        if not path.exists():
+            return []
+
+        text = path.read_text(encoding="utf-8")
+        pattern = re.compile(
+            rf"{re.escape(RECORD_START)}\n(.*?)\n{re.escape(RECORD_END)}",
+            re.DOTALL,
+        )
+
+        records: list[MemoryRecord] = []
+
+        for match in pattern.finditer(text):
+            raw_block = match.group(1)
+            try:
+                data = json.loads(raw_block)
+                if isinstance(data, dict):
+                    records.append(MemoryRecord.from_dict(data))
+            except Exception:
+                continue
+
+        return records
+
+    def _apply_metainfo_overlay_to_records(self) -> None:
+        """
+        Overlay current .ragmeta.json metadata onto records loaded from .ragmem.
+
+        .ragmem supplies the stable body.
+        .ragmeta.json supplies current metadata.
+        """
+        meta_records = self.metainfo.get("records", [])
+        if not isinstance(meta_records, list):
+            return
+
+        metadata_by_record_id: dict[str, dict[str, Any]] = {}
+
+        for item in meta_records:
+            if not isinstance(item, dict):
+                continue
+
+            record_id = str(item.get("record_id", "")).strip()
+            if not record_id:
+                continue
+
+            metadata_by_record_id[record_id] = item
+
+        for record in self.records:
+            metadata = metadata_by_record_id.get(record.record_id)
+            if metadata is None:
+                continue
+
+            record.update_metadata_overlay(metadata)
+
+    def _delete_sqlite_rows_not_in_memory(self, conn: sqlite3.Connection) -> None:
+        """
+        Keep SQLite as a mirror of the active MemoryManager.records list.
+        SQLite is not allowed to keep extra current rows for this file_id.
+        """
+        if not self.records:
+            conn.execute(
+                "DELETE FROM memory_records WHERE file_id = ?",
+                (self.file_id,),
+            )
+            return
+
+        record_ids = [record.record_id for record in self.records]
+        placeholders = ",".join("?" for _ in record_ids)
+
+        conn.execute(
+            f"""
+            DELETE FROM memory_records
+            WHERE file_id = ?
+              AND record_id NOT IN ({placeholders})
+            """,
+            [self.file_id, *record_ids],
+        )
+
+    def _lookup_file(self, file_id: str) -> dict[str, Any] | None:
+        self._init_sqlite()
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT file_id, title, filename_ragmem, filename_meta,
+                       created_at_utc, updated_at_utc, record_count
+                FROM memory_files
+                WHERE file_id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def _build_auto_history_title(
+        self,
+        record: MemoryRecord,
+        active_project_name: str | None = None,
+    ) -> str:
+        """
+        Build the first memory history title automatically.
+
+        The file name must stay generic and deterministic:
+        YYYY-MM-DD-HH-mm-memory-record.ragmem
+        """
+        return "memory-record"
+
+    @staticmethod
+    def _pending_buffer_log_view(buffer: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(buffer, dict) or not buffer:
+            return {}
+
+        return {
+            "record_id": str(buffer.get("record_id", "") or ""),
+            "created_at_utc": str(buffer.get("created_at_utc", "") or ""),
+            "question_vector_count": len(buffer.get("question_vectors", []) or []),
+            "answer_vector_count": len(buffer.get("answer_vectors", []) or []),
+            "vector_count": int(buffer.get("vector_count", 0) or 0),
+            "has_center_vector": bool(buffer.get("center_vector", [])),
+            "reduced_question_preview": str(buffer.get("reduced_question", "") or "")[:500],
+            "reduced_answer_preview": str(buffer.get("reduced_answer", "") or "")[:500],
+        }
+
+    def _init_sqlite(self) -> None:
+        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_files (
+                    file_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    filename_ragmem TEXT NOT NULL,
+                    filename_meta TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    record_count INTEGER NOT NULL
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_records (
+                    file_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    created_at_utc TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    retrieval_source_mode TEXT NOT NULL DEFAULT 'QA',
+                    direct_recall_key TEXT NOT NULL DEFAULT '',
+                    auto_keywords_json TEXT NOT NULL,
+                    user_keywords_json TEXT NOT NULL,
+                    active_project_name TEXT,
+                    embedded_files_snapshot_json TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    output_hash TEXT NOT NULL,
+                    PRIMARY KEY (file_id, record_id)
+                )
+                """
+            )
+
+            self._ensure_memory_records_columns(conn)
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_records_tag
+                ON memory_records(tag)
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_records_project
+                ON memory_records(active_project_name)
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_records_direct_recall_key
+                ON memory_records(direct_recall_key)
+                """
+            )
+
+            conn.commit()
+
+    @staticmethod
+    def _ensure_memory_records_columns(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(memory_records)").fetchall()
+        existing_columns = {str(row[1]) for row in rows}
+
+        if "retrieval_source_mode" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_records "
+                "ADD COLUMN retrieval_source_mode TEXT NOT NULL DEFAULT 'QA'"
+            )
+
+        if "direct_recall_key" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE memory_records "
+                "ADD COLUMN direct_recall_key TEXT NOT NULL DEFAULT ''"
+            )
+```
+
+### ~\ragstream\memory\memory_record.py
+```python
+# ragstream/memory/memory_record.py
+# -*- coding: utf-8 -*-
+"""
+MemoryRecord
+============
+One accepted input/output memory unit.
+
+Authority split:
+- .ragmem stores only the stable append-only memory body.
+- .ragmeta.json stores current metadata.
+- SQLite mirrors .ragmeta.json for fast lookup/indexing.
+
+A MemoryRecord in RAM contains both:
+- stable body fields
+- current metadata fields
+
+Only stable body fields are serialized into .ragmem.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+
+from datetime import datetime, timezone
+from typing import Any
+
+
+RECORD_START = "----- MEMORY RECORD START -----"
+RECORD_END = "----- MEMORY RECORD END -----"
+
+
+RETRIEVAL_SOURCE_MODES = {"QA", "Q", "A"}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _clean_list(values: list[str] | None) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+
+    for value in values or []:
+        item = str(value).strip()
+        if not item:
+            continue
+
+        key = item.lower()
+        if key in seen:
+            continue
+
+        cleaned.append(item)
+        seen.add(key)
+
+    return cleaned
+
+
+def _clean_retrieval_source_mode(value: str | None) -> str:
+    mode = str(value or "QA").strip().upper()
+    return mode if mode in RETRIEVAL_SOURCE_MODES else "QA"
+
+
+def _clean_direct_recall_key(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    return text if text else None
+
+
+class MemoryRecord:
+    def __init__(
+        self,
+        input_text: str,
+        output_text: str,
+        source: str,
+        parent_id: str | None = None,
+        tag: str = "Green",
+        user_keywords: list[str] | None = None,
+        active_project_name: str | None = None,
+        embedded_files_snapshot: list[str] | None = None,
+        retrieval_source_mode: str = "QA",
+        direct_recall_key: str = "",
+        active_retrieval_brief: str = "",
+        active_retrieval_brief_contributor_ids: list[str] | None = None,
+        *,
+        record_id: str | None = None,
+        created_at_utc: str | None = None,
+        auto_keywords: list[str] | None = None,
+        input_hash: str | None = None,
+        output_hash: str | None = None,
+    ) -> None:
+        self.record_id: str = record_id or uuid.uuid4().hex
+        self.parent_id: str | None = parent_id
+        self.created_at_utc: str = created_at_utc or _utc_now()
+
+        self.input_text: str = input_text or ""
+        self.output_text: str = output_text or ""
+        self.source: str = source or ""
+
+        self.tag: str = tag or "Green"
+        self.user_keywords: list[str] = _clean_list(user_keywords)
+        self.retrieval_source_mode: str = _clean_retrieval_source_mode(retrieval_source_mode)
+        self.direct_recall_key: str = _clean_direct_recall_key(direct_recall_key)
+
+        self.active_project_name: str | None = active_project_name
+        self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
+
+        self.active_retrieval_brief: str = str(active_retrieval_brief or "").strip()
+        self.active_retrieval_brief_contributor_ids: list[str] = _clean_list(
+            active_retrieval_brief_contributor_ids
+        )
+
+        self.input_hash: str = input_hash or _sha256(self.input_text)
+        self.output_hash: str = output_hash or _sha256(self.output_text)
+
+        if auto_keywords is None:
+            self.auto_keywords: list[str] = self.generate_auto_keywords()
+        else:
+            self.auto_keywords = _clean_list(auto_keywords)
+
+    def generate_auto_keywords(self) -> list[str]:
+        text = f"{self.input_text}\n\n{self.output_text}".strip()
+        if not text:
+            return []
+
+        try:
+            import yake
+        except Exception:
+            return []
+
+        try:
+            extractor = yake.KeywordExtractor(
+                lan="en",
+                n=3,
+                dedupLim=0.9,
+                top=5,
+                features=None,
+            )
+            keywords = extractor.extract_keywords(text)
+            return _clean_list([kw for kw, _score in keywords])
+        except Exception:
+            return []
+
+    def update_editable_metadata(
+        self,
+        tag: str | None = None,
+        user_keywords: list[str] | None = None,
+        retrieval_source_mode: str | None = None,
+        direct_recall_key: str | None = None,
+    ) -> None:
+        if tag is not None:
+            clean_tag = str(tag).strip()
+            if clean_tag:
+                self.tag = clean_tag
+
+        if user_keywords is not None:
+            self.user_keywords = _clean_list(user_keywords)
+
+        if retrieval_source_mode is not None:
+            self.retrieval_source_mode = _clean_retrieval_source_mode(retrieval_source_mode)
+
+        if direct_recall_key is not None:
+            self.direct_recall_key = _clean_direct_recall_key(direct_recall_key)
+
+    def update_active_retrieval_brief(
+        self,
+        active_retrieval_brief: str,
+        contributor_ids: list[str] | None = None,
+    ) -> None:
+        self.active_retrieval_brief = str(active_retrieval_brief or "").strip()
+        self.active_retrieval_brief_contributor_ids = _clean_list(contributor_ids)
+
+    def update_metadata_overlay(
+        self,
+        metadata: dict[str, Any],
+    ) -> None:
+        """
+        Apply current metadata loaded from .ragmeta.json.
+
+        This method deliberately does not modify stable .ragmem body fields:
+        - record_id
+        - parent_id
+        - created_at_utc
+        - input_text
+        - output_text
+        - source
+        - input_hash
+        - output_hash
+        - active_retrieval_brief
+        - active_retrieval_brief_contributor_ids
+        """
+        if not isinstance(metadata, dict):
+            return
+
+        self.update_editable_metadata(
+            tag=metadata.get("tag"),
+            user_keywords=list(metadata.get("user_keywords") or []),
+            retrieval_source_mode=metadata.get("retrieval_source_mode"),
+            direct_recall_key=metadata.get("direct_recall_key"),
+        )
+
+        if "auto_keywords" in metadata:
+            self.auto_keywords = _clean_list(list(metadata.get("auto_keywords") or []))
+
+        if "active_project_name" in metadata:
+            self.active_project_name = _optional_str(metadata.get("active_project_name"))
+
+        if "embedded_files_snapshot" in metadata:
+            self.embedded_files_snapshot = list(metadata.get("embedded_files_snapshot") or [])
+
+    def to_ragmem_dict(self) -> dict[str, Any]:
+        """
+        Stable append-only .ragmem body.
+
+        Editable GUI metadata is intentionally excluded from this dictionary.
+        """
+        return {
+            "record_id": self.record_id,
+            "parent_id": self.parent_id,
+            "created_at_utc": self.created_at_utc,
+            "input_text": self.input_text,
+            "output_text": self.output_text,
+            "source": self.source,
+            "input_hash": self.input_hash,
+            "output_hash": self.output_hash,
+            "active_retrieval_brief": self.active_retrieval_brief,
+            "active_retrieval_brief_contributor_ids": self.active_retrieval_brief_contributor_ids,
+        }
+
+    def to_ragmem_block(self) -> str:
+        body = json.dumps(self.to_ragmem_dict(), ensure_ascii=False, indent=2)
+        return f"{RECORD_START}\n{body}\n{RECORD_END}\n"
+
+    def to_index_dict(self) -> dict[str, Any]:
+        """
+        Current metadata/index view.
+
+        This dictionary is used for:
+        - .ragmeta.json per-record metadata
+        - SQLite mirror rows
+
+        It does not duplicate full input_text, output_text, or full ActiveBrief text.
+        """
+        return {
+            "record_id": self.record_id,
+            "parent_id": self.parent_id,
+            "created_at_utc": self.created_at_utc,
+            "source": self.source,
+            "tag": self.tag,
+            "retrieval_source_mode": self.retrieval_source_mode,
+            "direct_recall_key": self.direct_recall_key,
+            "auto_keywords": self.auto_keywords,
+            "user_keywords": self.user_keywords,
+            "active_project_name": self.active_project_name,
+            "embedded_files_snapshot": self.embedded_files_snapshot,
+            "input_hash": self.input_hash,
+            "output_hash": self.output_hash,
+        }
+
+    def to_full_dict(self) -> dict[str, Any]:
+        """
+        Full in-RAM diagnostic/export view.
+
+        This is not used for .ragmem serialization.
+        """
+        data = self.to_ragmem_dict()
+        data.update(
+            {
+                "tag": self.tag,
+                "retrieval_source_mode": self.retrieval_source_mode,
+                "direct_recall_key": self.direct_recall_key,
+                "auto_keywords": self.auto_keywords,
+                "user_keywords": self.user_keywords,
+                "active_project_name": self.active_project_name,
+                "embedded_files_snapshot": self.embedded_files_snapshot,
+            }
+        )
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
+        """
+        Load one MemoryRecord from a .ragmem block.
+
+        Supports both:
+        - new body-only .ragmem blocks
+        - older full .ragmem blocks that still contain metadata
+
+        Current metadata from .ragmeta.json is applied later by MemoryManager.
+        """
+        auto_keywords_raw = data.get("auto_keywords")
+
+        return cls(
+            input_text=str(data.get("input_text", "")),
+            output_text=str(data.get("output_text", "")),
+            source=str(data.get("source", "")),
+            parent_id=_optional_str(data.get("parent_id")),
+            tag=str(data.get("tag", "Green")),
+            user_keywords=list(data.get("user_keywords") or []),
+            active_project_name=_optional_str(data.get("active_project_name")),
+            embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
+            retrieval_source_mode=str(data.get("retrieval_source_mode", "QA")),
+            direct_recall_key=str(data.get("direct_recall_key", "")),
+            active_retrieval_brief=str(data.get("active_retrieval_brief", "") or ""),
+            active_retrieval_brief_contributor_ids=list(
+                data.get("active_retrieval_brief_contributor_ids") or []
+            ),
+            record_id=str(data.get("record_id") or uuid.uuid4().hex),
+            created_at_utc=str(data.get("created_at_utc") or _utc_now()),
+            auto_keywords=(
+                list(auto_keywords_raw)
+                if isinstance(auto_keywords_raw, list)
+                else None
+            ),
+            input_hash=data.get("input_hash"),
+            output_hash=data.get("output_hash"),
+        )
+```
+
+### ~\ragstream\memory\compression\memory_active_retrieval_brief.py
+```python
+# ragstream/memory/compression/memory_active_retrieval_brief.py
+# -*- coding: utf-8 -*-
+"""
+MemoryActiveRetrievalBriefBuilder
+=================================
+
+Creates the ActiveRetrievalBrief for a newly captured MemoryRecord.
+
+Current design:
+- runs during Memory Recording
+- uses K-1 ActiveBrief + reduced Q/A of K
+- creates K ActiveBrief
+- writes nothing directly to disk
+- returns result to MemoryManager, which owns MemoryRecord truth
+
+LLM calls:
+- first record: init JSON
+- later records: update JSON
+
+Relevance-gate behavior:
+- normal case:
+    Q/A passes against current ActiveBrief center -> update ActiveBrief with LLM
+- unrelated case:
+    Q/A fails against ActiveBrief and pending topic -> skip LLM, copy old brief
+- topic-shift case:
+    Q/A fails against ActiveBrief but passes against pending skipped Q/A -> create a new brief from pending Q/A + current Q/A
+"""
+
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+from typing import Any
+
+from ragstream.memory.memory_record import MemoryRecord
+from ragstream.memory.compression.memory_sentence_reducer import (
+    MemorySentenceReducer,
+    ReducedQA,
+)
+from ragstream.memory.compression.memory_activebrief_relevance_gate import (
+    MemoryActiveBriefRelevanceGate,
+)
+from ragstream.orchestration.agent_factory import AgentFactory
+from ragstream.orchestration.agent_prompt import AgentPrompt
+from ragstream.orchestration.llm_client import LLMClient
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+JsonDict = dict[str, Any]
+
+
+class MemoryActiveRetrievalBriefBuilder:
+    def __init__(
+        self,
+        *,
+        runtime_config: JsonDict | None = None,
+        agent_factory: AgentFactory | None = None,
+        llm_client: LLMClient | None = None,
+    ) -> None:
+        self.runtime_config = runtime_config if isinstance(runtime_config, dict) else self._load_runtime_config()
+
+        cfg = self.runtime_config.get("memory_active_retrieval_brief", {}) or {}
+        reducer_cfg = cfg.get("reducer", {}) or {}
+        llm_cfg = cfg.get("llm", {}) or {}
+        gate_cfg = cfg.get("activebrief_relevance_gate", {}) or {}
+
+        self.target_brief_tokens = int(llm_cfg.get("target_brief_tokens", 700))
+        self.prompt_cache_key = str(
+            llm_cfg.get("prompt_cache_key", "memory_activebrief_qa_summarizer")
+        )
+
+        self.agent_id = str(
+            llm_cfg.get("agent_id", "memory_activebrief_qa_summarizer")
+        )
+        self.init_agent_version = str(
+            llm_cfg.get(
+                "init_agent_version",
+                "memory_activebrief_qa_summarizer_init_001",
+            )
+        )
+        self.update_agent_version = str(
+            llm_cfg.get(
+                "update_agent_version",
+                "memory_activebrief_qa_summarizer_update_001",
+            )
+        )
+
+        embedding_model = str(reducer_cfg.get("embedding_model", "text-embedding-3-small"))
+        window_size_sentences = int(reducer_cfg.get("window_size_sentences", 3))
+        window_overlap_sentences = int(reducer_cfg.get("window_overlap_sentences", 1))
+
+        self.relevance_gate_enabled = bool(gate_cfg.get("enabled", True))
+
+        self.reducer = MemorySentenceReducer(
+            max_tokens_total=int(reducer_cfg.get("max_tokens_total", 3000)),
+            question_max_tokens=int(reducer_cfg.get("question_max_tokens", 1000)),
+            window_size_sentences=window_size_sentences,
+            window_overlap_sentences=window_overlap_sentences,
+            redundancy_threshold=float(reducer_cfg.get("redundancy_threshold", 0.92)),
+            embedding_model=embedding_model,
+        )
+
+        self.relevance_gate = MemoryActiveBriefRelevanceGate(
+            embedding_model=embedding_model,
+            window_size_sentences=window_size_sentences,
+            window_overlap_sentences=window_overlap_sentences,
+            activebrief_threshold=float(gate_cfg.get("activebrief_threshold", 0.25)),
+            pending_topic_threshold=float(gate_cfg.get("pending_topic_threshold", 0.25)),
+        )
+
+        self.agent_factory = agent_factory or AgentFactory()
+        self.llm_client = llm_client or LLMClient()
+
+    def build_for_record(
+        self,
+        *,
+        record: MemoryRecord,
+        previous_records: list[MemoryRecord],
+        pending_topic_buffer: dict[str, Any] | None = None,
+    ) -> JsonDict:
+        if record is None:
+            raise ValueError("MemoryActiveRetrievalBriefBuilder.build_for_record: record is None")
+
+        pending_topic_buffer = pending_topic_buffer if isinstance(pending_topic_buffer, dict) else {}
+
+        previous_brief_info = self._find_previous_clean_brief(previous_records)
+
+        reduced_qa = self.reducer.reduce_with_centroid(
+            input_text=record.input_text,
+            output_text=record.output_text,
+        )
+
+        logger_dev(
+            "ActiveBrief current raw Q/A\n"
+            + json.dumps(
+                {
+                    "record_id": record.record_id,
+                    "input_text": record.input_text,
+                    "output_text": record.output_text,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        logger_dev(
+            "ActiveBrief reduced Q/A after deterministic reduction\n"
+            + json.dumps(
+                {
+                    "record_id": record.record_id,
+                    "reduced_question": reduced_qa.reduced_question,
+                    "reduced_answer": reduced_qa.reduced_answer,
+                    "question_vector_count": len(reduced_qa.question_vectors),
+                    "answer_vector_count": len(reduced_qa.answer_vectors),
+                    "diagnostics": reduced_qa.diagnostics,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        logger_dev(
+            "ActiveBrief previous clean brief and pending-topic state\n"
+            + json.dumps(
+                {
+                    "previous_brief_info": previous_brief_info,
+                    "pending_topic_buffer": self._pending_buffer_log_view(pending_topic_buffer),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        if previous_brief_info["previous_active_retrieval_brief"]:
+            return self._handle_update_or_skip(
+                record=record,
+                reduced_qa=reduced_qa,
+                previous_brief_info=previous_brief_info,
+                pending_topic_buffer=pending_topic_buffer,
+            )
+
+        result = self._run_init_agent(
+            record=record,
+            reduced_qa=reduced_qa,
+            call_name="Memory ActiveBrief Init",
+        )
+        contributor_ids = [record.record_id]
+        active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
+
+        logger_dev(
+            "ActiveBrief new LLM result\n"
+            + json.dumps(
+                {
+                    "record_id": record.record_id,
+                    "route": "init_no_previous_activebrief",
+                    "active_retrieval_brief": active_brief,
+                    "active_retrieval_brief_contributor_ids": contributor_ids,
+                    "pending_topic_buffer_after": {},
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "active_retrieval_brief": active_brief,
+            "active_retrieval_brief_contributor_ids": contributor_ids,
+            "reduced_qa_diagnostics": reduced_qa.diagnostics,
+            "activebrief_llm_skipped": False,
+            "activebrief_gate_route": "init_no_previous_activebrief",
+            "pending_activebrief_topic_buffer": {},
+        }
+
+    def _handle_update_or_skip(
+        self,
+        *,
+        record: MemoryRecord,
+        reduced_qa: ReducedQA,
+        previous_brief_info: JsonDict,
+        pending_topic_buffer: dict[str, Any],
+    ) -> JsonDict:
+        previous_brief = str(previous_brief_info["previous_active_retrieval_brief"])
+        previous_contributor_ids = list(previous_brief_info.get("contributor_ids") or [])
+
+        if not self.relevance_gate_enabled:
+            result = self._run_update_agent(
+                record=record,
+                reduced_qa=reduced_qa,
+                previous_brief=previous_brief,
+                call_name="Memory ActiveBrief Update",
+            )
+            contributor_ids = self._merge_contributor_ids(previous_contributor_ids, [record.record_id])
+            active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
+
+            return {
+                "active_retrieval_brief": active_brief,
+                "active_retrieval_brief_contributor_ids": contributor_ids,
+                "reduced_qa_diagnostics": reduced_qa.diagnostics,
+                "activebrief_llm_skipped": False,
+                "activebrief_gate_route": "gate_disabled",
+                "pending_activebrief_topic_buffer": {},
+            }
+
+        gate_result = self.relevance_gate.evaluate(
+            record_id=record.record_id,
+            previous_active_retrieval_brief=previous_brief,
+            question_vectors=reduced_qa.question_vectors,
+            answer_vectors=reduced_qa.answer_vectors,
+            pending_topic_buffer=pending_topic_buffer,
+        )
+
+        if gate_result.route == "activebrief_update":
+            result = self._run_update_agent(
+                record=record,
+                reduced_qa=reduced_qa,
+                previous_brief=previous_brief,
+                call_name="Memory ActiveBrief Update",
+            )
+            contributor_ids = self._merge_contributor_ids(previous_contributor_ids, [record.record_id])
+            active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
+
+            logger_dev(
+                "ActiveBrief update accepted by relevance gate\n"
+                + json.dumps(
+                    {
+                        "record_id": record.record_id,
+                        "route": gate_result.route,
+                        "reason": gate_result.reason,
+                        "active_retrieval_brief_contributor_ids": contributor_ids,
+                        "pending_topic_buffer_after": {},
+                        "gate_diagnostics": gate_result.diagnostics,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
+
+            return {
+                "active_retrieval_brief": active_brief,
+                "active_retrieval_brief_contributor_ids": contributor_ids,
+                "reduced_qa_diagnostics": reduced_qa.diagnostics,
+                "activebrief_relevance_gate": gate_result.diagnostics,
+                "activebrief_llm_skipped": False,
+                "activebrief_gate_route": gate_result.route,
+                "pending_activebrief_topic_buffer": {},
+            }
+
+        if gate_result.route == "pending_topic_shift":
+            combined_reduced_qa = self._combine_pending_and_current_reduced_qa(
+                pending_topic_buffer=pending_topic_buffer,
+                current_reduced_qa=reduced_qa,
+            )
+
+            result = self._run_update_agent(
+                record=record,
+                reduced_qa=combined_reduced_qa,
+                previous_brief=previous_brief,
+                call_name="Memory ActiveBrief Topic Shift",
+            )
+
+            pending_record_id = str(pending_topic_buffer.get("record_id", "") or "")
+            contributor_ids = self._merge_contributor_ids(
+                previous_contributor_ids,
+                [pending_record_id, record.record_id],
+            )
+            active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
+
+            logger_dev(
+                "ActiveBrief topic shift confirmed by pending-topic gate\n"
+                + json.dumps(
+                    {
+                        "record_id": record.record_id,
+                        "pending_record_id": pending_record_id,
+                        "route": gate_result.route,
+                        "reason": gate_result.reason,
+                        "active_retrieval_brief": active_brief,
+                        "active_retrieval_brief_contributor_ids": contributor_ids,
+                        "pending_topic_buffer_after": {},
+                        "gate_diagnostics": gate_result.diagnostics,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
+
+            return {
+                "active_retrieval_brief": active_brief,
+                "active_retrieval_brief_contributor_ids": contributor_ids,
+                "reduced_qa_diagnostics": reduced_qa.diagnostics,
+                "activebrief_relevance_gate": gate_result.diagnostics,
+                "activebrief_llm_skipped": False,
+                "activebrief_gate_route": gate_result.route,
+                "pending_activebrief_topic_buffer": {},
+            }
+
+        new_pending_buffer = self.relevance_gate.build_pending_topic_buffer(
+            record_id=record.record_id,
+            created_at_utc=record.created_at_utc,
+            reduced_question=reduced_qa.reduced_question,
+            reduced_answer=reduced_qa.reduced_answer,
+            question_vectors=reduced_qa.question_vectors,
+            answer_vectors=reduced_qa.answer_vectors,
+        )
+
+        logger_dev(
+            "ActiveBrief update skipped by relevance gate\n"
+            + json.dumps(
+                {
+                    "record_id": record.record_id,
+                    "route": gate_result.route,
+                    "reason": gate_result.reason,
+                    "copied_previous_brief_record_id": previous_brief_info.get("record_id", ""),
+                    "active_retrieval_brief": previous_brief,
+                    "active_retrieval_brief_contributor_ids": previous_contributor_ids,
+                    "pending_topic_buffer_after": self._pending_buffer_log_view(new_pending_buffer),
+                    "gate_diagnostics": gate_result.diagnostics,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "active_retrieval_brief": previous_brief,
+            "active_retrieval_brief_contributor_ids": previous_contributor_ids,
+            "reduced_qa_diagnostics": reduced_qa.diagnostics,
+            "activebrief_relevance_gate": gate_result.diagnostics,
+            "activebrief_llm_skipped": True,
+            "activebrief_gate_route": gate_result.route,
+            "pending_activebrief_topic_buffer": new_pending_buffer,
+        }
+
+    def _run_init_agent(
+        self,
+        *,
+        record: MemoryRecord,
+        reduced_qa: ReducedQA,
+        call_name: str,
+    ) -> JsonDict:
+        agent_prompt = self.agent_factory.get_agent(
+            self.agent_id,
+            self.init_agent_version,
+        )
+
+        payload = self._compose_init_payload(
+            record=record,
+            reduced_qa=reduced_qa,
+        )
+
+        return self._run_agent_call(
+            call_name=call_name,
+            agent_prompt=agent_prompt,
+            input_payload=payload,
+        )
+
+    def _run_update_agent(
+        self,
+        *,
+        record: MemoryRecord,
+        reduced_qa: ReducedQA,
+        previous_brief: str,
+        call_name: str,
+    ) -> JsonDict:
+        agent_prompt = self.agent_factory.get_agent(
+            self.agent_id,
+            self.update_agent_version,
+        )
+
+        payload = self._compose_update_payload(
+            record=record,
+            reduced_qa=reduced_qa,
+            previous_brief=previous_brief,
+        )
+
+        return self._run_agent_call(
+            call_name=call_name,
+            agent_prompt=agent_prompt,
+            input_payload=payload,
+        )
+
+    def _compose_init_payload(
+        self,
+        *,
+        record: MemoryRecord,
+        reduced_qa: ReducedQA,
+    ) -> JsonDict:
+        return {
+            "reduced_question": reduced_qa.reduced_question,
+            "reduced_answer": reduced_qa.reduced_answer,
+            "memory_record_metadata": self._build_metadata_text(record),
+            "required_output": self._build_required_output_text(),
+        }
+
+    def _compose_update_payload(
+        self,
+        *,
+        record: MemoryRecord,
+        reduced_qa: ReducedQA,
+        previous_brief: str,
+    ) -> JsonDict:
+        return {
+            "previous_active_retrieval_brief": previous_brief,
+            "reduced_question": reduced_qa.reduced_question,
+            "reduced_answer": reduced_qa.reduced_answer,
+            "memory_record_metadata": self._build_metadata_text(record),
+            "required_output": self._build_required_output_text(),
+        }
+
+    def _run_agent_call(
+        self,
+        *,
+        call_name: str,
+        agent_prompt: AgentPrompt,
+        input_payload: JsonDict,
+    ) -> JsonDict:
+        messages, response_format = agent_prompt.compose(input_payload=input_payload)
+
+        logger_dev(
+            f"{call_name} LLM prompt payload\n"
+            + json.dumps(input_payload, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        logger_dev(
+            f"{call_name} LLM messages\n"
+            + json.dumps(messages, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        response = self.llm_client.responses(
+            messages=messages,
+            model_name=agent_prompt.model_name,
+            max_output_tokens=agent_prompt.max_output_tokens,
+            reasoning_effort="minimal",
+            return_metadata=True,
+            prompt_cache_key=self.prompt_cache_key,
+        )
+
+        raw_content = str(response.get("content", "") or "")
+        usage = response.get("usage", {}) or {}
+
+        logger_dev(
+            f"{call_name} LLM raw response\n"
+            + json.dumps(
+                {
+                    "content": raw_content,
+                    "usage": usage,
+                    "model_name": response.get("model_name", ""),
+                    "status": response.get("status", ""),
+                    "incomplete_reason": response.get("incomplete_reason", ""),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        parsed = agent_prompt.parse(raw_content)
+
+        logger_dev(
+            f"{call_name} parsed result\n"
+            + json.dumps(parsed, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return parsed
+
+    def _combine_pending_and_current_reduced_qa(
+        self,
+        *,
+        pending_topic_buffer: dict[str, Any],
+        current_reduced_qa: ReducedQA,
+    ) -> ReducedQA:
+        """
+        Topic-shift LLM payload.
+
+        When the current Q/A is not related to the old ActiveBrief but is related
+        to the previously skipped Q/A, we create a new ActiveBrief from both:
+        - the previous pending Q/A
+        - the current Q/A
+
+        This prevents the first skipped item of the new theme from being lost.
+        """
+        pending_question = str(pending_topic_buffer.get("reduced_question", "") or "").strip()
+        pending_answer = str(pending_topic_buffer.get("reduced_answer", "") or "").strip()
+
+        combined_question_parts = []
+        if pending_question:
+            combined_question_parts.append("[Pending skipped Q/A question]\n" + pending_question)
+        if current_reduced_qa.reduced_question:
+            combined_question_parts.append("[Current Q/A question]\n" + current_reduced_qa.reduced_question)
+
+        combined_answer_parts = []
+        if pending_answer:
+            combined_answer_parts.append("[Pending skipped Q/A answer]\n" + pending_answer)
+        if current_reduced_qa.reduced_answer:
+            combined_answer_parts.append("[Current Q/A answer]\n" + current_reduced_qa.reduced_answer)
+
+        return ReducedQA(
+            reduced_question="\n\n".join(combined_question_parts).strip(),
+            reduced_answer="\n\n".join(combined_answer_parts).strip(),
+            question_vectors=[],
+            answer_vectors=[],
+            diagnostics={
+                "mode": "topic_shift_combined_pending_and_current",
+                "pending_record_id": str(pending_topic_buffer.get("record_id", "") or ""),
+                "current_question_vector_count": len(current_reduced_qa.question_vectors),
+                "current_answer_vector_count": len(current_reduced_qa.answer_vectors),
+            },
+        )
+
+    def _find_previous_clean_brief(
+        self,
+        previous_records: list[MemoryRecord],
+    ) -> JsonDict:
+        records = list(previous_records or [])
+        black_ids = {
+            record.record_id
+            for record in records
+            if str(getattr(record, "tag", "") or "").strip() == "Black"
+        }
+
+        for record in reversed(records):
+            if str(getattr(record, "tag", "") or "").strip() == "Black":
+                continue
+
+            brief = str(getattr(record, "active_retrieval_brief", "") or "").strip()
+            if not brief:
+                continue
+
+            contributor_ids = list(
+                getattr(record, "active_retrieval_brief_contributor_ids", []) or []
+            )
+
+            if any(contributor_id in black_ids for contributor_id in contributor_ids):
+                continue
+
+            return {
+                "record_id": record.record_id,
+                "previous_active_retrieval_brief": brief,
+                "contributor_ids": contributor_ids or [record.record_id],
+            }
+
+        return {
+            "record_id": "",
+            "previous_active_retrieval_brief": "",
+            "contributor_ids": [],
+        }
+
+    def _build_metadata_text(
+        self,
+        record: MemoryRecord,
+    ) -> str:
+        data = {
+            "record_id": record.record_id,
+            "parent_id": record.parent_id,
+            "created_at_utc": record.created_at_utc,
+            "source": record.source,
+            "tag": record.tag,
+            "retrieval_source_mode": record.retrieval_source_mode,
+            "active_project_name": record.active_project_name,
+            "auto_keywords": record.auto_keywords,
+            "user_keywords": record.user_keywords,
+            "embedded_files_snapshot": record.embedded_files_snapshot,
+        }
+
+        return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+    def _build_required_output_text(self) -> str:
+        return (
+            "{\n"
+            '  "active_retrieval_brief": "one compact query-independent Current Working Conversation brief"\n'
+            "}\n\n"
+            f"Keep active_retrieval_brief at or below about {self.target_brief_tokens} tokens."
+        )
+
+    @staticmethod
+    def _merge_contributor_ids(
+        old_ids: list[str],
+        new_ids: list[str],
+    ) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+
+        for value in list(old_ids or []) + list(new_ids or []):
+            item = str(value or "").strip()
+            if not item:
+                continue
+
+            if item in seen:
+                continue
+
+            result.append(item)
+            seen.add(item)
+
+        return result
+
+    @staticmethod
+    def _pending_buffer_log_view(buffer: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(buffer, dict) or not buffer:
+            return {}
+
+        return {
+            "record_id": str(buffer.get("record_id", "") or ""),
+            "created_at_utc": str(buffer.get("created_at_utc", "") or ""),
+            "question_vector_count": len(buffer.get("question_vectors", []) or []),
+            "answer_vector_count": len(buffer.get("answer_vectors", []) or []),
+            "vector_count": int(buffer.get("vector_count", 0) or 0),
+            "has_center_vector": bool(buffer.get("center_vector", [])),
+            "reduced_question_preview": str(buffer.get("reduced_question", "") or "")[:500],
+            "reduced_answer_preview": str(buffer.get("reduced_answer", "") or "")[:500],
+        }
+
+    @staticmethod
+    def _load_runtime_config() -> JsonDict:
+        root = Path(__file__).resolve().parents[3]
+        path = root / "ragstream" / "config" / "runtime_config.json"
+
+        if not path.exists():
+            return {}
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+```
+
+### ~\ragstream\memory\compression\memory_activebrief_relevance_gate.py
+```python
+# ragstream/memory/compression/memory_activebrief_relevance_gate.py
+# -*- coding: utf-8 -*-
+"""
+MemoryActiveBriefRelevanceGate
+==============================
+
+Non-LLM gate before ActiveBrief update.
+
+Purpose:
+- Avoid sending unrelated Q/A pairs to the ActiveBrief LLM updater.
+- Still save every MemoryRecord normally.
+- If a Q/A is not worthy, copy the previous ActiveBrief into the new record.
+- If a new topic becomes stable, allow it to replace/update the ActiveBrief.
+
+Current logic:
+1. Compare new Q/A vectors to the center of the current ActiveBrief.
+2. If Q/A top-score mean passes activebrief_threshold:
+   -> normal ActiveBrief update.
+3. If it fails, compare new Q/A vectors to the center of the previous skipped Q/A.
+4. If Q/A top-score mean passes pending_topic_threshold:
+   -> topic shift confirmed, call LLM using the pending Q/A + current Q/A.
+5. If both fail:
+   -> skip LLM, copy previous ActiveBrief, update pending-topic buffer.
+
+Important:
+- No ActiveBrief weak-tail / 80% logic remains here.
+- The gate uses fixed development thresholds from runtime_config.
+- The gate logs only scores and summaries, not full vectors.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+
+from dataclasses import dataclass
+from typing import Any
+
+from ragstream.ingestion.embedder import Embedder
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+Vector = list[float]
+
+
+@dataclass
+class RelevanceGateResult:
+    should_update_activebrief: bool
+    route: str
+    reason: str
+    activebrief_top_mean: float
+    pending_topic_top_mean: float
+    diagnostics: dict[str, Any]
+
+
+class MemoryActiveBriefRelevanceGate:
+    def __init__(
+        self,
+        *,
+        embedding_model: str = "text-embedding-3-small",
+        window_size_sentences: int = 3,
+        window_overlap_sentences: int = 1,
+        activebrief_threshold: float = 0.25,
+        pending_topic_threshold: float = 0.25,
+    ) -> None:
+        self.embedding_model = str(embedding_model)
+        self.window_size_sentences = int(window_size_sentences)
+        self.window_overlap_sentences = int(window_overlap_sentences)
+        self.activebrief_threshold = float(activebrief_threshold)
+        self.pending_topic_threshold = float(pending_topic_threshold)
+
+        self._embedder = Embedder(model=self.embedding_model)
+
+    def evaluate(
+        self,
+        *,
+        record_id: str,
+        previous_active_retrieval_brief: str,
+        question_vectors: list[Vector],
+        answer_vectors: list[Vector],
+        pending_topic_buffer: dict[str, Any] | None = None,
+    ) -> RelevanceGateResult:
+        """
+        Decide whether the current Q/A should update ActiveBrief.
+
+        Q/A vectors are reused from MemorySentenceReducer.
+        The only new embedding cost here is the previous ActiveBrief text.
+        """
+        previous_brief = str(previous_active_retrieval_brief or "").strip()
+        pending_topic_buffer = pending_topic_buffer if isinstance(pending_topic_buffer, dict) else {}
+
+        qa_vectors = list(question_vectors or []) + list(answer_vectors or [])
+
+        if not previous_brief:
+            return self._log_and_return(
+                record_id=record_id,
+                result=RelevanceGateResult(
+                    should_update_activebrief=True,
+                    route="init_no_previous_activebrief",
+                    reason="no_previous_activebrief",
+                    activebrief_top_mean=0.0,
+                    pending_topic_top_mean=0.0,
+                    diagnostics={
+                        "record_id": record_id,
+                        "decision": "pass",
+                        "route": "init_no_previous_activebrief",
+                        "reason": "no_previous_activebrief",
+                    },
+                ),
+            )
+
+        if not qa_vectors:
+            return self._log_and_return(
+                record_id=record_id,
+                result=RelevanceGateResult(
+                    should_update_activebrief=False,
+                    route="skip_no_qa_vectors",
+                    reason="no_qa_vectors",
+                    activebrief_top_mean=0.0,
+                    pending_topic_top_mean=0.0,
+                    diagnostics={
+                        "record_id": record_id,
+                        "decision": "skip",
+                        "route": "skip_no_qa_vectors",
+                        "reason": "no_qa_vectors",
+                    },
+                ),
+            )
+
+        activebrief_center = self._build_activebrief_center(previous_brief)
+
+        if not activebrief_center:
+            # Safe pass:
+            # If the ActiveBrief reference space cannot be built,
+            # do not risk blocking an update.
+            return self._log_and_return(
+                record_id=record_id,
+                result=RelevanceGateResult(
+                    should_update_activebrief=True,
+                    route="activebrief_safe_pass",
+                    reason="no_activebrief_center_safe_pass",
+                    activebrief_top_mean=0.0,
+                    pending_topic_top_mean=0.0,
+                    diagnostics={
+                        "record_id": record_id,
+                        "decision": "pass",
+                        "route": "activebrief_safe_pass",
+                        "reason": "no_activebrief_center_safe_pass",
+                    },
+                ),
+            )
+
+        activebrief_eval = self._evaluate_against_center(
+            center_vector=activebrief_center,
+            question_vectors=question_vectors,
+            answer_vectors=answer_vectors,
+        )
+
+        if activebrief_eval["qa_top_mean"] >= self.activebrief_threshold:
+            diagnostics = {
+                "record_id": record_id,
+                "decision": "pass",
+                "route": "activebrief_update",
+                "reason": "qa_top_mean_passed_activebrief_threshold",
+                "embedding_model": self.embedding_model,
+                "activebrief_threshold": self.activebrief_threshold,
+                "pending_topic_threshold": self.pending_topic_threshold,
+                "activebrief_comparison": activebrief_eval,
+                "pending_topic_comparison": {},
+            }
+
+            return self._log_and_return(
+                record_id=record_id,
+                result=RelevanceGateResult(
+                    should_update_activebrief=True,
+                    route="activebrief_update",
+                    reason="qa_top_mean_passed_activebrief_threshold",
+                    activebrief_top_mean=float(activebrief_eval["qa_top_mean"]),
+                    pending_topic_top_mean=0.0,
+                    diagnostics=diagnostics,
+                ),
+            )
+
+        pending_center = self._extract_pending_center(pending_topic_buffer)
+
+        pending_eval: dict[str, Any] = {}
+        if pending_center:
+            pending_eval = self._evaluate_against_center(
+                center_vector=pending_center,
+                question_vectors=question_vectors,
+                answer_vectors=answer_vectors,
+            )
+
+            if pending_eval["qa_top_mean"] >= self.pending_topic_threshold:
+                diagnostics = {
+                    "record_id": record_id,
+                    "decision": "pass",
+                    "route": "pending_topic_shift",
+                    "reason": "qa_top_mean_passed_pending_topic_threshold",
+                    "embedding_model": self.embedding_model,
+                    "activebrief_threshold": self.activebrief_threshold,
+                    "pending_topic_threshold": self.pending_topic_threshold,
+                    "pending_topic_record_id": str(pending_topic_buffer.get("record_id", "") or ""),
+                    "activebrief_comparison": activebrief_eval,
+                    "pending_topic_comparison": pending_eval,
+                }
+
+                return self._log_and_return(
+                    record_id=record_id,
+                    result=RelevanceGateResult(
+                        should_update_activebrief=True,
+                        route="pending_topic_shift",
+                        reason="qa_top_mean_passed_pending_topic_threshold",
+                        activebrief_top_mean=float(activebrief_eval["qa_top_mean"]),
+                        pending_topic_top_mean=float(pending_eval["qa_top_mean"]),
+                        diagnostics=diagnostics,
+                    ),
+                )
+
+        diagnostics = {
+            "record_id": record_id,
+            "decision": "skip",
+            "route": "skip_and_update_pending_topic",
+            "reason": "qa_failed_activebrief_and_pending_topic_thresholds",
+            "embedding_model": self.embedding_model,
+            "activebrief_threshold": self.activebrief_threshold,
+            "pending_topic_threshold": self.pending_topic_threshold,
+            "pending_topic_record_id": str(pending_topic_buffer.get("record_id", "") or ""),
+            "activebrief_comparison": activebrief_eval,
+            "pending_topic_comparison": pending_eval,
+        }
+
+        return self._log_and_return(
+            record_id=record_id,
+            result=RelevanceGateResult(
+                should_update_activebrief=False,
+                route="skip_and_update_pending_topic",
+                reason="qa_failed_activebrief_and_pending_topic_thresholds",
+                activebrief_top_mean=float(activebrief_eval["qa_top_mean"]),
+                pending_topic_top_mean=float(pending_eval.get("qa_top_mean", 0.0) or 0.0),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def build_pending_topic_buffer(
+        self,
+        *,
+        record_id: str,
+        created_at_utc: str,
+        reduced_question: str,
+        reduced_answer: str,
+        question_vectors: list[Vector],
+        answer_vectors: list[Vector],
+    ) -> dict[str, Any]:
+        """
+        Build the RAM-only pending-topic buffer.
+
+        This buffer is not persisted into .ragmem or SQLite.
+        It exists only to detect a possible topic shift:
+        first skipped Q/A creates the buffer;
+        next skipped Q/A is compared against this buffer.
+        """
+        qa_vectors = list(question_vectors or []) + list(answer_vectors or [])
+        center_vector = self._centroid(qa_vectors)
+
+        buffer = {
+            "record_id": str(record_id or ""),
+            "created_at_utc": str(created_at_utc or ""),
+            "reduced_question": str(reduced_question or ""),
+            "reduced_answer": str(reduced_answer or ""),
+            "question_vectors": list(question_vectors or []),
+            "answer_vectors": list(answer_vectors or []),
+            "center_vector": center_vector,
+            "vector_count": len(qa_vectors),
+        }
+
+        logger_dev(
+            "ActiveBrief pending-topic buffer updated\n"
+            + json.dumps(
+                {
+                    "record_id": buffer["record_id"],
+                    "created_at_utc": buffer["created_at_utc"],
+                    "question_vector_count": len(buffer["question_vectors"]),
+                    "answer_vector_count": len(buffer["answer_vectors"]),
+                    "vector_count": buffer["vector_count"],
+                    "has_center_vector": bool(buffer["center_vector"]),
+                    "reduced_question_preview": buffer["reduced_question"][:500],
+                    "reduced_answer_preview": buffer["reduced_answer"][:500],
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return buffer
+
+    def _build_activebrief_center(self, previous_brief: str) -> Vector:
+        activebrief_windows = self._build_sentence_windows(previous_brief)
+        activebrief_texts = [item["text"] for item in activebrief_windows]
+        activebrief_vectors = self._embed_texts(activebrief_texts)
+        return self._centroid(activebrief_vectors)
+
+    def _evaluate_against_center(
+        self,
+        *,
+        center_vector: Vector,
+        question_vectors: list[Vector],
+        answer_vectors: list[Vector],
+    ) -> dict[str, Any]:
+        """
+        Score Q/A vectors against a reference center.
+
+        Used twice:
+        - Q/A against current ActiveBrief center
+        - Q/A against pending skipped-topic center
+        """
+        question_scores = [
+            self._cosine(vector, center_vector)
+            for vector in question_vectors or []
+        ]
+        answer_scores = [
+            self._cosine(vector, center_vector)
+            for vector in answer_vectors or []
+        ]
+        qa_scores = question_scores + answer_scores
+        qa_scores_sorted = sorted(qa_scores, reverse=True)
+
+        top_count = self._select_count(len(qa_scores_sorted))
+        top_scores = qa_scores_sorted[:top_count]
+        top_mean = self._mean(top_scores)
+
+        return {
+            "qa_vector_count": len(qa_scores),
+            "question_vector_count": len(question_scores),
+            "answer_vector_count": len(answer_scores),
+            "qa_top_count": top_count,
+            "qa_top_mean": top_mean,
+            "qa_top_scores": self._round_list(top_scores),
+            "qa_all_scores_best_to_worst": self._round_list(qa_scores_sorted),
+            "qa_score_summary": self._score_summary(qa_scores),
+            "question_score_summary": self._score_summary(question_scores),
+            "answer_score_summary": self._score_summary(answer_scores),
+        }
+
+    @staticmethod
+    def _select_count(n: int) -> int:
+        """
+        Stable 20% top-score selection rule.
+
+        For small texts, pure percentage is unstable:
+        - <= 4 vectors: use all
+        - 5..20 vectors: use top 4
+        - > 20 vectors: use floor(n / 5)
+        """
+        n = int(n)
+        if n <= 0:
+            return 0
+        if n <= 4:
+            return n
+        if n <= 20:
+            return 4
+        return max(1, n // 5)
+
+    @staticmethod
+    def _extract_pending_center(pending_topic_buffer: dict[str, Any]) -> Vector:
+        center = pending_topic_buffer.get("center_vector", [])
+        if not isinstance(center, list):
+            return []
+        return [float(value) for value in center]
+
+    def _build_sentence_windows(self, text: str) -> list[dict[str, Any]]:
+        sentences = self._split_sentences(text)
+
+        if not sentences:
+            return []
+
+        window_size = max(1, self.window_size_sentences)
+        overlap = max(0, min(self.window_overlap_sentences, window_size - 1))
+        step = max(1, window_size - overlap)
+
+        windows: list[dict[str, Any]] = []
+
+        start = 0
+        while start < len(sentences):
+            end = min(len(sentences), start + window_size)
+            indexes = list(range(start, end))
+            window_text = " ".join(sentences[start:end]).strip()
+
+            if window_text:
+                windows.append(
+                    {
+                        "text": window_text,
+                        "sentence_indexes": indexes,
+                    }
+                )
+
+            if end >= len(sentences):
+                break
+
+            start += step
+
+        return windows
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        clean = str(text or "").strip()
+        if not clean:
+            return []
+
+        clean = re.sub(r"\n{2,}", "\n", clean)
+        rough_parts = re.split(r"(?<=[.!?])\s+|\n+", clean)
+
+        sentences: list[str] = []
+        for part in rough_parts:
+            item = str(part or "").strip()
+            if item:
+                sentences.append(item)
+
+        if not sentences and clean:
+            sentences.append(clean)
+
+        return sentences
+
+    def _embed_texts(self, texts: list[str]) -> list[Vector]:
+        clean_texts = [str(text or "").strip() for text in texts]
+        clean_texts = [text for text in clean_texts if text]
+
+        if not clean_texts:
+            return []
+
+        vectors = self._embedder.embed(clean_texts)
+        return [list(vector) for vector in vectors]
+
+    @staticmethod
+    def _centroid(vectors: list[Vector]) -> Vector:
+        if not vectors:
+            return []
+
+        dim = len(vectors[0])
+        if dim <= 0:
+            return []
+
+        sums = [0.0 for _ in range(dim)]
+        count = 0
+
+        for vector in vectors:
+            if len(vector) != dim:
+                continue
+
+            for i, value in enumerate(vector):
+                sums[i] += float(value)
+
+            count += 1
+
+        if count <= 0:
+            return []
+
+        return [value / float(count) for value in sums]
+
+    @staticmethod
+    def _cosine(a: Vector, b: Vector) -> float:
+        if not a or not b or len(a) != len(b):
+            return 0.0
+
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+
+        for x, y in zip(a, b):
+            fx = float(x)
+            fy = float(y)
+            dot += fx * fy
+            norm_a += fx * fx
+            norm_b += fy * fy
+
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return 0.0
+
+        return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+    @staticmethod
+    def _mean(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        return float(sum(float(value) for value in values) / len(values))
+
+    @staticmethod
+    def _round_list(values: list[float]) -> list[float]:
+        return [round(float(value), 6) for value in values]
+
+    def _score_summary(self, values: list[float]) -> dict[str, Any]:
+        if not values:
+            return {
+                "count": 0,
+                "min": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
+            }
+
+        return {
+            "count": len(values),
+            "min": round(min(values), 6),
+            "max": round(max(values), 6),
+            "mean": round(self._mean(values), 6),
+        }
+
+    def _log_and_return(
+        self,
+        *,
+        record_id: str,
+        result: RelevanceGateResult,
+    ) -> RelevanceGateResult:
+        logger_dev(
+            "ActiveBrief relevance gate decision\n"
+            + json.dumps(
+                {
+                    "record_id": record_id,
+                    "should_update_activebrief": result.should_update_activebrief,
+                    "route": result.route,
+                    "reason": result.reason,
+                    "activebrief_top_mean": result.activebrief_top_mean,
+                    "pending_topic_top_mean": result.pending_topic_top_mean,
+                    "diagnostics": result.diagnostics,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+        return result
+```
+
+### ~\ragstream\memory\compression\memory_sentence_reducer.py
+```python
+# ragstream/memory/compression/memory_sentence_reducer.py
+# -*- coding: utf-8 -*-
+"""
+MemorySentenceReducer
+=====================
+
+Shared deterministic Q/A reducer for memory compression.
+
+Current use:
+- ActiveRetrievalBrief creation uses centroid-anchor reduction.
+
+Future use:
+- Retrieval-time memory compression can use query-anchor reduction.
+
+Core idea:
+- split Q and A into sentence windows
+- always embed Q/A windows
+- score windows against an anchor vector
+- remove highly redundant windows
+- respect Q/A token budget
+- restore original sentence order
+
+Important:
+- The output keeps Q_vectors and A_vectors.
+- If no reduction happens, these vectors represent all Q/A windows.
+- If reduction happens, these vectors represent only surviving windows.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+
+from dataclasses import dataclass
+from typing import Any
+
+from ragstream.ingestion.embedder import Embedder
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+Vector = list[float]
+
+
+@dataclass
+class ReducedQA:
+    reduced_question: str
+    reduced_answer: str
+    question_vectors: list[Vector]
+    answer_vectors: list[Vector]
+    diagnostics: dict[str, Any]
+
+
+class MemorySentenceReducer:
+    def __init__(
+        self,
+        *,
+        max_tokens_total: int = 3000,
+        question_max_tokens: int = 1000,
+        window_size_sentences: int = 3,
+        window_overlap_sentences: int = 1,
+        redundancy_threshold: float = 0.92,
+        embedding_model: str = "text-embedding-3-small",
+    ) -> None:
+        self.max_tokens_total = int(max_tokens_total)
+        self.question_max_tokens = int(question_max_tokens)
+        self.window_size_sentences = int(window_size_sentences)
+        self.window_overlap_sentences = int(window_overlap_sentences)
+        self.redundancy_threshold = float(redundancy_threshold)
+        self.embedding_model = str(embedding_model)
+
+        self._embedder = Embedder(model=self.embedding_model)
+
+    def reduce_with_centroid(
+        self,
+        input_text: str,
+        output_text: str,
+    ) -> ReducedQA:
+        """
+        Query-independent reduction.
+
+        The anchor vector is the centroid of all Q/A sentence-window vectors.
+        Used for ActiveRetrievalBrief creation.
+        """
+        prepared = self._prepare_qa_windows_and_vectors(
+            input_text=input_text,
+            output_text=output_text,
+        )
+
+        all_vectors = prepared["question_vectors"] + prepared["answer_vectors"]
+
+        if not all_vectors:
+            return ReducedQA(
+                reduced_question="",
+                reduced_answer="",
+                question_vectors=[],
+                answer_vectors=[],
+                diagnostics={
+                    "mode": "centroid",
+                    "reason": "no_vectors",
+                },
+            )
+
+        anchor_vector = self._centroid(all_vectors)
+
+        return self._reduce_prepared(
+            input_text=input_text,
+            output_text=output_text,
+            question_windows=prepared["question_windows"],
+            answer_windows=prepared["answer_windows"],
+            question_vectors=prepared["question_vectors"],
+            answer_vectors=prepared["answer_vectors"],
+            anchor_vector=anchor_vector,
+            mode="centroid",
+        )
+
+    def reduce_with_anchor(
+        self,
+        input_text: str,
+        output_text: str,
+        anchor_vector: Vector,
+    ) -> ReducedQA:
+        """
+        Anchor-based reduction.
+
+        The anchor vector may be:
+        - centroid vector, for query-independent reduction
+        - query vector, for future retrieval-time compression
+        """
+        prepared = self._prepare_qa_windows_and_vectors(
+            input_text=input_text,
+            output_text=output_text,
+        )
+
+        return self._reduce_prepared(
+            input_text=input_text,
+            output_text=output_text,
+            question_windows=prepared["question_windows"],
+            answer_windows=prepared["answer_windows"],
+            question_vectors=prepared["question_vectors"],
+            answer_vectors=prepared["answer_vectors"],
+            anchor_vector=anchor_vector,
+            mode="external_anchor",
+        )
+
+    def _prepare_qa_windows_and_vectors(
+        self,
+        *,
+        input_text: str,
+        output_text: str,
+    ) -> dict[str, Any]:
+        """
+        Always vectorize Q and A windows.
+
+        Reason:
+        - Even if no deterministic reduction is needed, the vectors are useful
+          for the later ActiveBrief relevance gate.
+        - This avoids paying again to embed the same Q/A.
+        """
+        question_windows = self._build_sentence_windows(input_text)
+        answer_windows = self._build_sentence_windows(output_text)
+
+        question_vectors = self._embed_texts([item["text"] for item in question_windows])
+        answer_vectors = self._embed_texts([item["text"] for item in answer_windows])
+
+        return {
+            "question_windows": question_windows,
+            "answer_windows": answer_windows,
+            "question_vectors": question_vectors,
+            "answer_vectors": answer_vectors,
+        }
+
+    def _reduce_prepared(
+        self,
+        *,
+        input_text: str,
+        output_text: str,
+        question_windows: list[dict[str, Any]],
+        answer_windows: list[dict[str, Any]],
+        question_vectors: list[Vector],
+        answer_vectors: list[Vector],
+        anchor_vector: Vector,
+        mode: str,
+    ) -> ReducedQA:
+        input_tokens = self._count_tokens(input_text)
+        output_tokens = self._count_tokens(output_text)
+
+        q_budget, a_budget = self._allocate_qa_budget(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+        reduced_question, surviving_q_vectors, q_diag = self._reduce_side(
+            text=input_text,
+            windows=question_windows,
+            vectors=question_vectors,
+            anchor_vector=anchor_vector,
+            token_budget=q_budget,
+            side="question",
+        )
+
+        reduced_answer, surviving_a_vectors, a_diag = self._reduce_side(
+            text=output_text,
+            windows=answer_windows,
+            vectors=answer_vectors,
+            anchor_vector=anchor_vector,
+            token_budget=a_budget,
+            side="answer",
+        )
+
+        diagnostics = {
+            "mode": mode,
+            "embedding_model": self.embedding_model,
+            "max_tokens_total": self.max_tokens_total,
+            "question_max_tokens": self.question_max_tokens,
+            "input_tokens_estimated": input_tokens,
+            "output_tokens_estimated": output_tokens,
+            "question_budget": q_budget,
+            "answer_budget": a_budget,
+            "question_vector_count_before": len(question_vectors),
+            "answer_vector_count_before": len(answer_vectors),
+            "question_vector_count_after": len(surviving_q_vectors),
+            "answer_vector_count_after": len(surviving_a_vectors),
+            "question": q_diag,
+            "answer": a_diag,
+        }
+
+        logger_dev(
+            "MemorySentenceReducer result\n"
+            + self._safe_json_dump(
+                {
+                    "diagnostics": diagnostics,
+                    "reduced_question": reduced_question,
+                    "reduced_answer": reduced_answer,
+                }
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return ReducedQA(
+            reduced_question=reduced_question,
+            reduced_answer=reduced_answer,
+            question_vectors=surviving_q_vectors,
+            answer_vectors=surviving_a_vectors,
+            diagnostics=diagnostics,
+        )
+
+    def _allocate_qa_budget(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> tuple[int, int]:
+        total_tokens = max(1, int(input_tokens) + int(output_tokens))
+
+        proportional_q = round(self.max_tokens_total * (int(input_tokens) / total_tokens))
+        q_budget = min(int(proportional_q), self.question_max_tokens)
+
+        if input_tokens > 0 and q_budget <= 0:
+            q_budget = min(self.question_max_tokens, self.max_tokens_total)
+
+        a_budget = max(0, self.max_tokens_total - q_budget)
+
+        return q_budget, a_budget
+
+    def _reduce_side(
+        self,
+        *,
+        text: str,
+        windows: list[dict[str, Any]],
+        vectors: list[Vector],
+        anchor_vector: Vector,
+        token_budget: int,
+        side: str,
+    ) -> tuple[str, list[Vector], dict[str, Any]]:
+        clean_text = str(text or "").strip()
+        if not clean_text or token_budget <= 0:
+            return "", [], {
+                "side": side,
+                "reason": "empty_or_zero_budget",
+                "token_budget": token_budget,
+            }
+
+        original_tokens = self._count_tokens(clean_text)
+
+        if original_tokens <= token_budget:
+            # No reduction needed.
+            # Still return all vectors, because the relevance gate needs them.
+            return clean_text, list(vectors), {
+                "side": side,
+                "reason": "already_below_budget",
+                "original_tokens_estimated": original_tokens,
+                "token_budget": token_budget,
+                "window_count": len(windows),
+                "surviving_vector_count": len(vectors),
+            }
+
+        sentences = self._split_sentences(clean_text)
+
+        if not windows or not vectors:
+            return clean_text[: max(1, token_budget * 4)], [], {
+                "side": side,
+                "reason": "no_windows_or_vectors_fallback",
+                "original_tokens_estimated": original_tokens,
+                "token_budget": token_budget,
+            }
+
+        scored: list[dict[str, Any]] = []
+        max_count = min(len(windows), len(vectors))
+
+        for idx in range(max_count):
+            item = windows[idx]
+            vector = vectors[idx]
+
+            scored.append(
+                {
+                    "window_index": idx,
+                    "score": self._cosine(vector, anchor_vector),
+                    "text": item["text"],
+                    "sentence_indexes": item["sentence_indexes"],
+                    "vector": vector,
+                    "tokens": self._count_tokens(item["text"]),
+                }
+            )
+
+        scored.sort(key=lambda item: item["score"], reverse=True)
+
+        selected: list[dict[str, Any]] = []
+        selected_sentence_indexes: set[int] = set()
+        used_window_tokens = 0
+
+        for candidate in scored:
+            if used_window_tokens + int(candidate["tokens"]) > token_budget:
+                continue
+
+            if self._is_redundant(candidate["vector"], selected):
+                continue
+
+            selected.append(candidate)
+            used_window_tokens += int(candidate["tokens"])
+            selected_sentence_indexes.update(candidate["sentence_indexes"])
+
+        if not selected and scored:
+            first = scored[0]
+            selected.append(first)
+            selected_sentence_indexes.update(first["sentence_indexes"])
+
+        reduced_sentences: list[str] = []
+        used_tokens = 0
+
+        for sentence_index in sorted(selected_sentence_indexes):
+            if sentence_index < 0 or sentence_index >= len(sentences):
+                continue
+
+            sentence = sentences[sentence_index]
+            sentence_tokens = self._count_tokens(sentence)
+
+            if used_tokens + sentence_tokens > token_budget:
+                continue
+
+            reduced_sentences.append(sentence)
+            used_tokens += sentence_tokens
+
+        reduced_text = " ".join(reduced_sentences).strip()
+
+        if not reduced_text and selected:
+            # Last-resort fallback:
+            # If one sentence is longer than the budget, keep a bounded text slice.
+            reduced_text = str(selected[0].get("text", "") or "")[: max(1, token_budget * 4)].strip()
+
+        surviving_vectors = [list(item["vector"]) for item in selected]
+
+        return reduced_text, surviving_vectors, {
+            "side": side,
+            "reason": "reduced",
+            "original_tokens_estimated": original_tokens,
+            "token_budget": token_budget,
+            "window_count": len(windows),
+            "selected_window_count": len(selected),
+            "selected_sentence_count": len(reduced_sentences),
+            "surviving_vector_count": len(surviving_vectors),
+            "reduced_tokens_estimated": self._count_tokens(reduced_text),
+        }
+
+    def _is_redundant(
+        self,
+        candidate_vector: Vector,
+        selected: list[dict[str, Any]],
+    ) -> bool:
+        for item in selected:
+            existing_vector = item.get("vector") or []
+            if self._cosine(candidate_vector, existing_vector) >= self.redundancy_threshold:
+                return True
+        return False
+
+    def _build_sentence_windows(self, text: str) -> list[dict[str, Any]]:
+        sentences = self._split_sentences(text)
+        return self._build_windows_from_sentences(sentences)
+
+    def _build_windows_from_sentences(
+        self,
+        sentences: list[str],
+    ) -> list[dict[str, Any]]:
+        if not sentences:
+            return []
+
+        window_size = max(1, self.window_size_sentences)
+        overlap = max(0, min(self.window_overlap_sentences, window_size - 1))
+        step = max(1, window_size - overlap)
+
+        windows: list[dict[str, Any]] = []
+
+        start = 0
+        while start < len(sentences):
+            end = min(len(sentences), start + window_size)
+            indexes = list(range(start, end))
+            text = " ".join(sentences[start:end]).strip()
+
+            if text:
+                windows.append(
+                    {
+                        "text": text,
+                        "sentence_indexes": indexes,
+                    }
+                )
+
+            if end >= len(sentences):
+                break
+
+            start += step
+
+        return windows
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        clean = str(text or "").strip()
+        if not clean:
+            return []
+
+        clean = re.sub(r"\n{2,}", "\n", clean)
+        rough_parts = re.split(r"(?<=[.!?])\s+|\n+", clean)
+
+        sentences: list[str] = []
+        for part in rough_parts:
+            item = str(part or "").strip()
+            if item:
+                sentences.append(item)
+
+        if not sentences and clean:
+            sentences.append(clean)
+
+        return sentences
+
+    def _embed_texts(self, texts: list[str]) -> list[Vector]:
+        clean_texts = [str(text or "").strip() for text in texts]
+        clean_texts = [text for text in clean_texts if text]
+
+        if not clean_texts:
+            return []
+
+        vectors = self._embedder.embed(clean_texts)
+        return [list(vector) for vector in vectors]
+
+    @staticmethod
+    def _centroid(vectors: list[Vector]) -> Vector:
+        if not vectors:
+            return []
+
+        dim = len(vectors[0])
+        if dim <= 0:
+            return []
+
+        sums = [0.0 for _ in range(dim)]
+        count = 0
+
+        for vector in vectors:
+            if len(vector) != dim:
+                continue
+
+            for i, value in enumerate(vector):
+                sums[i] += float(value)
+
+            count += 1
+
+        if count <= 0:
+            return []
+
+        return [value / float(count) for value in sums]
+
+    @staticmethod
+    def _cosine(a: Vector, b: Vector) -> float:
+        if not a or not b or len(a) != len(b):
+            return 0.0
+
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+
+        for x, y in zip(a, b):
+            fx = float(x)
+            fy = float(y)
+            dot += fx * fy
+            norm_a += fx * fx
+            norm_b += fy * fy
+
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return 0.0
+
+        return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        clean = str(text or "")
+        if not clean:
+            return 0
+
+        try:
+            import tiktoken  # type: ignore
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(clean))
+        except Exception:
+            return max(1, math.ceil(len(clean) / 4))
+
+    @staticmethod
+    def _safe_json_dump(data: Any) -> str:
+        import json
+
+        try:
+            return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            return repr(data)
+```
+
+### ~\ragstream\memory\ingestion\memory_chunker.py
 ```python
 # ragstream/memory/memory_chunker.py
 # -*- coding: utf-8 -*-
@@ -9663,7 +12511,631 @@ class MemoryChunker:
         return "; ".join(cleaned)
 ```
 
-### ~\ragstream\memory\memory_context_pack.py
+### ~\ragstream\memory\ingestion\memory_ingestion_manager.py
+```python
+# ragstream/memory/memory_ingestion_manager.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import threading
+
+from typing import Any
+
+from ragstream.textforge.RagLog import LogALL as logger
+
+
+class MemoryIngestionManager:
+    def __init__(
+        self,
+        memory_manager: Any,
+        memory_chunker: Any,
+        memory_vector_store: Any,
+    ) -> None:
+        self.memory_manager = memory_manager
+        self.memory_chunker = memory_chunker
+        self.memory_vector_store = memory_vector_store
+
+        self._lock = threading.Lock()
+        self._active_record_ids: set[str] = set()
+
+    def ingest_record(self, record_id: str) -> dict[str, Any]:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return {
+                "success": False,
+                "record_id": record_id,
+                "message": "record_id is empty.",
+            }
+
+        record = self._find_record(clean_record_id)
+        if record is None:
+            message = f"MemoryRecord not found for ingestion: {clean_record_id}"
+            logger(message, "WARN", "PUBLIC")
+            return {
+                "success": False,
+                "record_id": clean_record_id,
+                "message": message,
+            }
+
+        try:
+            logger(
+                (
+                    "Memory ingestion started: "
+                    f"record={clean_record_id[:8]} | file_id={self.memory_manager.file_id[:8]}"
+                ),
+                "INFO",
+                "INTERNAL",
+            )
+
+            entries = self.memory_chunker.build_vector_entries(
+                record,
+                file_id=self.memory_manager.file_id,
+                filename_ragmem=self.memory_manager.filename_ragmem,
+                filename_meta=self.memory_manager.filename_meta,
+            )
+
+            role_counts = self._count_roles(entries)
+
+            logger(
+                (
+                    "Memory blocks prepared: "
+                    f"handle={role_counts.get('record_handle', 0)}, "
+                    f"question={role_counts.get('question', 0)}, "
+                    f"answer={role_counts.get('answer', 0)}"
+                ),
+                "INFO",
+                "INTERNAL",
+            )
+
+            result = self.memory_vector_store.replace_record_entries(
+                record_id=clean_record_id,
+                entries=entries,
+            )
+
+            result.update(
+                {
+                    "role_counts": role_counts,
+                    "file_id": self.memory_manager.file_id,
+                    "filename_ragmem": self.memory_manager.filename_ragmem,
+                }
+            )
+
+            logger(
+                (
+                    "Memory ingestion finished: "
+                    f"{role_counts.get('record_handle', 0)} handle, "
+                    f"{role_counts.get('question', 0)} question blocks, "
+                    f"{role_counts.get('answer', 0)} answer blocks "
+                    f"→ {result.get('vectors_written', 0)} vectors."
+                ),
+                "INFO",
+                "PUBLIC",
+            )
+
+            logger(
+                (
+                    "Memory vector store updated: "
+                    f"path={result.get('persist_dir', '')} | "
+                    f"collection={result.get('collection_name', '')} | "
+                    f"record_vectors={result.get('record_vector_count', 0)}"
+                ),
+                "INFO",
+                "INTERNAL",
+            )
+
+            return result
+
+        except Exception as e:
+            message = f"Memory ingestion failed for {clean_record_id[:8]}: {e}"
+            logger(message, "ERROR", "PUBLIC")
+            return {
+                "success": False,
+                "record_id": clean_record_id,
+                "message": message,
+            }
+
+    def ingest_all(self) -> dict[str, Any]:
+        records = list(getattr(self.memory_manager, "records", []) or [])
+
+        total = len(records)
+        success_count = 0
+        failure_count = 0
+        results: list[dict[str, Any]] = []
+
+        logger(f"Memory ingestion started for loaded history: {total} records.", "INFO", "PUBLIC")
+
+        for record in records:
+            result = self.ingest_record(record.record_id)
+            results.append(result)
+
+            if result.get("success"):
+                success_count += 1
+            else:
+                failure_count += 1
+
+        logger(
+            (
+                "Memory history ingestion finished: "
+                f"{success_count} succeeded, {failure_count} failed."
+            ),
+            "INFO" if failure_count == 0 else "WARN",
+            "PUBLIC",
+        )
+
+        return {
+            "success": failure_count == 0,
+            "total": total,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "results": results,
+        }
+
+    def ingest_record_async(self, record_id: str) -> None:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return
+
+        record = self._find_record(clean_record_id)
+        if record is None:
+            logger(f"Memory ingestion was not scheduled; record not found: {clean_record_id}", "WARN", "PUBLIC")
+            return
+
+        with self._lock:
+            if clean_record_id in self._active_record_ids:
+                logger(
+                    f"Memory ingestion already running for record: {clean_record_id[:8]}",
+                    "INFO",
+                    "INTERNAL",
+                )
+                return
+
+            self._active_record_ids.add(clean_record_id)
+
+        logger(
+            (
+                "Memory ingestion scheduled: "
+                f"record={clean_record_id[:8]} | "
+                f"question_chars={len(record.input_text or '')} | "
+                f"answer_chars={len(record.output_text or '')}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
+        thread = threading.Thread(
+            target=self._async_worker,
+            args=(clean_record_id,),
+            daemon=True,
+            name=f"memory-ingest-{clean_record_id[:8]}",
+        )
+
+        try:
+            from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+
+            ctx = get_script_run_ctx()
+            if ctx is not None:
+                add_script_run_ctx(thread, ctx)
+        except Exception:
+            pass
+
+        thread.start()
+
+    def _async_worker(self, record_id: str) -> None:
+        try:
+            self.ingest_record(record_id)
+        finally:
+            with self._lock:
+                self._active_record_ids.discard(record_id)
+
+    def _find_record(self, record_id: str) -> Any | None:
+        for record in getattr(self.memory_manager, "records", []) or []:
+            if getattr(record, "record_id", None) == record_id:
+                return record
+        return None
+
+    @staticmethod
+    def _count_roles(entries: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+
+        for entry in entries:
+            metadata = entry.get("metadata", {})
+            role = str(metadata.get("role", "")).strip() or "unknown"
+            counts[role] = counts.get(role, 0) + 1
+
+        return counts
+```
+
+### ~\ragstream\memory\ingestion\memory_vector_store.py
+```python
+# ragstream/memory/memory_vector_store.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+from typing import Any
+
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
+
+
+class MemoryVectorStore:
+    """
+    Dedicated memory Chroma vector store.
+
+    This store is separate from document Chroma stores.
+
+    It owns:
+    - memory vector persistence
+    - record vector replacement
+    - record vector deletion
+    - file/history vector deletion by file_id
+    - raw vector search for MemoryRetriever
+
+    It does not own:
+    - MemoryRecord truth
+    - SQLite metadata truth
+    - memory scoring
+    - MemoryContextPack creation
+    """
+
+    def __init__(
+        self,
+        persist_dir: str,
+        collection_name: str,
+        embedder: Any,
+    ) -> None:
+        self.persist_dir = str(persist_dir)
+        self.collection_name = collection_name
+        self.embedder = embedder
+
+        Path(self.persist_dir).mkdir(parents=True, exist_ok=True)
+
+        import chromadb
+
+        self._client = chromadb.PersistentClient(path=self.persist_dir)
+        self._collection = self._client.get_or_create_collection(name=self.collection_name)
+
+        logger(
+            f"MemoryVectorStore ready: {self.persist_dir} | collection={self.collection_name}",
+            "INFO",
+            "INTERNAL",
+        )
+
+    def replace_record_entries(
+        self,
+        record_id: str,
+        entries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            raise ValueError("record_id must not be empty.")
+
+        old_count = self.count_record(clean_record_id)
+        self.delete_record(clean_record_id)
+
+        if not entries:
+            return {
+                "success": True,
+                "record_id": clean_record_id,
+                "deleted_old_vectors": old_count,
+                "vectors_written": 0,
+                "record_vector_count": 0,
+                "collection_name": self.collection_name,
+                "persist_dir": self.persist_dir,
+            }
+
+        ids = [str(entry["id"]) for entry in entries]
+        documents = [str(entry.get("document", "")) for entry in entries]
+        metadatas = [self._sanitize_metadata(entry.get("metadata", {})) for entry in entries]
+
+        embeddings = self._embed_documents(documents)
+
+        self._collection.add(
+            ids=ids,
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+
+        new_count = self.count_record(clean_record_id)
+
+        logger(
+            (
+                "Memory vectors written: "
+                f"record={clean_record_id[:8]} | deleted={old_count} | "
+                f"new={len(ids)} | total_for_record={new_count}"
+            ),
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            (
+                "MemoryVectorStore.replace_record_entries\n"
+                f"record_id={clean_record_id}\n"
+                f"ids={json.dumps(ids, ensure_ascii=False, indent=2)}\n"
+                f"metadatas={json.dumps(metadatas, ensure_ascii=False, indent=2, default=str)}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "success": True,
+            "record_id": clean_record_id,
+            "deleted_old_vectors": old_count,
+            "vectors_written": len(ids),
+            "record_vector_count": new_count,
+            "collection_name": self.collection_name,
+            "persist_dir": self.persist_dir,
+        }
+
+    def query(
+        self,
+        query_text: str,
+        n_results: int = 10,
+        where: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Search memory vectors and return flat hit dictionaries.
+
+        Returned hit format:
+        {
+            "id": str,
+            "document": str,
+            "metadata": dict,
+            "distance": float | None,
+            "rank": int
+        }
+        """
+        text = str(query_text or "").strip()
+        if not text:
+            return []
+
+        query_embedding = self._embed_documents([text])[0]
+
+        query_kwargs: dict[str, Any] = {
+            "query_embeddings": [query_embedding],
+            "n_results": int(n_results),
+            "include": ["documents", "metadatas", "distances"],
+        }
+
+        if where:
+            query_kwargs["where"] = self._sanitize_where(where)
+
+        result = self._collection.query(**query_kwargs)
+        hits = self._normalize_query_result(result)
+
+        logger(
+            f"MemoryVectorStore query finished: hits={len(hits)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            (
+                "MemoryVectorStore.query\n"
+                f"query_text={text}\n"
+                f"n_results={n_results}\n"
+                f"where={json.dumps(where or {}, ensure_ascii=False, indent=2, default=str)}\n"
+                f"hits={json.dumps(hits, ensure_ascii=False, indent=2, default=str)}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return hits
+
+    def delete_record(self, record_id: str) -> dict[str, Any]:
+        """Delete all memory vectors belonging to one MemoryRecord."""
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return {
+                "success": False,
+                "record_id": record_id,
+                "deleted_vectors": 0,
+                "message": "record_id is empty.",
+            }
+
+        old_count = self.count_record(clean_record_id)
+
+        if old_count > 0:
+            self._collection.delete(where={"record_id": clean_record_id})
+
+        new_count = self.count_record(clean_record_id)
+
+        deleted_vectors = max(old_count - new_count, 0)
+
+        logger_dev(
+            (
+                "MemoryVectorStore.delete_record\n"
+                f"record_id={clean_record_id}\n"
+                f"old_count={old_count}\n"
+                f"new_count={new_count}\n"
+                f"deleted_vectors={deleted_vectors}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "success": True,
+            "record_id": clean_record_id,
+            "deleted_vectors": deleted_vectors,
+            "record_vector_count": new_count,
+        }
+
+    def delete_file(self, file_id: str) -> dict[str, Any]:
+        """
+        Delete all memory vectors belonging to one memory history.
+
+        This is used by FILES tab Delete.
+        """
+        clean_file_id = (file_id or "").strip()
+        if not clean_file_id:
+            return {
+                "success": False,
+                "file_id": file_id,
+                "deleted_vectors": 0,
+                "message": "file_id is empty.",
+            }
+
+        old_count = self.count_file(clean_file_id)
+
+        if old_count > 0:
+            self._collection.delete(where={"file_id": clean_file_id})
+
+        new_count = self.count_file(clean_file_id)
+        deleted_vectors = max(old_count - new_count, 0)
+
+        logger(
+            (
+                "Memory vectors deleted by file_id: "
+                f"file={clean_file_id[:8]} | deleted={deleted_vectors}"
+            ),
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            (
+                "MemoryVectorStore.delete_file\n"
+                f"file_id={clean_file_id}\n"
+                f"old_count={old_count}\n"
+                f"new_count={new_count}\n"
+                f"deleted_vectors={deleted_vectors}"
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "success": True,
+            "file_id": clean_file_id,
+            "deleted_vectors": deleted_vectors,
+            "file_vector_count": new_count,
+            "collection_name": self.collection_name,
+            "persist_dir": self.persist_dir,
+        }
+
+    def count_record(self, record_id: str) -> int:
+        """Count vectors belonging to one MemoryRecord."""
+        clean_record_id = (record_id or "").strip()
+        if not clean_record_id:
+            return 0
+
+        try:
+            result = self._collection.get(where={"record_id": clean_record_id})
+            return len(result.get("ids", []))
+        except Exception:
+            return 0
+
+    def count_file(self, file_id: str) -> int:
+        """Count vectors belonging to one memory history."""
+        clean_file_id = (file_id or "").strip()
+        if not clean_file_id:
+            return 0
+
+        try:
+            result = self._collection.get(where={"file_id": clean_file_id})
+            return len(result.get("ids", []))
+        except Exception:
+            return 0
+
+    def _embed_documents(self, documents: list[str]) -> list[list[float]]:
+        if not documents:
+            return []
+
+        vectors = self.embedder.embed(documents)
+
+        result: list[list[float]] = []
+        for vector in vectors:
+            if hasattr(vector, "tolist"):
+                vector = vector.tolist()
+            result.append([float(value) for value in vector])
+
+        return result
+
+    @staticmethod
+    def _normalize_query_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+        ids = (result.get("ids") or [[]])[0] or []
+        documents = (result.get("documents") or [[]])[0] or []
+        metadatas = (result.get("metadatas") or [[]])[0] or []
+        distances = (result.get("distances") or [[]])[0] or []
+
+        hits: list[dict[str, Any]] = []
+
+        for idx, vector_id in enumerate(ids):
+            metadata = metadatas[idx] if idx < len(metadatas) and metadatas[idx] else {}
+            document = documents[idx] if idx < len(documents) else ""
+            distance = distances[idx] if idx < len(distances) else None
+
+            hits.append(
+                {
+                    "id": vector_id,
+                    "document": document,
+                    "metadata": metadata,
+                    "distance": distance,
+                    "rank": idx + 1,
+                }
+            )
+
+        return hits
+
+    @staticmethod
+    def _sanitize_where(where: dict[str, Any]) -> dict[str, str | int | float | bool]:
+        clean: dict[str, str | int | float | bool] = {}
+
+        for key, value in (where or {}).items():
+            if value is None:
+                continue
+
+            clean_key = str(key)
+
+            if isinstance(value, bool):
+                clean[clean_key] = value
+            elif isinstance(value, int):
+                clean[clean_key] = value
+            elif isinstance(value, float):
+                clean[clean_key] = value
+            else:
+                clean[clean_key] = str(value)
+
+        return clean
+
+    @staticmethod
+    def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
+        clean: dict[str, str | int | float | bool] = {}
+
+        for key, value in (metadata or {}).items():
+            clean_key = str(key)
+
+            if value is None:
+                clean[clean_key] = ""
+            elif isinstance(value, bool):
+                clean[clean_key] = value
+            elif isinstance(value, int):
+                clean[clean_key] = value
+            elif isinstance(value, float):
+                clean[clean_key] = value
+            elif isinstance(value, str):
+                clean[clean_key] = value
+            else:
+                clean[clean_key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+        return clean
+```
+
+### ~\ragstream\memory\retrieval\memory_context_pack.py
 ```python
 # ragstream/memory/memory_context_pack.py
 # -*- coding: utf-8 -*-
@@ -9687,7 +13159,6 @@ from __future__ import annotations
 import json
 
 from typing import Any
-
 
 
 class MemoryContextPack:
@@ -9811,10 +13282,17 @@ class MemoryContextPack:
             return
 
         for idx, candidate in enumerate(self.episodic_candidates, start=1):
-            score = candidate.get("final_parent_score", candidate.get("score", ""))
+            final_score = candidate.get("final_parent_score", candidate.get("score", ""))
+            semantic_score = candidate.get("semantic_parent_score", "")
+            recency_score = candidate.get("recency_score", "")
+            episode_distance_k = candidate.get("episode_distance_k", "")
+
             lines.append(f"**E{idx}. record_id:** `{candidate.get('record_id', '')}`")
             lines.append(f"- tag: `{candidate.get('tag', '')}`")
-            lines.append(f"- score: `{score}`")
+            lines.append(f"- final_score: `{final_score}`")
+            lines.append(f"- semantic_score: `{semantic_score}`")
+            lines.append(f"- recency_score: `{recency_score}`")
+            lines.append(f"- episode_distance_k: `{episode_distance_k}`")
             lines.append(f"- retrieval_source_mode: `{candidate.get('retrieval_source_mode', '')}`")
             lines.append("")
             lines.append(self._format_qa(candidate))
@@ -9831,7 +13309,10 @@ class MemoryContextPack:
             lines.append(f"**M{idx}. vector_id:** `{candidate.get('vector_id', candidate.get('id', ''))}`")
             lines.append(f"- record_id: `{candidate.get('record_id', '')}`")
             lines.append(f"- role: `{candidate.get('role', '')}`")
-            lines.append(f"- score: `{candidate.get('score', '')}`")
+            lines.append(f"- final_score: `{candidate.get('score', '')}`")
+            lines.append(f"- semantic_score: `{candidate.get('semantic_score', '')}`")
+            lines.append(f"- recency_score: `{candidate.get('recency_score', '')}`")
+            lines.append(f"- episode_distance_k: `{candidate.get('episode_distance_k', '')}`")
             lines.append("")
             text = str(candidate.get("document", candidate.get("text", ""))).strip()
             if text:
@@ -9890,7 +13371,993 @@ class MemoryContextPack:
         return "\n".join(lines).strip() if lines else "(no Q/A body available)"
 ```
 
-### ~\ragstream\memory\memory_file_manager.py
+### ~\ragstream\memory\retrieval\memory_index_lookup.py
+```python
+# ragstream/memory/memory_index_lookup.py
+# -*- coding: utf-8 -*-
+"""
+MemoryIndexLookup
+=================
+Deterministic lookup layer for Memory Retrieval.
+
+This class reads memory_index.sqlite3 and, when needed, reconstructs Q/A body
+text from the corresponding .ragmem file.
+
+It does not perform vector search.
+It does not score semantic hits.
+It does not modify memory truth.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+
+from pathlib import Path
+from typing import Any
+
+from ragstream.memory.memory_record import RECORD_END, RECORD_START
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+class MemoryIndexLookup:
+    """
+    SQLite-backed deterministic lookup helper.
+
+    The SQLite table mirrors .ragmeta.json metadata.
+    Full Q/A body is loaded from .ragmem only when needed for candidates.
+    """
+
+    def __init__(
+        self,
+        sqlite_path: str | Path,
+        memory_root: str | Path | None = None,
+    ) -> None:
+        self.sqlite_path: Path = Path(sqlite_path)
+        self.memory_root: Path | None = Path(memory_root) if memory_root is not None else None
+
+    def get_working_memory(
+        self,
+        file_id: str,
+        cfg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Return latest non-Black records from the active memory file.
+
+        This is the current-log working memory.
+        """
+        clean_file_id = str(file_id or "").strip()
+        if not clean_file_id:
+            return []
+
+        working_cfg = cfg.get("working_memory", {}) if isinstance(cfg, dict) else {}
+        if working_cfg.get("enabled", True) is False:
+            return []
+
+        max_pairs = int(working_cfg.get("max_pairs", 2))
+        exclude_tags = self._as_list(working_cfg.get("exclude_tags", ["Black"]))
+
+        query = """
+            SELECT *
+            FROM memory_records
+            WHERE file_id = ?
+        """
+        params: list[Any] = [clean_file_id]
+
+        if exclude_tags:
+            placeholders = ",".join("?" for _ in exclude_tags)
+            query += f" AND tag NOT IN ({placeholders})"
+            params.extend(exclude_tags)
+
+        query += " ORDER BY created_at_utc DESC LIMIT ?"
+        params.append(max_pairs)
+
+        rows = self._fetch_rows(query, params)
+        candidates = [self._row_to_candidate(row) for row in rows]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        logger(
+            f"Memory working lookup: file={clean_file_id[:8]} | candidates={len(candidates)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory working lookup result\n"
+            + json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return candidates
+
+    def get_latest_gold(
+        self,
+        file_id: str,
+        cfg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Return latest Gold candidates from the active memory file.
+
+        Gold is still bounded by config; it is not unlimited context.
+        """
+        clean_file_id = str(file_id or "").strip()
+        if not clean_file_id:
+            return []
+
+        episodic_cfg = cfg.get("episodic_memory", {}) if isinstance(cfg, dict) else {}
+        if episodic_cfg.get("enabled", True) is False:
+            return []
+
+        max_gold_records = int(episodic_cfg.get("max_gold_records", 1))
+
+        rows = self._fetch_rows(
+            """
+            SELECT *
+            FROM memory_records
+            WHERE file_id = ?
+              AND tag = 'Gold'
+            ORDER BY created_at_utc DESC
+            LIMIT ?
+            """,
+            [clean_file_id, max_gold_records],
+        )
+
+        candidates = [self._row_to_candidate(row) for row in rows]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        logger(
+            f"Memory Gold lookup: file={clean_file_id[:8]} | candidates={len(candidates)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory Gold lookup result\n"
+            + json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return candidates
+
+    def get_direct_recall(
+        self,
+        direct_recall_key: str,
+        cfg: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """
+        Lookup a Direct Recall candidate across all memory histories.
+
+        Automatic retrieval stays current-file only, but Direct Recall is allowed
+        to cross histories through exact key lookup.
+        """
+        key = str(direct_recall_key or "").strip()
+        if not key:
+            return None
+
+        direct_cfg = cfg.get("direct_recall", {}) if isinstance(cfg, dict) else {}
+        if direct_cfg.get("enabled", True) is False:
+            return None
+
+        exclude_tags = self._as_list(direct_cfg.get("exclude_tags", ["Black"]))
+
+        query = """
+            SELECT *
+            FROM memory_records
+            WHERE direct_recall_key = ?
+        """
+        params: list[Any] = [key]
+
+        if exclude_tags:
+            placeholders = ",".join("?" for _ in exclude_tags)
+            query += f" AND tag NOT IN ({placeholders})"
+            params.extend(exclude_tags)
+
+        query += """
+            ORDER BY
+              CASE tag WHEN 'Gold' THEN 0 WHEN 'Green' THEN 1 ELSE 2 END,
+              created_at_utc DESC
+            LIMIT 1
+        """
+
+        rows = self._fetch_rows(query, params)
+        if not rows:
+            logger(f"Direct Recall lookup found no match: key={key}", "INFO", "INTERNAL")
+            return None
+
+        candidates = [self._row_to_candidate(rows[0])]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        candidate = candidates[0] if candidates else None
+
+        logger(
+            f"Direct Recall lookup matched: key={key} | record={candidate.get('record_id', '')[:8] if candidate else ''}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Direct Recall lookup result\n"
+            + json.dumps(candidate, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return candidate
+
+    def get_records_by_ids(
+        self,
+        file_id: str,
+        record_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """
+        Load metadata rows for selected parent MemoryRecord ids.
+        """
+        clean_file_id = str(file_id or "").strip()
+        clean_ids = [str(record_id).strip() for record_id in record_ids if str(record_id).strip()]
+
+        if not clean_file_id or not clean_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in clean_ids)
+
+        rows = self._fetch_rows(
+            f"""
+            SELECT *
+            FROM memory_records
+            WHERE file_id = ?
+              AND record_id IN ({placeholders})
+            """,
+            [clean_file_id, *clean_ids],
+        )
+
+        candidates = [self._row_to_candidate(row) for row in rows]
+        candidates = self._attach_file_rows(candidates)
+        candidates = self._attach_ragmem_bodies(candidates)
+
+        return candidates
+
+    def get_file_row(
+        self,
+        file_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one row from memory_files."""
+        clean_file_id = str(file_id or "").strip()
+        if not clean_file_id:
+            return None
+
+        rows = self._fetch_rows(
+            """
+            SELECT *
+            FROM memory_files
+            WHERE file_id = ?
+            """,
+            [clean_file_id],
+            table_name="memory_files",
+        )
+
+        return dict(rows[0]) if rows else None
+
+    def _fetch_rows(
+        self,
+        query: str,
+        params: list[Any],
+        *,
+        table_name: str = "memory_records",
+    ) -> list[sqlite3.Row]:
+        if not self.sqlite_path.exists():
+            logger(f"Memory SQLite not found: {self.sqlite_path}", "WARN", "PUBLIC")
+            return []
+
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(query, params).fetchall()
+
+        logger_dev(
+            (
+                "MemoryIndexLookup SQL result\n"
+                f"table={table_name}\n"
+                f"query={query.strip()}\n"
+                f"params={params}\n"
+                f"rows={len(rows)}"
+            ),
+            "TRACE",
+            "CONFIDENTIAL",
+        )
+
+        return rows
+
+    def _row_to_candidate(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+
+        candidate: dict[str, Any] = {
+            "file_id": data.get("file_id", ""),
+            "record_id": data.get("record_id", ""),
+            "parent_id": data.get("parent_id", ""),
+            "created_at_utc": data.get("created_at_utc", ""),
+            "source": data.get("source", ""),
+            "tag": data.get("tag", ""),
+            "retrieval_source_mode": data.get("retrieval_source_mode", "QA"),
+            "direct_recall_key": data.get("direct_recall_key", ""),
+            "auto_keywords": self._json_list(data.get("auto_keywords_json")),
+            "user_keywords": self._json_list(data.get("user_keywords_json")),
+            "active_project_name": data.get("active_project_name", ""),
+            "embedded_files_snapshot": self._json_list(data.get("embedded_files_snapshot_json")),
+            "input_hash": data.get("input_hash", ""),
+            "output_hash": data.get("output_hash", ""),
+            "sqlite_metadata": data,
+        }
+
+        return candidate
+
+    def _attach_file_rows(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        file_cache: dict[str, dict[str, Any]] = {}
+
+        for candidate in candidates:
+            file_id = str(candidate.get("file_id", "")).strip()
+            if not file_id:
+                continue
+
+            if file_id not in file_cache:
+                file_cache[file_id] = self.get_file_row(file_id) or {}
+
+            file_row = file_cache[file_id]
+            candidate["file_row"] = file_row
+            candidate["title"] = file_row.get("title", "")
+            candidate["filename_ragmem"] = file_row.get("filename_ragmem", "")
+            candidate["filename_meta"] = file_row.get("filename_meta", "")
+
+        return candidates
+
+    def _attach_ragmem_bodies(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Attach stable Q/A body from .ragmem.
+
+        SQLite intentionally stores metadata only, so Q/A body comes from
+        the durable .ragmem file.
+        """
+        if self.memory_root is None:
+            return candidates
+
+        body_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+        for candidate in candidates:
+            file_id = str(candidate.get("file_id", "")).strip()
+            record_id = str(candidate.get("record_id", "")).strip()
+
+            if not file_id or not record_id:
+                continue
+
+            cache_key = (file_id, record_id)
+            if cache_key not in body_cache:
+                body_cache[cache_key] = self._load_ragmem_body(candidate)
+
+            body = body_cache[cache_key]
+            candidate["input_text"] = body.get("input_text", "")
+            candidate["output_text"] = body.get("output_text", "")
+            candidate["ragmem_body"] = body
+
+        return candidates
+
+    def _load_ragmem_body(
+        self,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self.memory_root is None:
+            return {}
+
+        filename_ragmem = str(candidate.get("filename_ragmem", "")).strip()
+        record_id = str(candidate.get("record_id", "")).strip()
+
+        if not filename_ragmem or not record_id:
+            return {}
+
+        ragmem_path = self.memory_root / "files" / filename_ragmem
+        if not ragmem_path.exists():
+            return {}
+
+        text = ragmem_path.read_text(encoding="utf-8")
+        pattern = re.compile(
+            rf"{re.escape(RECORD_START)}\n(.*?)\n{re.escape(RECORD_END)}",
+            re.DOTALL,
+        )
+
+        for match in pattern.finditer(text):
+            raw_block = match.group(1)
+            try:
+                data = json.loads(raw_block)
+            except Exception:
+                continue
+
+            if isinstance(data, dict) and str(data.get("record_id", "")) == record_id:
+                return data
+
+        return {}
+
+    @staticmethod
+    def _json_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+
+        if value is None:
+            return []
+
+        try:
+            parsed = json.loads(str(value))
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _as_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        if value is None:
+            return []
+
+        text = str(value).strip()
+        return [text] if text else []
+```
+
+### ~\ragstream\memory\retrieval\memory_scoring.py
+```python
+# ragstream/memory/memory_scoring.py
+# -*- coding: utf-8 -*-
+"""
+MemoryScorer
+============
+Scoring and aggregation logic for Memory Retrieval.
+
+It receives raw vector hits and converts them into:
+- normalized hit scores
+- parent MemoryRecord scores
+- selected semantic memory chunks
+
+This class does not read SQLite.
+This class does not query Chroma.
+This class does not mutate SuperPrompt.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+
+from typing import Any
+
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+
+
+class MemoryScorer:
+    """
+    Memory retrieval scoring helper.
+
+    Role-separated scoring:
+    - question hits represent similarity to an old problem
+    - answer hits represent similarity to an old solution
+    - record_handle hits represent metadata/keyword/anchor discovery
+
+    Recency scoring is episode-distance based:
+    - k = 0 means latest MemoryRecord
+    - k = 1 means one MemoryRecord older
+    - k = 2 means two MemoryRecords older
+    """
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+    ) -> None:
+        self.config: dict[str, Any] = config or {}
+        self.parent_score_weights: dict[str, dict[str, float]] = dict(
+            self.config.get("parent_score_weights", {}) or {}
+        )
+
+        self.default_weights: dict[str, float] = {
+            "answer": 0.55,
+            "question": 0.35,
+            "meta": 0.10,
+        }
+
+        self.semantic_chunk_cfg: dict[str, Any] = dict(
+            self.config.get("semantic_memory_chunks", {}) or {}
+        )
+        self.episodic_cfg: dict[str, Any] = dict(
+            self.config.get("episodic_memory", {}) or {}
+        )
+
+    def score_vector_hits(
+        self,
+        raw_hits: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Normalize raw vector-store hits.
+
+        Chroma usually returns distance, where smaller means better.
+        This method converts distance into a simple similarity-like score.
+        """
+        scored_hits: list[dict[str, Any]] = []
+
+        for rank, hit in enumerate(raw_hits, start=1):
+            metadata = dict(hit.get("metadata", {}) or {})
+            role = str(metadata.get("role", hit.get("role", "")) or "").strip()
+
+            distance = hit.get("distance")
+            score = hit.get("score")
+
+            if score is None:
+                score = self._distance_to_score(distance)
+
+            scored_hit = {
+                "rank": rank,
+                "vector_id": hit.get("id", hit.get("vector_id", "")),
+                "record_id": metadata.get("record_id", hit.get("record_id", "")),
+                "role": role,
+                "score": float(score),
+                "semantic_score": float(score),
+                "distance": distance,
+                "document": hit.get("document", ""),
+                "metadata": metadata,
+                "raw_hit": hit,
+            }
+
+            scored_hits.append(scored_hit)
+
+        logger(
+            f"Memory vector hits scored: {len(scored_hits)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory scored vector hits\n"
+            + json.dumps(scored_hits, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return scored_hits
+
+    def aggregate_parent_scores(
+        self,
+        scored_hits: list[dict[str, Any]],
+        metadata_by_record: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Aggregate vector-hit scores by parent MemoryRecord.
+
+        The parent score is the main episodic score.
+        Individual chunks remain available separately for A3/A4 later.
+        """
+        metadata_by_record = metadata_by_record or {}
+        grouped: dict[str, dict[str, Any]] = {}
+
+        for hit in scored_hits:
+            record_id = str(hit.get("record_id", "")).strip()
+            if not record_id:
+                continue
+
+            role = str(hit.get("role", "")).strip()
+            score = float(hit.get("score", 0.0))
+
+            if record_id not in grouped:
+                metadata = dict(metadata_by_record.get(record_id, {}) or {})
+                grouped[record_id] = {
+                    "record_id": record_id,
+                    "tag": metadata.get("tag", "Green") or "Green",
+                    "retrieval_source_mode": metadata.get("retrieval_source_mode", "QA"),
+                    "episode_distance_k": metadata.get("episode_distance_k"),
+                    "episode_index": metadata.get("episode_index"),
+                    "episode_count_in_active_file": metadata.get("episode_count_in_active_file"),
+                    "question_score": 0.0,
+                    "answer_score": 0.0,
+                    "meta_score": 0.0,
+                    "semantic_parent_score": 0.0,
+                    "recency_score": None,
+                    "final_parent_score": 0.0,
+                    "hit_count": 0,
+                    "hits": [],
+                    "metadata": metadata,
+                }
+
+            parent = grouped[record_id]
+            parent["hit_count"] += 1
+            parent["hits"].append(hit)
+
+            if role == "question":
+                parent["question_score"] = max(float(parent["question_score"]), score)
+            elif role == "answer":
+                parent["answer_score"] = max(float(parent["answer_score"]), score)
+            else:
+                parent["meta_score"] = max(float(parent["meta_score"]), score)
+
+        parents = list(grouped.values())
+        parents = self.apply_retrieval_source_mode(parents)
+        parents = self.apply_tag_rules(parents)
+        parents = self.apply_episodic_recency_policy(parents)
+        parents = self.rank_parents(parents)
+
+        logger(
+            f"Memory parent scores aggregated: {len(parents)} parents",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Memory parent score aggregation\n"
+            + json.dumps(parents, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return parents
+
+    def apply_retrieval_source_mode(
+        self,
+        parent_scores: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Apply QA/Q/A weighting to parent MemoryRecord scores.
+
+        This produces the semantic parent score before recency is applied.
+        """
+        for parent in parent_scores:
+            mode = str(parent.get("retrieval_source_mode", "QA") or "QA").strip().upper()
+            if mode not in {"QA", "Q", "A"}:
+                mode = "QA"
+
+            weights = self.parent_score_weights.get(mode, self.default_weights)
+
+            answer_score = float(parent.get("answer_score", 0.0))
+            question_score = float(parent.get("question_score", 0.0))
+            meta_score = float(parent.get("meta_score", 0.0))
+
+            semantic_parent_score = (
+                answer_score * float(weights.get("answer", 0.0))
+                + question_score * float(weights.get("question", 0.0))
+                + meta_score * float(weights.get("meta", 0.0))
+            )
+
+            parent["semantic_parent_score"] = semantic_parent_score
+            parent["final_parent_score"] = semantic_parent_score
+            parent["applied_weights"] = weights
+            parent["retrieval_source_mode"] = mode
+
+        return parent_scores
+
+    def apply_tag_rules(
+        self,
+        parent_scores: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Apply current retrieval tag rules.
+
+        Black records are excluded from automatic Memory Retrieval.
+        Gold records are not decayed here because Gold is handled as a separate
+        priority/bypass path by MemoryRetriever.
+        """
+        excluded_tags = self._collect_excluded_tags()
+        result: list[dict[str, Any]] = []
+
+        for parent in parent_scores:
+            tag = str(parent.get("tag", "") or "Green").strip()
+
+            if tag in excluded_tags:
+                parent["excluded"] = True
+                parent["exclude_reason"] = f"tag={tag}"
+                continue
+
+            parent["excluded"] = False
+            parent["gold_bypass_recency"] = tag == "Gold"
+
+            result.append(parent)
+
+        return result
+
+    def apply_episodic_recency_policy(
+        self,
+        parent_scores: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Apply Green episodic recency policy.
+
+        Formula:
+            final = semantic_weight * semantic_parent_score
+                    + recency_weight * recency_score
+
+        Gold bypasses this normal recency policy.
+        Black has already been excluded.
+        """
+        semantic_weight = float(self.episodic_cfg.get("green_semantic_weight", 0.75))
+        recency_weight = float(self.episodic_cfg.get("green_recency_weight", 0.25))
+        half_life_k = float(self.episodic_cfg.get("green_half_life_k", 10.0))
+        recency_enabled = bool(self.episodic_cfg.get("recency_enabled", True))
+
+        semantic_weight, recency_weight = self._normalize_two_weights(
+            semantic_weight,
+            recency_weight,
+        )
+
+        for parent in parent_scores:
+            tag = str(parent.get("tag", "") or "Green").strip()
+            semantic_score = float(parent.get("semantic_parent_score", 0.0))
+
+            if tag == "Gold":
+                parent["final_parent_score"] = semantic_score
+                parent["recency_score"] = None
+                parent["recency_policy"] = "bypassed_for_gold"
+                continue
+
+            if not recency_enabled:
+                parent["final_parent_score"] = semantic_score
+                parent["recency_score"] = None
+                parent["recency_policy"] = "disabled"
+                continue
+
+            recency_score = self._recency_score_from_episode_distance(
+                parent.get("episode_distance_k"),
+                half_life_k,
+            )
+
+            final_score = (
+                semantic_weight * semantic_score
+                + recency_weight * recency_score
+            )
+
+            parent["final_parent_score"] = final_score
+            parent["recency_score"] = recency_score
+            parent["recency_half_life_k"] = half_life_k
+            parent["semantic_recency_weights"] = {
+                "semantic": semantic_weight,
+                "recency": recency_weight,
+            }
+            parent["recency_policy"] = "green_episodic_semantic_plus_recency"
+
+        return parent_scores
+
+    def rank_parents(
+        self,
+        parent_scores: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return parent MemoryRecords sorted by final score."""
+        return sorted(
+            parent_scores,
+            key=lambda item: float(item.get("final_parent_score", 0.0)),
+            reverse=True,
+        )
+
+    def select_semantic_chunks(
+        self,
+        scored_hits: list[dict[str, Any]],
+        max_memory_chunks: int,
+        metadata_by_record: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Select raw semantic memory chunks for later A3/A4.
+
+        record_handle hits are not selected here because they are discovery
+        handles, not semantic evidence chunks.
+
+        Semantic chunks use weaker recency weighting than episodic memory.
+        """
+        metadata_by_record = metadata_by_record or {}
+        candidates: list[dict[str, Any]] = []
+
+        semantic_weight = float(self.semantic_chunk_cfg.get("semantic_weight", 0.90))
+        recency_weight = float(self.semantic_chunk_cfg.get("recency_weight", 0.10))
+        half_life_k = float(self.semantic_chunk_cfg.get("half_life_k", 10.0))
+        recency_enabled = bool(self.semantic_chunk_cfg.get("recency_enabled", True))
+
+        semantic_weight, recency_weight = self._normalize_two_weights(
+            semantic_weight,
+            recency_weight,
+        )
+
+        for hit in scored_hits:
+            role = str(hit.get("role", "")).strip()
+            if role not in {"question", "answer"}:
+                continue
+
+            record_id = str(hit.get("record_id", "") or "").strip()
+            live_metadata = dict(metadata_by_record.get(record_id, {}) or {})
+            metadata = dict(hit.get("metadata", {}) or {})
+            merged_metadata = {**metadata, **live_metadata}
+
+            tag = str(merged_metadata.get("tag", "") or "Green").strip()
+            if tag in self._collect_excluded_tags():
+                continue
+
+            semantic_score = float(hit.get("semantic_score", hit.get("score", 0.0)))
+
+            if tag == "Gold":
+                final_score = semantic_score
+                recency_score = None
+                recency_policy = "bypassed_for_gold"
+            elif recency_enabled:
+                recency_score = self._recency_score_from_episode_distance(
+                    merged_metadata.get("episode_distance_k"),
+                    half_life_k,
+                )
+                final_score = (
+                    semantic_weight * semantic_score
+                    + recency_weight * recency_score
+                )
+                recency_policy = "semantic_chunk_semantic_plus_recency"
+            else:
+                final_score = semantic_score
+                recency_score = None
+                recency_policy = "disabled"
+
+            candidates.append(
+                {
+                    "vector_id": hit.get("vector_id", ""),
+                    "record_id": record_id,
+                    "role": role,
+                    "score": float(final_score),
+                    "semantic_score": semantic_score,
+                    "recency_score": recency_score,
+                    "episode_distance_k": merged_metadata.get("episode_distance_k"),
+                    "recency_half_life_k": half_life_k if recency_enabled and tag != "Gold" else None,
+                    "semantic_recency_weights": {
+                        "semantic": semantic_weight,
+                        "recency": recency_weight,
+                    },
+                    "recency_policy": recency_policy,
+                    "distance": hit.get("distance"),
+                    "document": hit.get("document", ""),
+                    "metadata": merged_metadata,
+                    "rank": hit.get("rank"),
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: float(item.get("score", 0.0)),
+            reverse=True,
+        )
+
+        selected = candidates[: max(0, int(max_memory_chunks))]
+
+        logger(
+            f"Semantic memory chunks selected: {len(selected)}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger_dev(
+            "Selected semantic memory chunks\n"
+            + json.dumps(selected, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return selected
+
+    def describe_policy(self) -> dict[str, Any]:
+        """Return compact scoring policy for developer diagnostics."""
+        return {
+            "episodic_memory": {
+                "green_semantic_weight": float(self.episodic_cfg.get("green_semantic_weight", 0.75)),
+                "green_recency_weight": float(self.episodic_cfg.get("green_recency_weight", 0.25)),
+                "green_half_life_k": float(self.episodic_cfg.get("green_half_life_k", 10.0)),
+                "recency_enabled": bool(self.episodic_cfg.get("recency_enabled", True)),
+                "gold_policy": "bypass_recency_normal_scoring",
+            },
+            "semantic_memory_chunks": {
+                "semantic_weight": float(self.semantic_chunk_cfg.get("semantic_weight", 0.90)),
+                "recency_weight": float(self.semantic_chunk_cfg.get("recency_weight", 0.10)),
+                "half_life_k": float(self.semantic_chunk_cfg.get("half_life_k", 10.0)),
+                "recency_enabled": bool(self.semantic_chunk_cfg.get("recency_enabled", True)),
+                "gold_policy": "bypass_recency_normal_scoring",
+            },
+        }
+
+    def _collect_excluded_tags(self) -> set[str]:
+        tags: set[str] = set()
+
+        for section_name in ("working_memory", "episodic_memory", "direct_recall", "semantic_memory_chunks"):
+            section = self.config.get(section_name, {})
+            for tag in section.get("exclude_tags", []) or []:
+                clean = str(tag).strip()
+                if clean:
+                    tags.add(clean)
+
+        if not tags:
+            tags.add("Black")
+
+        return tags
+
+    @staticmethod
+    def _recency_score_from_episode_distance(
+        episode_distance_k: Any,
+        half_life_k: float,
+    ) -> float:
+        """
+        Episode-distance half-life decay.
+
+        k = 0 -> 1.0
+        k = H -> 0.5
+        k = 2H -> 0.25
+
+        Missing k returns 1.0 so missing metadata does not silently kill
+        otherwise relevant memory.
+        """
+        try:
+            k = float(episode_distance_k)
+        except Exception:
+            return 1.0
+
+        if math.isnan(k) or math.isinf(k):
+            return 1.0
+
+        if k < 0:
+            k = 0.0
+
+        try:
+            h = float(half_life_k)
+        except Exception:
+            h = 10.0
+
+        if math.isnan(h) or math.isinf(h) or h <= 0:
+            h = 10.0
+
+        score = 2.0 ** (-k / h)
+
+        return max(0.0, min(1.0, float(score)))
+
+    @staticmethod
+    def _normalize_two_weights(
+        semantic_weight: float,
+        recency_weight: float,
+    ) -> tuple[float, float]:
+        """
+        Normalize two active weights so semantic=1 and recency=1 still gives 1.
+
+        This avoids the inactive-importance problem.
+        """
+        s = max(0.0, float(semantic_weight))
+        r = max(0.0, float(recency_weight))
+        total = s + r
+
+        if total <= 0:
+            return 1.0, 0.0
+
+        return s / total, r / total
+
+    @staticmethod
+    def _distance_to_score(distance: Any) -> float:
+        """
+        Convert Chroma distance into a bounded similarity-like score.
+
+        Smaller distance means better match.
+        """
+        try:
+            d = float(distance)
+        except Exception:
+            return 0.0
+
+        if math.isnan(d) or math.isinf(d):
+            return 0.0
+
+        if d < 0:
+            d = 0.0
+
+        return 1.0 / (1.0 + d)
+```
+
+### ~\ragstream\memory\storage\memory_file_manager.py
 ```python
 # ragstream/memory/memory_file_manager.py
 # -*- coding: utf-8 -*-
@@ -10333,2317 +14800,6 @@ class MemoryFileManager:
         if not clean_file_id:
             raise ValueError("file_id must not be empty.")
         return clean_file_id
-```
-
-### ~\ragstream\memory\memory_index_lookup.py
-```python
-# ragstream/memory/memory_index_lookup.py
-# -*- coding: utf-8 -*-
-"""
-MemoryIndexLookup
-=================
-Deterministic lookup layer for Memory Retrieval.
-
-This class reads memory_index.sqlite3 and, when needed, reconstructs Q/A body
-text from the corresponding .ragmem file.
-
-It does not perform vector search.
-It does not score semantic hits.
-It does not modify memory truth.
-"""
-
-from __future__ import annotations
-
-import json
-import re
-import sqlite3
-
-from pathlib import Path
-from typing import Any
-
-from ragstream.memory.memory_record import RECORD_END, RECORD_START
-from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
-
-
-class MemoryIndexLookup:
-    """
-    SQLite-backed deterministic lookup helper.
-
-    The SQLite table mirrors .ragmeta.json metadata.
-    Full Q/A body is loaded from .ragmem only when needed for candidates.
-    """
-
-    def __init__(
-        self,
-        sqlite_path: str | Path,
-        memory_root: str | Path | None = None,
-    ) -> None:
-        self.sqlite_path: Path = Path(sqlite_path)
-        self.memory_root: Path | None = Path(memory_root) if memory_root is not None else None
-
-    def get_working_memory(
-        self,
-        file_id: str,
-        cfg: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """
-        Return latest non-Black records from the active memory file.
-
-        This is the current-log working memory.
-        """
-        clean_file_id = str(file_id or "").strip()
-        if not clean_file_id:
-            return []
-
-        working_cfg = cfg.get("working_memory", {}) if isinstance(cfg, dict) else {}
-        if working_cfg.get("enabled", True) is False:
-            return []
-
-        max_pairs = int(working_cfg.get("max_pairs", 2))
-        exclude_tags = self._as_list(working_cfg.get("exclude_tags", ["Black"]))
-
-        query = """
-            SELECT *
-            FROM memory_records
-            WHERE file_id = ?
-        """
-        params: list[Any] = [clean_file_id]
-
-        if exclude_tags:
-            placeholders = ",".join("?" for _ in exclude_tags)
-            query += f" AND tag NOT IN ({placeholders})"
-            params.extend(exclude_tags)
-
-        query += " ORDER BY created_at_utc DESC LIMIT ?"
-        params.append(max_pairs)
-
-        rows = self._fetch_rows(query, params)
-        candidates = [self._row_to_candidate(row) for row in rows]
-        candidates = self._attach_file_rows(candidates)
-        candidates = self._attach_ragmem_bodies(candidates)
-
-        logger(
-            f"Memory working lookup: file={clean_file_id[:8]} | candidates={len(candidates)}",
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            "Memory working lookup result\n"
-            + json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return candidates
-
-    def get_latest_gold(
-        self,
-        file_id: str,
-        cfg: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """
-        Return latest Gold candidates from the active memory file.
-
-        Gold is still bounded by config; it is not unlimited context.
-        """
-        clean_file_id = str(file_id or "").strip()
-        if not clean_file_id:
-            return []
-
-        episodic_cfg = cfg.get("episodic_memory", {}) if isinstance(cfg, dict) else {}
-        if episodic_cfg.get("enabled", True) is False:
-            return []
-
-        max_gold_records = int(episodic_cfg.get("max_gold_records", 1))
-
-        rows = self._fetch_rows(
-            """
-            SELECT *
-            FROM memory_records
-            WHERE file_id = ?
-              AND tag = 'Gold'
-            ORDER BY created_at_utc DESC
-            LIMIT ?
-            """,
-            [clean_file_id, max_gold_records],
-        )
-
-        candidates = [self._row_to_candidate(row) for row in rows]
-        candidates = self._attach_file_rows(candidates)
-        candidates = self._attach_ragmem_bodies(candidates)
-
-        logger(
-            f"Memory Gold lookup: file={clean_file_id[:8]} | candidates={len(candidates)}",
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            "Memory Gold lookup result\n"
-            + json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return candidates
-
-    def get_direct_recall(
-        self,
-        direct_recall_key: str,
-        cfg: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """
-        Lookup a Direct Recall candidate across all memory histories.
-
-        Automatic retrieval stays current-file only, but Direct Recall is allowed
-        to cross histories through exact key lookup.
-        """
-        key = str(direct_recall_key or "").strip()
-        if not key:
-            return None
-
-        direct_cfg = cfg.get("direct_recall", {}) if isinstance(cfg, dict) else {}
-        if direct_cfg.get("enabled", True) is False:
-            return None
-
-        exclude_tags = self._as_list(direct_cfg.get("exclude_tags", ["Black"]))
-
-        query = """
-            SELECT *
-            FROM memory_records
-            WHERE direct_recall_key = ?
-        """
-        params: list[Any] = [key]
-
-        if exclude_tags:
-            placeholders = ",".join("?" for _ in exclude_tags)
-            query += f" AND tag NOT IN ({placeholders})"
-            params.extend(exclude_tags)
-
-        query += """
-            ORDER BY
-              CASE tag WHEN 'Gold' THEN 0 WHEN 'Green' THEN 1 ELSE 2 END,
-              created_at_utc DESC
-            LIMIT 1
-        """
-
-        rows = self._fetch_rows(query, params)
-        if not rows:
-            logger(f"Direct Recall lookup found no match: key={key}", "INFO", "INTERNAL")
-            return None
-
-        candidates = [self._row_to_candidate(rows[0])]
-        candidates = self._attach_file_rows(candidates)
-        candidates = self._attach_ragmem_bodies(candidates)
-
-        candidate = candidates[0] if candidates else None
-
-        logger(
-            f"Direct Recall lookup matched: key={key} | record={candidate.get('record_id', '')[:8] if candidate else ''}",
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            "Direct Recall lookup result\n"
-            + json.dumps(candidate, ensure_ascii=False, indent=2, default=str),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return candidate
-
-    def get_records_by_ids(
-        self,
-        file_id: str,
-        record_ids: list[str],
-    ) -> list[dict[str, Any]]:
-        """
-        Load metadata rows for selected parent MemoryRecord ids.
-        """
-        clean_file_id = str(file_id or "").strip()
-        clean_ids = [str(record_id).strip() for record_id in record_ids if str(record_id).strip()]
-
-        if not clean_file_id or not clean_ids:
-            return []
-
-        placeholders = ",".join("?" for _ in clean_ids)
-
-        rows = self._fetch_rows(
-            f"""
-            SELECT *
-            FROM memory_records
-            WHERE file_id = ?
-              AND record_id IN ({placeholders})
-            """,
-            [clean_file_id, *clean_ids],
-        )
-
-        candidates = [self._row_to_candidate(row) for row in rows]
-        candidates = self._attach_file_rows(candidates)
-        candidates = self._attach_ragmem_bodies(candidates)
-
-        return candidates
-
-    def get_file_row(
-        self,
-        file_id: str,
-    ) -> dict[str, Any] | None:
-        """Return one row from memory_files."""
-        clean_file_id = str(file_id or "").strip()
-        if not clean_file_id:
-            return None
-
-        rows = self._fetch_rows(
-            """
-            SELECT *
-            FROM memory_files
-            WHERE file_id = ?
-            """,
-            [clean_file_id],
-            table_name="memory_files",
-        )
-
-        return dict(rows[0]) if rows else None
-
-    def _fetch_rows(
-        self,
-        query: str,
-        params: list[Any],
-        *,
-        table_name: str = "memory_records",
-    ) -> list[sqlite3.Row]:
-        if not self.sqlite_path.exists():
-            logger(f"Memory SQLite not found: {self.sqlite_path}", "WARN", "PUBLIC")
-            return []
-
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(query, params).fetchall()
-
-        logger_dev(
-            (
-                "MemoryIndexLookup SQL result\n"
-                f"table={table_name}\n"
-                f"query={query.strip()}\n"
-                f"params={params}\n"
-                f"rows={len(rows)}"
-            ),
-            "TRACE",
-            "CONFIDENTIAL",
-        )
-
-        return rows
-
-    def _row_to_candidate(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-        data = dict(row)
-
-        candidate: dict[str, Any] = {
-            "file_id": data.get("file_id", ""),
-            "record_id": data.get("record_id", ""),
-            "parent_id": data.get("parent_id", ""),
-            "created_at_utc": data.get("created_at_utc", ""),
-            "source": data.get("source", ""),
-            "tag": data.get("tag", ""),
-            "retrieval_source_mode": data.get("retrieval_source_mode", "QA"),
-            "direct_recall_key": data.get("direct_recall_key", ""),
-            "auto_keywords": self._json_list(data.get("auto_keywords_json")),
-            "user_keywords": self._json_list(data.get("user_keywords_json")),
-            "active_project_name": data.get("active_project_name", ""),
-            "embedded_files_snapshot": self._json_list(data.get("embedded_files_snapshot_json")),
-            "input_hash": data.get("input_hash", ""),
-            "output_hash": data.get("output_hash", ""),
-            "sqlite_metadata": data,
-        }
-
-        return candidate
-
-    def _attach_file_rows(
-        self,
-        candidates: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        file_cache: dict[str, dict[str, Any]] = {}
-
-        for candidate in candidates:
-            file_id = str(candidate.get("file_id", "")).strip()
-            if not file_id:
-                continue
-
-            if file_id not in file_cache:
-                file_cache[file_id] = self.get_file_row(file_id) or {}
-
-            file_row = file_cache[file_id]
-            candidate["file_row"] = file_row
-            candidate["title"] = file_row.get("title", "")
-            candidate["filename_ragmem"] = file_row.get("filename_ragmem", "")
-            candidate["filename_meta"] = file_row.get("filename_meta", "")
-
-        return candidates
-
-    def _attach_ragmem_bodies(
-        self,
-        candidates: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """
-        Attach stable Q/A body from .ragmem.
-
-        SQLite intentionally stores metadata only, so Q/A body comes from
-        the durable .ragmem file.
-        """
-        if self.memory_root is None:
-            return candidates
-
-        body_cache: dict[tuple[str, str], dict[str, Any]] = {}
-
-        for candidate in candidates:
-            file_id = str(candidate.get("file_id", "")).strip()
-            record_id = str(candidate.get("record_id", "")).strip()
-
-            if not file_id or not record_id:
-                continue
-
-            cache_key = (file_id, record_id)
-            if cache_key not in body_cache:
-                body_cache[cache_key] = self._load_ragmem_body(candidate)
-
-            body = body_cache[cache_key]
-            candidate["input_text"] = body.get("input_text", "")
-            candidate["output_text"] = body.get("output_text", "")
-            candidate["ragmem_body"] = body
-
-        return candidates
-
-    def _load_ragmem_body(
-        self,
-        candidate: dict[str, Any],
-    ) -> dict[str, Any]:
-        if self.memory_root is None:
-            return {}
-
-        filename_ragmem = str(candidate.get("filename_ragmem", "")).strip()
-        record_id = str(candidate.get("record_id", "")).strip()
-
-        if not filename_ragmem or not record_id:
-            return {}
-
-        ragmem_path = self.memory_root / "files" / filename_ragmem
-        if not ragmem_path.exists():
-            return {}
-
-        text = ragmem_path.read_text(encoding="utf-8")
-        pattern = re.compile(
-            rf"{re.escape(RECORD_START)}\n(.*?)\n{re.escape(RECORD_END)}",
-            re.DOTALL,
-        )
-
-        for match in pattern.finditer(text):
-            raw_block = match.group(1)
-            try:
-                data = json.loads(raw_block)
-            except Exception:
-                continue
-
-            if isinstance(data, dict) and str(data.get("record_id", "")) == record_id:
-                return data
-
-        return {}
-
-    @staticmethod
-    def _json_list(value: Any) -> list[Any]:
-        if isinstance(value, list):
-            return value
-
-        if value is None:
-            return []
-
-        try:
-            parsed = json.loads(str(value))
-            return parsed if isinstance(parsed, list) else []
-        except Exception:
-            return []
-
-    @staticmethod
-    def _as_list(value: Any) -> list[str]:
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-
-        if value is None:
-            return []
-
-        text = str(value).strip()
-        return [text] if text else []
-```
-
-### ~\ragstream\memory\memory_ingestion_manager.py
-```python
-# ragstream/memory/memory_ingestion_manager.py
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
-import threading
-
-from typing import Any
-
-from ragstream.textforge.RagLog import LogALL as logger
-
-
-class MemoryIngestionManager:
-    def __init__(
-        self,
-        memory_manager: Any,
-        memory_chunker: Any,
-        memory_vector_store: Any,
-    ) -> None:
-        self.memory_manager = memory_manager
-        self.memory_chunker = memory_chunker
-        self.memory_vector_store = memory_vector_store
-
-        self._lock = threading.Lock()
-        self._active_record_ids: set[str] = set()
-
-    def ingest_record(self, record_id: str) -> dict[str, Any]:
-        clean_record_id = (record_id or "").strip()
-        if not clean_record_id:
-            return {
-                "success": False,
-                "record_id": record_id,
-                "message": "record_id is empty.",
-            }
-
-        record = self._find_record(clean_record_id)
-        if record is None:
-            message = f"MemoryRecord not found for ingestion: {clean_record_id}"
-            logger(message, "WARN", "PUBLIC")
-            return {
-                "success": False,
-                "record_id": clean_record_id,
-                "message": message,
-            }
-
-        try:
-            logger(
-                (
-                    "Memory ingestion started: "
-                    f"record={clean_record_id[:8]} | file_id={self.memory_manager.file_id[:8]}"
-                ),
-                "INFO",
-                "INTERNAL",
-            )
-
-            entries = self.memory_chunker.build_vector_entries(
-                record,
-                file_id=self.memory_manager.file_id,
-                filename_ragmem=self.memory_manager.filename_ragmem,
-                filename_meta=self.memory_manager.filename_meta,
-            )
-
-            role_counts = self._count_roles(entries)
-
-            logger(
-                (
-                    "Memory blocks prepared: "
-                    f"handle={role_counts.get('record_handle', 0)}, "
-                    f"question={role_counts.get('question', 0)}, "
-                    f"answer={role_counts.get('answer', 0)}"
-                ),
-                "INFO",
-                "INTERNAL",
-            )
-
-            result = self.memory_vector_store.replace_record_entries(
-                record_id=clean_record_id,
-                entries=entries,
-            )
-
-            result.update(
-                {
-                    "role_counts": role_counts,
-                    "file_id": self.memory_manager.file_id,
-                    "filename_ragmem": self.memory_manager.filename_ragmem,
-                }
-            )
-
-            logger(
-                (
-                    "Memory ingestion finished: "
-                    f"{role_counts.get('record_handle', 0)} handle, "
-                    f"{role_counts.get('question', 0)} question blocks, "
-                    f"{role_counts.get('answer', 0)} answer blocks "
-                    f"→ {result.get('vectors_written', 0)} vectors."
-                ),
-                "INFO",
-                "PUBLIC",
-            )
-
-            logger(
-                (
-                    "Memory vector store updated: "
-                    f"path={result.get('persist_dir', '')} | "
-                    f"collection={result.get('collection_name', '')} | "
-                    f"record_vectors={result.get('record_vector_count', 0)}"
-                ),
-                "INFO",
-                "INTERNAL",
-            )
-
-            return result
-
-        except Exception as e:
-            message = f"Memory ingestion failed for {clean_record_id[:8]}: {e}"
-            logger(message, "ERROR", "PUBLIC")
-            return {
-                "success": False,
-                "record_id": clean_record_id,
-                "message": message,
-            }
-
-    def ingest_all(self) -> dict[str, Any]:
-        records = list(getattr(self.memory_manager, "records", []) or [])
-
-        total = len(records)
-        success_count = 0
-        failure_count = 0
-        results: list[dict[str, Any]] = []
-
-        logger(f"Memory ingestion started for loaded history: {total} records.", "INFO", "PUBLIC")
-
-        for record in records:
-            result = self.ingest_record(record.record_id)
-            results.append(result)
-
-            if result.get("success"):
-                success_count += 1
-            else:
-                failure_count += 1
-
-        logger(
-            (
-                "Memory history ingestion finished: "
-                f"{success_count} succeeded, {failure_count} failed."
-            ),
-            "INFO" if failure_count == 0 else "WARN",
-            "PUBLIC",
-        )
-
-        return {
-            "success": failure_count == 0,
-            "total": total,
-            "success_count": success_count,
-            "failure_count": failure_count,
-            "results": results,
-        }
-
-    def ingest_record_async(self, record_id: str) -> None:
-        clean_record_id = (record_id or "").strip()
-        if not clean_record_id:
-            return
-
-        record = self._find_record(clean_record_id)
-        if record is None:
-            logger(f"Memory ingestion was not scheduled; record not found: {clean_record_id}", "WARN", "PUBLIC")
-            return
-
-        with self._lock:
-            if clean_record_id in self._active_record_ids:
-                logger(
-                    f"Memory ingestion already running for record: {clean_record_id[:8]}",
-                    "INFO",
-                    "INTERNAL",
-                )
-                return
-
-            self._active_record_ids.add(clean_record_id)
-
-        logger(
-            (
-                "Memory ingestion scheduled: "
-                f"record={clean_record_id[:8]} | "
-                f"question_chars={len(record.input_text or '')} | "
-                f"answer_chars={len(record.output_text or '')}"
-            ),
-            "INFO",
-            "PUBLIC",
-        )
-
-        thread = threading.Thread(
-            target=self._async_worker,
-            args=(clean_record_id,),
-            daemon=True,
-            name=f"memory-ingest-{clean_record_id[:8]}",
-        )
-
-        try:
-            from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
-
-            ctx = get_script_run_ctx()
-            if ctx is not None:
-                add_script_run_ctx(thread, ctx)
-        except Exception:
-            pass
-
-        thread.start()
-
-    def _async_worker(self, record_id: str) -> None:
-        try:
-            self.ingest_record(record_id)
-        finally:
-            with self._lock:
-                self._active_record_ids.discard(record_id)
-
-    def _find_record(self, record_id: str) -> Any | None:
-        for record in getattr(self.memory_manager, "records", []) or []:
-            if getattr(record, "record_id", None) == record_id:
-                return record
-        return None
-
-    @staticmethod
-    def _count_roles(entries: list[dict[str, Any]]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-
-        for entry in entries:
-            metadata = entry.get("metadata", {})
-            role = str(metadata.get("role", "")).strip() or "unknown"
-            counts[role] = counts.get(role, 0) + 1
-
-        return counts
-```
-
-### ~\ragstream\memory\memory_manager.py
-```python
-# ragstream/memory/memory_manager.py
-# -*- coding: utf-8 -*-
-"""
-MemoryManager
-=============
-Owns one active memory history file, its MemoryRecords, MetaInfo,
-.ragmem persistence, .ragmeta.json persistence, and SQLite indexing.
-
-Authority split:
-- .ragmem is append-only and stores stable memory body fields only.
-- .ragmeta.json stores current editable/readable metadata.
-- SQLite mirrors .ragmeta.json for fast lookup/indexing.
-"""
-
-from __future__ import annotations
-
-import json
-import re
-import sqlite3
-import uuid
-
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
-
-from ragstream.memory.memory_record import (
-    MemoryRecord,
-    RECORD_END,
-    RECORD_START,
-)
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _filename_timestamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d-%H-%M")
-
-
-def _safe_title(title: str) -> str:
-    value = (title or "").strip()
-    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
-    value = re.sub(r"-{2,}", "-", value).strip("-._")
-    return value or "Untitled"
-
-
-def _unique(values: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-
-    for value in values:
-        item = str(value).strip()
-        if not item:
-            continue
-
-        key = item.lower()
-        if key in seen:
-            continue
-
-        result.append(item)
-        seen.add(key)
-
-    return result
-
-
-def _clean_retrieval_source_mode(value: str | None) -> str | None:
-    if value is None:
-        return None
-
-    mode = str(value or "").strip().upper()
-    if mode in {"QA", "Q", "A"}:
-        return mode
-
-    return "QA"
-
-
-def _clean_direct_recall_key(value: str | None) -> str | None:
-    if value is None:
-        return None
-
-    return str(value or "").strip()
-
-
-class MemoryManager:
-    def __init__(
-        self,
-        memory_root: Path,
-        sqlite_path: Path,
-        title: str = "",
-    ) -> None:
-        self.file_id: str = uuid.uuid4().hex
-        self.title: str = ""
-        self.filename_ragmem: str = ""
-        self.filename_meta: str = ""
-
-        self.memory_root: Path = Path(memory_root)
-        self.sqlite_path: Path = Path(sqlite_path)
-
-        self.records: list[MemoryRecord] = []
-        self.metainfo: dict[str, Any] = {}
-
-        self.tag_catalog: list[str] = ["Gold", "Green", "Black"]
-        self.b_file_created: bool = False
-
-        self.memory_root.mkdir(parents=True, exist_ok=True)
-        self.files_root.mkdir(parents=True, exist_ok=True)
-        self._init_sqlite()
-
-        if title.strip():
-            self.start_new_history(title)
-
-    @property
-    def files_root(self) -> Path:
-        return self.memory_root / "files"
-
-    @property
-    def ragmem_path(self) -> Path:
-        return self.files_root / self.filename_ragmem
-
-    @property
-    def meta_path(self) -> Path:
-        return self.files_root / self.filename_meta
-
-    def start_new_history(self, title: str) -> None:
-        clean_title = (title or "").strip()
-        if not clean_title:
-            raise ValueError("Memory title must not be empty.")
-
-        self.file_id = uuid.uuid4().hex
-        self.title = clean_title
-        self.records = []
-        self.metainfo = {}
-        self.b_file_created = False
-
-        stem = f"{_filename_timestamp()}-{_safe_title(clean_title)}"
-        filename_ragmem = f"{stem}.ragmem"
-        filename_meta = f"{stem}.ragmeta.json"
-
-        if (self.files_root / filename_ragmem).exists():
-            stem = f"{stem}-{self.file_id[:8]}"
-            filename_ragmem = f"{stem}.ragmem"
-            filename_meta = f"{stem}.ragmeta.json"
-
-        self.filename_ragmem = filename_ragmem
-        self.filename_meta = filename_meta
-
-    def load_history(self, file_id: str) -> None:
-        file_row = self._lookup_file(file_id)
-        if not file_row:
-            raise ValueError(f"Memory history not found: {file_id}")
-
-        self.file_id = file_row["file_id"]
-        self.title = file_row["title"]
-        self.filename_ragmem = file_row["filename_ragmem"]
-        self.filename_meta = file_row["filename_meta"]
-
-        self.records = self._read_ragmem_records(self.ragmem_path)
-        self.b_file_created = self.ragmem_path.exists()
-
-        if self.meta_path.exists():
-            with self.meta_path.open("r", encoding="utf-8") as f:
-                loaded_meta = json.load(f)
-            self.metainfo = loaded_meta if isinstance(loaded_meta, dict) else {}
-            self._apply_metainfo_overlay_to_records()
-        else:
-            self.save_metainfo()
-
-        self.refresh_sqlite_index()
-
-    def list_histories(self) -> list[dict[str, Any]]:
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT file_id, title, filename_ragmem, filename_meta,
-                       created_at_utc, updated_at_utc, record_count
-                FROM memory_files
-                ORDER BY updated_at_utc DESC
-                """
-            ).fetchall()
-
-        return [dict(row) for row in rows]
-
-    def capture_pair(
-        self,
-        input_text: str,
-        output_text: str,
-        source: str,
-        parent_id: str | None = None,
-        user_keywords: list[str] | None = None,
-        active_project_name: str | None = None,
-        embedded_files_snapshot: list[str] | None = None,
-    ) -> MemoryRecord:
-        record = MemoryRecord(
-            input_text=input_text,
-            output_text=output_text,
-            source=source,
-            parent_id=parent_id,
-            tag="Green",
-            user_keywords=user_keywords,
-            active_project_name=active_project_name,
-            embedded_files_snapshot=embedded_files_snapshot,
-            retrieval_source_mode="QA",
-            direct_recall_key="",
-        )
-
-        if not self.title.strip():
-            auto_title = self._build_auto_history_title(
-                record=record,
-                active_project_name=active_project_name,
-            )
-            self.start_new_history(auto_title)
-
-        self.records.append(record)
-        self._append_record_to_ragmem(record)
-        self.save_metainfo()
-        self.refresh_sqlite_index()
-
-        return record
-
-    def sync_gui_edits(
-        self,
-        gui_records_state: list[dict[str, Any]],
-    ) -> None:
-        if not gui_records_state:
-            return
-
-        records_by_id = {record.record_id: record for record in self.records}
-        changed = False
-
-        for item in gui_records_state:
-            record_id = str(item.get("record_id", "")).strip()
-            if not record_id or record_id not in records_by_id:
-                continue
-
-            record = records_by_id[record_id]
-
-            tag = item.get("tag")
-            if tag is not None:
-                tag = str(tag).strip()
-                if tag not in self.tag_catalog:
-                    tag = None
-
-            user_keywords = item.get("user_keywords")
-            if user_keywords is not None and not isinstance(user_keywords, list):
-                user_keywords = []
-
-            retrieval_source_mode = _clean_retrieval_source_mode(item.get("retrieval_source_mode"))
-            direct_recall_key = _clean_direct_recall_key(item.get("direct_recall_key"))
-
-            before = record.to_index_dict()
-            record.update_editable_metadata(
-                tag=tag,
-                user_keywords=user_keywords,
-                retrieval_source_mode=retrieval_source_mode,
-                direct_recall_key=direct_recall_key,
-            )
-            after = record.to_index_dict()
-
-            if before != after:
-                changed = True
-
-        if changed:
-            self.save_metainfo()
-            self.refresh_sqlite_index()
-
-    def save_metainfo(self) -> None:
-        self.metainfo = self._build_metainfo()
-
-        if not self.filename_meta:
-            return
-
-        self.files_root.mkdir(parents=True, exist_ok=True)
-        with self.meta_path.open("w", encoding="utf-8") as f:
-            json.dump(self.metainfo, f, ensure_ascii=False, indent=2)
-
-    def refresh_sqlite_index(self) -> None:
-        self._init_sqlite()
-
-        if not self.file_id or not self.filename_ragmem:
-            return
-
-        metainfo = self._build_metainfo()
-        now = _utc_now()
-
-        created_at_utc = metainfo.get("created_at_utc") or now
-        updated_at_utc = metainfo.get("updated_at_utc") or now
-        record_count = int(metainfo.get("record_count", 0))
-
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO memory_files (
-                    file_id, title, filename_ragmem, filename_meta,
-                    created_at_utc, updated_at_utc, record_count
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(file_id) DO UPDATE SET
-                    title = excluded.title,
-                    filename_ragmem = excluded.filename_ragmem,
-                    filename_meta = excluded.filename_meta,
-                    created_at_utc = excluded.created_at_utc,
-                    updated_at_utc = excluded.updated_at_utc,
-                    record_count = excluded.record_count
-                """,
-                (
-                    self.file_id,
-                    self.title,
-                    self.filename_ragmem,
-                    self.filename_meta,
-                    created_at_utc,
-                    updated_at_utc,
-                    record_count,
-                ),
-            )
-
-            for record in self.records:
-                index_data = record.to_index_dict()
-
-                conn.execute(
-                    """
-                    INSERT INTO memory_records (
-                        file_id, record_id, parent_id, created_at_utc,
-                        source, tag, retrieval_source_mode, direct_recall_key,
-                        auto_keywords_json, user_keywords_json,
-                        active_project_name, embedded_files_snapshot_json,
-                        input_hash, output_hash
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(file_id, record_id) DO UPDATE SET
-                        parent_id = excluded.parent_id,
-                        created_at_utc = excluded.created_at_utc,
-                        source = excluded.source,
-                        tag = excluded.tag,
-                        retrieval_source_mode = excluded.retrieval_source_mode,
-                        direct_recall_key = excluded.direct_recall_key,
-                        auto_keywords_json = excluded.auto_keywords_json,
-                        user_keywords_json = excluded.user_keywords_json,
-                        active_project_name = excluded.active_project_name,
-                        embedded_files_snapshot_json = excluded.embedded_files_snapshot_json,
-                        input_hash = excluded.input_hash,
-                        output_hash = excluded.output_hash
-                    """,
-                    (
-                        self.file_id,
-                        index_data["record_id"],
-                        index_data["parent_id"],
-                        index_data["created_at_utc"],
-                        index_data["source"],
-                        index_data["tag"],
-                        index_data["retrieval_source_mode"],
-                        index_data["direct_recall_key"],
-                        json.dumps(index_data["auto_keywords"], ensure_ascii=False),
-                        json.dumps(index_data["user_keywords"], ensure_ascii=False),
-                        index_data["active_project_name"],
-                        json.dumps(index_data["embedded_files_snapshot"], ensure_ascii=False),
-                        index_data["input_hash"],
-                        index_data["output_hash"],
-                    ),
-                )
-
-            self._delete_sqlite_rows_not_in_memory(conn)
-            conn.commit()
-
-    def _build_metainfo(self) -> dict[str, Any]:
-        record_ids = [record.record_id for record in self.records]
-        parent_ids = _unique([record.parent_id for record in self.records if record.parent_id])
-
-        tag_summary: dict[str, int] = {}
-        auto_keywords: list[str] = []
-        user_keywords: list[str] = []
-
-        for record in self.records:
-            tag_summary[record.tag] = tag_summary.get(record.tag, 0) + 1
-            auto_keywords.extend(record.auto_keywords)
-            user_keywords.extend(record.user_keywords)
-
-        created_at_utc = self.records[0].created_at_utc if self.records else ""
-        updated_at_utc = _utc_now() if self.records else ""
-
-        return {
-            "file_id": self.file_id,
-            "title": self.title,
-            "filename_ragmem": self.filename_ragmem,
-            "filename_meta": self.filename_meta,
-            "created_at_utc": created_at_utc,
-            "updated_at_utc": updated_at_utc,
-            "record_count": len(self.records),
-            "record_ids": record_ids,
-            "parent_ids": parent_ids,
-            "tag_summary": tag_summary,
-            "auto_keywords": _unique(auto_keywords),
-            "user_keywords": _unique(user_keywords),
-            "records": [record.to_index_dict() for record in self.records],
-        }
-
-    def close(self) -> None:
-        self.save_metainfo()
-        self.refresh_sqlite_index()
-
-    def _append_record_to_ragmem(self, record: MemoryRecord) -> None:
-        if not self.filename_ragmem:
-            raise ValueError("Memory filename is not initialized.")
-
-        self.files_root.mkdir(parents=True, exist_ok=True)
-
-        with self.ragmem_path.open("a", encoding="utf-8") as f:
-            f.write(record.to_ragmem_block())
-            f.write("\n")
-
-        self.b_file_created = True
-
-    def _read_ragmem_records(self, path: Path) -> list[MemoryRecord]:
-        if not path.exists():
-            return []
-
-        text = path.read_text(encoding="utf-8")
-        pattern = re.compile(
-            rf"{re.escape(RECORD_START)}\n(.*?)\n{re.escape(RECORD_END)}",
-            re.DOTALL,
-        )
-
-        records: list[MemoryRecord] = []
-
-        for match in pattern.finditer(text):
-            raw_block = match.group(1)
-            try:
-                data = json.loads(raw_block)
-                if isinstance(data, dict):
-                    records.append(MemoryRecord.from_dict(data))
-            except Exception:
-                continue
-
-        return records
-
-    def _apply_metainfo_overlay_to_records(self) -> None:
-        """
-        Overlay current .ragmeta.json metadata onto records loaded from .ragmem.
-
-        .ragmem supplies the stable body.
-        .ragmeta.json supplies current metadata.
-        """
-        meta_records = self.metainfo.get("records", [])
-        if not isinstance(meta_records, list):
-            return
-
-        metadata_by_record_id: dict[str, dict[str, Any]] = {}
-
-        for item in meta_records:
-            if not isinstance(item, dict):
-                continue
-
-            record_id = str(item.get("record_id", "")).strip()
-            if not record_id:
-                continue
-
-            metadata_by_record_id[record_id] = item
-
-        for record in self.records:
-            metadata = metadata_by_record_id.get(record.record_id)
-            if metadata is None:
-                continue
-
-            record.update_metadata_overlay(metadata)
-
-    def _delete_sqlite_rows_not_in_memory(self, conn: sqlite3.Connection) -> None:
-        """
-        Keep SQLite as a mirror of the active MemoryManager.records list.
-        SQLite is not allowed to keep extra current rows for this file_id.
-        """
-        if not self.records:
-            conn.execute(
-                "DELETE FROM memory_records WHERE file_id = ?",
-                (self.file_id,),
-            )
-            return
-
-        record_ids = [record.record_id for record in self.records]
-        placeholders = ",".join("?" for _ in record_ids)
-
-        conn.execute(
-            f"""
-            DELETE FROM memory_records
-            WHERE file_id = ?
-              AND record_id NOT IN ({placeholders})
-            """,
-            [self.file_id, *record_ids],
-        )
-
-    def _lookup_file(self, file_id: str) -> dict[str, Any] | None:
-        self._init_sqlite()
-
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                """
-                SELECT file_id, title, filename_ragmem, filename_meta,
-                       created_at_utc, updated_at_utc, record_count
-                FROM memory_files
-                WHERE file_id = ?
-                """,
-                (file_id,),
-            ).fetchone()
-
-        return dict(row) if row else None
-
-    def _build_auto_history_title(
-        self,
-        record: MemoryRecord,
-        active_project_name: str | None = None,
-    ) -> str:
-        """
-        Build the first memory history title automatically.
-
-        The file name must stay generic and deterministic:
-        YYYY-MM-DD-HH-mm-memory-record.ragmem
-        """
-        return "memory-record"
-
-    def _init_sqlite(self) -> None:
-        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memory_files (
-                    file_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    filename_ragmem TEXT NOT NULL,
-                    filename_meta TEXT NOT NULL,
-                    created_at_utc TEXT NOT NULL,
-                    updated_at_utc TEXT NOT NULL,
-                    record_count INTEGER NOT NULL
-                )
-                """
-            )
-
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memory_records (
-                    file_id TEXT NOT NULL,
-                    record_id TEXT NOT NULL,
-                    parent_id TEXT,
-                    created_at_utc TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    tag TEXT NOT NULL,
-                    retrieval_source_mode TEXT NOT NULL DEFAULT 'QA',
-                    direct_recall_key TEXT NOT NULL DEFAULT '',
-                    auto_keywords_json TEXT NOT NULL,
-                    user_keywords_json TEXT NOT NULL,
-                    active_project_name TEXT,
-                    embedded_files_snapshot_json TEXT NOT NULL,
-                    input_hash TEXT NOT NULL,
-                    output_hash TEXT NOT NULL,
-                    PRIMARY KEY (file_id, record_id)
-                )
-                """
-            )
-
-            self._ensure_memory_records_columns(conn)
-
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_memory_records_tag
-                ON memory_records(tag)
-                """
-            )
-
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_memory_records_project
-                ON memory_records(active_project_name)
-                """
-            )
-
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_memory_records_direct_recall_key
-                ON memory_records(direct_recall_key)
-                """
-            )
-
-            conn.commit()
-
-    @staticmethod
-    def _ensure_memory_records_columns(conn: sqlite3.Connection) -> None:
-        rows = conn.execute("PRAGMA table_info(memory_records)").fetchall()
-        existing_columns = {str(row[1]) for row in rows}
-
-        if "retrieval_source_mode" not in existing_columns:
-            conn.execute(
-                "ALTER TABLE memory_records "
-                "ADD COLUMN retrieval_source_mode TEXT NOT NULL DEFAULT 'QA'"
-            )
-
-        if "direct_recall_key" not in existing_columns:
-            conn.execute(
-                "ALTER TABLE memory_records "
-                "ADD COLUMN direct_recall_key TEXT NOT NULL DEFAULT ''"
-            )
-```
-
-### ~\ragstream\memory\memory_record.py
-```python
-# ragstream/memory/memory_record.py
-# -*- coding: utf-8 -*-
-"""
-MemoryRecord
-============
-One accepted input/output memory unit.
-
-Authority split:
-- .ragmem stores only the stable append-only memory body.
-- .ragmeta.json stores current metadata.
-- SQLite mirrors .ragmeta.json for fast lookup/indexing.
-
-A MemoryRecord in RAM contains both:
-- stable body fields
-- current metadata fields
-
-Only stable body fields are serialized into .ragmem.
-"""
-
-from __future__ import annotations
-
-import hashlib
-import json
-import uuid
-
-from datetime import datetime, timezone
-from typing import Any
-
-
-RECORD_START = "----- MEMORY RECORD START -----"
-RECORD_END = "----- MEMORY RECORD END -----"
-
-
-RETRIEVAL_SOURCE_MODES = {"QA", "Q", "A"}
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _sha256(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
-
-
-def _clean_list(values: list[str] | None) -> list[str]:
-    cleaned: list[str] = []
-    seen: set[str] = set()
-
-    for value in values or []:
-        item = str(value).strip()
-        if not item:
-            continue
-
-        key = item.lower()
-        if key in seen:
-            continue
-
-        cleaned.append(item)
-        seen.add(key)
-
-    return cleaned
-
-
-def _clean_retrieval_source_mode(value: str | None) -> str:
-    mode = str(value or "QA").strip().upper()
-    return mode if mode in RETRIEVAL_SOURCE_MODES else "QA"
-
-
-def _clean_direct_recall_key(value: str | None) -> str:
-    return str(value or "").strip()
-
-
-def _optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-
-    text = str(value).strip()
-    return text if text else None
-
-
-class MemoryRecord:
-    def __init__(
-        self,
-        input_text: str,
-        output_text: str,
-        source: str,
-        parent_id: str | None = None,
-        tag: str = "Green",
-        user_keywords: list[str] | None = None,
-        active_project_name: str | None = None,
-        embedded_files_snapshot: list[str] | None = None,
-        retrieval_source_mode: str = "QA",
-        direct_recall_key: str = "",
-        *,
-        record_id: str | None = None,
-        created_at_utc: str | None = None,
-        auto_keywords: list[str] | None = None,
-        input_hash: str | None = None,
-        output_hash: str | None = None,
-    ) -> None:
-        self.record_id: str = record_id or uuid.uuid4().hex
-        self.parent_id: str | None = parent_id
-        self.created_at_utc: str = created_at_utc or _utc_now()
-
-        self.input_text: str = input_text or ""
-        self.output_text: str = output_text or ""
-        self.source: str = source or ""
-
-        self.tag: str = tag or "Green"
-        self.user_keywords: list[str] = _clean_list(user_keywords)
-        self.retrieval_source_mode: str = _clean_retrieval_source_mode(retrieval_source_mode)
-        self.direct_recall_key: str = _clean_direct_recall_key(direct_recall_key)
-
-        self.active_project_name: str | None = active_project_name
-        self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
-
-        self.input_hash: str = input_hash or _sha256(self.input_text)
-        self.output_hash: str = output_hash or _sha256(self.output_text)
-
-        if auto_keywords is None:
-            self.auto_keywords: list[str] = self.generate_auto_keywords()
-        else:
-            self.auto_keywords = _clean_list(auto_keywords)
-
-    def generate_auto_keywords(self) -> list[str]:
-        text = f"{self.input_text}\n\n{self.output_text}".strip()
-        if not text:
-            return []
-
-        try:
-            import yake
-        except Exception:
-            return []
-
-        try:
-            extractor = yake.KeywordExtractor(
-                lan="en",
-                n=3,
-                dedupLim=0.9,
-                top=5,
-                features=None,
-            )
-            keywords = extractor.extract_keywords(text)
-            return _clean_list([kw for kw, _score in keywords])
-        except Exception:
-            return []
-
-    def update_editable_metadata(
-        self,
-        tag: str | None = None,
-        user_keywords: list[str] | None = None,
-        retrieval_source_mode: str | None = None,
-        direct_recall_key: str | None = None,
-    ) -> None:
-        if tag is not None:
-            clean_tag = str(tag).strip()
-            if clean_tag:
-                self.tag = clean_tag
-
-        if user_keywords is not None:
-            self.user_keywords = _clean_list(user_keywords)
-
-        if retrieval_source_mode is not None:
-            self.retrieval_source_mode = _clean_retrieval_source_mode(retrieval_source_mode)
-
-        if direct_recall_key is not None:
-            self.direct_recall_key = _clean_direct_recall_key(direct_recall_key)
-
-    def update_metadata_overlay(
-        self,
-        metadata: dict[str, Any],
-    ) -> None:
-        """
-        Apply current metadata loaded from .ragmeta.json.
-
-        This method deliberately does not modify stable .ragmem body fields:
-        - record_id
-        - parent_id
-        - created_at_utc
-        - input_text
-        - output_text
-        - source
-        - input_hash
-        - output_hash
-        """
-        if not isinstance(metadata, dict):
-            return
-
-        self.update_editable_metadata(
-            tag=metadata.get("tag"),
-            user_keywords=list(metadata.get("user_keywords") or []),
-            retrieval_source_mode=metadata.get("retrieval_source_mode"),
-            direct_recall_key=metadata.get("direct_recall_key"),
-        )
-
-        if "auto_keywords" in metadata:
-            self.auto_keywords = _clean_list(list(metadata.get("auto_keywords") or []))
-
-        if "active_project_name" in metadata:
-            self.active_project_name = _optional_str(metadata.get("active_project_name"))
-
-        if "embedded_files_snapshot" in metadata:
-            self.embedded_files_snapshot = list(metadata.get("embedded_files_snapshot") or [])
-
-    def to_ragmem_dict(self) -> dict[str, Any]:
-        """
-        Stable append-only .ragmem body.
-
-        Editable GUI metadata is intentionally excluded from this dictionary.
-        """
-        return {
-            "record_id": self.record_id,
-            "parent_id": self.parent_id,
-            "created_at_utc": self.created_at_utc,
-            "input_text": self.input_text,
-            "output_text": self.output_text,
-            "source": self.source,
-            "input_hash": self.input_hash,
-            "output_hash": self.output_hash,
-        }
-
-    def to_ragmem_block(self) -> str:
-        body = json.dumps(self.to_ragmem_dict(), ensure_ascii=False, indent=2)
-        return f"{RECORD_START}\n{body}\n{RECORD_END}\n"
-
-    def to_index_dict(self) -> dict[str, Any]:
-        """
-        Current metadata/index view.
-
-        This dictionary is used for:
-        - .ragmeta.json per-record metadata
-        - SQLite mirror rows
-
-        It does not duplicate full input_text or output_text.
-        """
-        return {
-            "record_id": self.record_id,
-            "parent_id": self.parent_id,
-            "created_at_utc": self.created_at_utc,
-            "source": self.source,
-            "tag": self.tag,
-            "retrieval_source_mode": self.retrieval_source_mode,
-            "direct_recall_key": self.direct_recall_key,
-            "auto_keywords": self.auto_keywords,
-            "user_keywords": self.user_keywords,
-            "active_project_name": self.active_project_name,
-            "embedded_files_snapshot": self.embedded_files_snapshot,
-            "input_hash": self.input_hash,
-            "output_hash": self.output_hash,
-        }
-
-    def to_full_dict(self) -> dict[str, Any]:
-        """
-        Full in-RAM diagnostic/export view.
-
-        This is not used for .ragmem serialization.
-        """
-        data = self.to_ragmem_dict()
-        data.update(
-            {
-                "tag": self.tag,
-                "retrieval_source_mode": self.retrieval_source_mode,
-                "direct_recall_key": self.direct_recall_key,
-                "auto_keywords": self.auto_keywords,
-                "user_keywords": self.user_keywords,
-                "active_project_name": self.active_project_name,
-                "embedded_files_snapshot": self.embedded_files_snapshot,
-            }
-        )
-        return data
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MemoryRecord":
-        """
-        Load one MemoryRecord from a .ragmem block.
-
-        Supports both:
-        - new body-only .ragmem blocks
-        - older full .ragmem blocks that still contain metadata
-
-        Current metadata from .ragmeta.json is applied later by MemoryManager.
-        """
-        auto_keywords_raw = data.get("auto_keywords")
-
-        return cls(
-            input_text=str(data.get("input_text", "")),
-            output_text=str(data.get("output_text", "")),
-            source=str(data.get("source", "")),
-            parent_id=_optional_str(data.get("parent_id")),
-            tag=str(data.get("tag", "Green")),
-            user_keywords=list(data.get("user_keywords") or []),
-            active_project_name=_optional_str(data.get("active_project_name")),
-            embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
-            retrieval_source_mode=str(data.get("retrieval_source_mode", "QA")),
-            direct_recall_key=str(data.get("direct_recall_key", "")),
-            record_id=str(data.get("record_id") or uuid.uuid4().hex),
-            created_at_utc=str(data.get("created_at_utc") or _utc_now()),
-            auto_keywords=(
-                list(auto_keywords_raw)
-                if isinstance(auto_keywords_raw, list)
-                else None
-            ),
-            input_hash=data.get("input_hash"),
-            output_hash=data.get("output_hash"),
-        )
-```
-
-### ~\ragstream\memory\memory_scoring.py
-```python
-# ragstream/memory/memory_scoring.py
-# -*- coding: utf-8 -*-
-"""
-MemoryScorer
-============
-Scoring and aggregation logic for Memory Retrieval.
-
-It receives raw vector hits and converts them into:
-- normalized hit scores
-- parent MemoryRecord scores
-- selected semantic memory chunks
-
-This class does not read SQLite.
-This class does not query Chroma.
-This class does not mutate SuperPrompt.
-"""
-
-from __future__ import annotations
-
-import json
-import math
-
-from typing import Any
-
-from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
-
-
-class MemoryScorer:
-    """
-    Memory retrieval scoring helper.
-
-    Role-separated scoring:
-    - question hits represent similarity to an old problem
-    - answer hits represent similarity to an old solution
-    - record_handle hits represent metadata/keyword/anchor discovery
-    """
-
-    def __init__(
-        self,
-        config: dict[str, Any],
-    ) -> None:
-        self.config: dict[str, Any] = config or {}
-        self.parent_score_weights: dict[str, dict[str, float]] = dict(
-            self.config.get("parent_score_weights", {}) or {}
-        )
-
-        self.default_weights: dict[str, float] = {
-            "answer": 0.55,
-            "question": 0.35,
-            "meta": 0.10,
-        }
-
-    def score_vector_hits(
-        self,
-        raw_hits: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """
-        Normalize raw vector-store hits.
-
-        Chroma usually returns distance, where smaller means better.
-        This method converts distance into a simple similarity-like score.
-        """
-        scored_hits: list[dict[str, Any]] = []
-
-        for rank, hit in enumerate(raw_hits, start=1):
-            metadata = dict(hit.get("metadata", {}) or {})
-            role = str(metadata.get("role", hit.get("role", "")) or "").strip()
-
-            distance = hit.get("distance")
-            score = hit.get("score")
-
-            if score is None:
-                score = self._distance_to_score(distance)
-
-            scored_hit = {
-                "rank": rank,
-                "vector_id": hit.get("id", hit.get("vector_id", "")),
-                "record_id": metadata.get("record_id", hit.get("record_id", "")),
-                "role": role,
-                "score": float(score),
-                "distance": distance,
-                "document": hit.get("document", ""),
-                "metadata": metadata,
-                "raw_hit": hit,
-            }
-
-            scored_hits.append(scored_hit)
-
-        logger(
-            f"Memory vector hits scored: {len(scored_hits)}",
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            "Memory scored vector hits\n"
-            + json.dumps(scored_hits, ensure_ascii=False, indent=2, default=str),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return scored_hits
-
-    def aggregate_parent_scores(
-        self,
-        scored_hits: list[dict[str, Any]],
-        metadata_by_record: dict[str, dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Aggregate vector-hit scores by parent MemoryRecord.
-
-        The parent score is the main episodic score.
-        Individual chunks remain available separately for A3/A4 later.
-        """
-        metadata_by_record = metadata_by_record or {}
-        grouped: dict[str, dict[str, Any]] = {}
-
-        for hit in scored_hits:
-            record_id = str(hit.get("record_id", "")).strip()
-            if not record_id:
-                continue
-
-            role = str(hit.get("role", "")).strip()
-            score = float(hit.get("score", 0.0))
-
-            if record_id not in grouped:
-                metadata = dict(metadata_by_record.get(record_id, {}) or {})
-                grouped[record_id] = {
-                    "record_id": record_id,
-                    "tag": metadata.get("tag", ""),
-                    "retrieval_source_mode": metadata.get("retrieval_source_mode", "QA"),
-                    "question_score": 0.0,
-                    "answer_score": 0.0,
-                    "meta_score": 0.0,
-                    "final_parent_score": 0.0,
-                    "hit_count": 0,
-                    "hits": [],
-                    "metadata": metadata,
-                }
-
-            parent = grouped[record_id]
-            parent["hit_count"] += 1
-            parent["hits"].append(hit)
-
-            if role == "question":
-                parent["question_score"] = max(float(parent["question_score"]), score)
-            elif role == "answer":
-                parent["answer_score"] = max(float(parent["answer_score"]), score)
-            else:
-                parent["meta_score"] = max(float(parent["meta_score"]), score)
-
-        parents = list(grouped.values())
-        parents = self.apply_retrieval_source_mode(parents)
-        parents = self.apply_tag_rules(parents)
-        parents = self.rank_parents(parents)
-
-        logger(
-            f"Memory parent scores aggregated: {len(parents)} parents",
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            "Memory parent score aggregation\n"
-            + json.dumps(parents, ensure_ascii=False, indent=2, default=str),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return parents
-
-    def apply_retrieval_source_mode(
-        self,
-        parent_scores: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """
-        Apply QA/Q/A weighting to parent MemoryRecord scores.
-        """
-        for parent in parent_scores:
-            mode = str(parent.get("retrieval_source_mode", "QA") or "QA").strip().upper()
-            if mode not in {"QA", "Q", "A"}:
-                mode = "QA"
-
-            weights = self.parent_score_weights.get(mode, self.default_weights)
-
-            answer_score = float(parent.get("answer_score", 0.0))
-            question_score = float(parent.get("question_score", 0.0))
-            meta_score = float(parent.get("meta_score", 0.0))
-
-            parent["final_parent_score"] = (
-                answer_score * float(weights.get("answer", 0.0))
-                + question_score * float(weights.get("question", 0.0))
-                + meta_score * float(weights.get("meta", 0.0))
-            )
-
-            parent["applied_weights"] = weights
-            parent["retrieval_source_mode"] = mode
-
-        return parent_scores
-
-    def apply_tag_rules(
-        self,
-        parent_scores: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """
-        Apply current retrieval tag rules.
-
-        Black records are excluded from automatic Memory Retrieval.
-        Gold records receive a small priority lift but still remain bounded.
-        """
-        excluded_tags = self._collect_excluded_tags()
-        result: list[dict[str, Any]] = []
-
-        for parent in parent_scores:
-            tag = str(parent.get("tag", "") or "").strip()
-
-            if tag in excluded_tags:
-                parent["excluded"] = True
-                parent["exclude_reason"] = f"tag={tag}"
-                continue
-
-            if tag == "Gold":
-                parent["final_parent_score"] = float(parent.get("final_parent_score", 0.0)) + 0.05
-                parent["gold_priority_applied"] = True
-            else:
-                parent["gold_priority_applied"] = False
-
-            result.append(parent)
-
-        return result
-
-    def rank_parents(
-        self,
-        parent_scores: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Return parent MemoryRecords sorted by final score."""
-        return sorted(
-            parent_scores,
-            key=lambda item: float(item.get("final_parent_score", 0.0)),
-            reverse=True,
-        )
-
-    def select_semantic_chunks(
-        self,
-        scored_hits: list[dict[str, Any]],
-        max_memory_chunks: int,
-    ) -> list[dict[str, Any]]:
-        """
-        Select raw semantic memory chunks for later A3/A4.
-
-        record_handle hits are not selected here because they are discovery
-        handles, not semantic evidence chunks.
-        """
-        candidates: list[dict[str, Any]] = []
-
-        for hit in scored_hits:
-            role = str(hit.get("role", "")).strip()
-            if role not in {"question", "answer"}:
-                continue
-
-            metadata = dict(hit.get("metadata", {}) or {})
-            tag = str(metadata.get("tag", "") or "").strip()
-            if tag in self._collect_excluded_tags():
-                continue
-
-            candidates.append(
-                {
-                    "vector_id": hit.get("vector_id", ""),
-                    "record_id": hit.get("record_id", ""),
-                    "role": role,
-                    "score": float(hit.get("score", 0.0)),
-                    "distance": hit.get("distance"),
-                    "document": hit.get("document", ""),
-                    "metadata": metadata,
-                    "rank": hit.get("rank"),
-                }
-            )
-
-        candidates.sort(
-            key=lambda item: float(item.get("score", 0.0)),
-            reverse=True,
-        )
-
-        selected = candidates[: max(0, int(max_memory_chunks))]
-
-        logger(
-            f"Semantic memory chunks selected: {len(selected)}",
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            "Selected semantic memory chunks\n"
-            + json.dumps(selected, ensure_ascii=False, indent=2, default=str),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return selected
-
-    def _collect_excluded_tags(self) -> set[str]:
-        tags: set[str] = set()
-
-        for section_name in ("working_memory", "episodic_memory", "direct_recall"):
-            section = self.config.get(section_name, {})
-            for tag in section.get("exclude_tags", []) or []:
-                clean = str(tag).strip()
-                if clean:
-                    tags.add(clean)
-
-        if not tags:
-            tags.add("Black")
-
-        return tags
-
-    @staticmethod
-    def _distance_to_score(distance: Any) -> float:
-        """
-        Convert Chroma distance into a bounded similarity-like score.
-
-        Smaller distance means better match.
-        """
-        try:
-            d = float(distance)
-        except Exception:
-            return 0.0
-
-        if math.isnan(d) or math.isinf(d):
-            return 0.0
-
-        if d < 0:
-            d = 0.0
-
-        return 1.0 / (1.0 + d)
-```
-
-### ~\ragstream\memory\memory_vector_store.py
-```python
-# ragstream/memory/memory_vector_store.py
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
-import json
-
-from pathlib import Path
-from typing import Any
-
-from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
-
-
-class MemoryVectorStore:
-    """
-    Dedicated memory Chroma vector store.
-
-    This store is separate from document Chroma stores.
-
-    It owns:
-    - memory vector persistence
-    - record vector replacement
-    - record vector deletion
-    - file/history vector deletion by file_id
-    - raw vector search for MemoryRetriever
-
-    It does not own:
-    - MemoryRecord truth
-    - SQLite metadata truth
-    - memory scoring
-    - MemoryContextPack creation
-    """
-
-    def __init__(
-        self,
-        persist_dir: str,
-        collection_name: str,
-        embedder: Any,
-    ) -> None:
-        self.persist_dir = str(persist_dir)
-        self.collection_name = collection_name
-        self.embedder = embedder
-
-        Path(self.persist_dir).mkdir(parents=True, exist_ok=True)
-
-        import chromadb
-
-        self._client = chromadb.PersistentClient(path=self.persist_dir)
-        self._collection = self._client.get_or_create_collection(name=self.collection_name)
-
-        logger(
-            f"MemoryVectorStore ready: {self.persist_dir} | collection={self.collection_name}",
-            "INFO",
-            "INTERNAL",
-        )
-
-    def replace_record_entries(
-        self,
-        record_id: str,
-        entries: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        clean_record_id = (record_id or "").strip()
-        if not clean_record_id:
-            raise ValueError("record_id must not be empty.")
-
-        old_count = self.count_record(clean_record_id)
-        self.delete_record(clean_record_id)
-
-        if not entries:
-            return {
-                "success": True,
-                "record_id": clean_record_id,
-                "deleted_old_vectors": old_count,
-                "vectors_written": 0,
-                "record_vector_count": 0,
-                "collection_name": self.collection_name,
-                "persist_dir": self.persist_dir,
-            }
-
-        ids = [str(entry["id"]) for entry in entries]
-        documents = [str(entry.get("document", "")) for entry in entries]
-        metadatas = [self._sanitize_metadata(entry.get("metadata", {})) for entry in entries]
-
-        embeddings = self._embed_documents(documents)
-
-        self._collection.add(
-            ids=ids,
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
-
-        new_count = self.count_record(clean_record_id)
-
-        logger(
-            (
-                "Memory vectors written: "
-                f"record={clean_record_id[:8]} | deleted={old_count} | "
-                f"new={len(ids)} | total_for_record={new_count}"
-            ),
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            (
-                "MemoryVectorStore.replace_record_entries\n"
-                f"record_id={clean_record_id}\n"
-                f"ids={json.dumps(ids, ensure_ascii=False, indent=2)}\n"
-                f"metadatas={json.dumps(metadatas, ensure_ascii=False, indent=2, default=str)}"
-            ),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return {
-            "success": True,
-            "record_id": clean_record_id,
-            "deleted_old_vectors": old_count,
-            "vectors_written": len(ids),
-            "record_vector_count": new_count,
-            "collection_name": self.collection_name,
-            "persist_dir": self.persist_dir,
-        }
-
-    def query(
-        self,
-        query_text: str,
-        n_results: int = 10,
-        where: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Search memory vectors and return flat hit dictionaries.
-
-        Returned hit format:
-        {
-            "id": str,
-            "document": str,
-            "metadata": dict,
-            "distance": float | None,
-            "rank": int
-        }
-        """
-        text = str(query_text or "").strip()
-        if not text:
-            return []
-
-        query_embedding = self._embed_documents([text])[0]
-
-        query_kwargs: dict[str, Any] = {
-            "query_embeddings": [query_embedding],
-            "n_results": int(n_results),
-            "include": ["documents", "metadatas", "distances"],
-        }
-
-        if where:
-            query_kwargs["where"] = self._sanitize_where(where)
-
-        result = self._collection.query(**query_kwargs)
-        hits = self._normalize_query_result(result)
-
-        logger(
-            f"MemoryVectorStore query finished: hits={len(hits)}",
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            (
-                "MemoryVectorStore.query\n"
-                f"query_text={text}\n"
-                f"n_results={n_results}\n"
-                f"where={json.dumps(where or {}, ensure_ascii=False, indent=2, default=str)}\n"
-                f"hits={json.dumps(hits, ensure_ascii=False, indent=2, default=str)}"
-            ),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return hits
-
-    def delete_record(self, record_id: str) -> dict[str, Any]:
-        """Delete all memory vectors belonging to one MemoryRecord."""
-        clean_record_id = (record_id or "").strip()
-        if not clean_record_id:
-            return {
-                "success": False,
-                "record_id": record_id,
-                "deleted_vectors": 0,
-                "message": "record_id is empty.",
-            }
-
-        old_count = self.count_record(clean_record_id)
-
-        if old_count > 0:
-            self._collection.delete(where={"record_id": clean_record_id})
-
-        new_count = self.count_record(clean_record_id)
-
-        deleted_vectors = max(old_count - new_count, 0)
-
-        logger_dev(
-            (
-                "MemoryVectorStore.delete_record\n"
-                f"record_id={clean_record_id}\n"
-                f"old_count={old_count}\n"
-                f"new_count={new_count}\n"
-                f"deleted_vectors={deleted_vectors}"
-            ),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return {
-            "success": True,
-            "record_id": clean_record_id,
-            "deleted_vectors": deleted_vectors,
-            "record_vector_count": new_count,
-        }
-
-    def delete_file(self, file_id: str) -> dict[str, Any]:
-        """
-        Delete all memory vectors belonging to one memory history.
-
-        This is used by FILES tab Delete.
-        """
-        clean_file_id = (file_id or "").strip()
-        if not clean_file_id:
-            return {
-                "success": False,
-                "file_id": file_id,
-                "deleted_vectors": 0,
-                "message": "file_id is empty.",
-            }
-
-        old_count = self.count_file(clean_file_id)
-
-        if old_count > 0:
-            self._collection.delete(where={"file_id": clean_file_id})
-
-        new_count = self.count_file(clean_file_id)
-        deleted_vectors = max(old_count - new_count, 0)
-
-        logger(
-            (
-                "Memory vectors deleted by file_id: "
-                f"file={clean_file_id[:8]} | deleted={deleted_vectors}"
-            ),
-            "INFO",
-            "INTERNAL",
-        )
-
-        logger_dev(
-            (
-                "MemoryVectorStore.delete_file\n"
-                f"file_id={clean_file_id}\n"
-                f"old_count={old_count}\n"
-                f"new_count={new_count}\n"
-                f"deleted_vectors={deleted_vectors}"
-            ),
-            "DEBUG",
-            "CONFIDENTIAL",
-        )
-
-        return {
-            "success": True,
-            "file_id": clean_file_id,
-            "deleted_vectors": deleted_vectors,
-            "file_vector_count": new_count,
-            "collection_name": self.collection_name,
-            "persist_dir": self.persist_dir,
-        }
-
-    def count_record(self, record_id: str) -> int:
-        """Count vectors belonging to one MemoryRecord."""
-        clean_record_id = (record_id or "").strip()
-        if not clean_record_id:
-            return 0
-
-        try:
-            result = self._collection.get(where={"record_id": clean_record_id})
-            return len(result.get("ids", []))
-        except Exception:
-            return 0
-
-    def count_file(self, file_id: str) -> int:
-        """Count vectors belonging to one memory history."""
-        clean_file_id = (file_id or "").strip()
-        if not clean_file_id:
-            return 0
-
-        try:
-            result = self._collection.get(where={"file_id": clean_file_id})
-            return len(result.get("ids", []))
-        except Exception:
-            return 0
-
-    def _embed_documents(self, documents: list[str]) -> list[list[float]]:
-        if not documents:
-            return []
-
-        vectors = self.embedder.embed(documents)
-
-        result: list[list[float]] = []
-        for vector in vectors:
-            if hasattr(vector, "tolist"):
-                vector = vector.tolist()
-            result.append([float(value) for value in vector])
-
-        return result
-
-    @staticmethod
-    def _normalize_query_result(result: dict[str, Any]) -> list[dict[str, Any]]:
-        ids = (result.get("ids") or [[]])[0] or []
-        documents = (result.get("documents") or [[]])[0] or []
-        metadatas = (result.get("metadatas") or [[]])[0] or []
-        distances = (result.get("distances") or [[]])[0] or []
-
-        hits: list[dict[str, Any]] = []
-
-        for idx, vector_id in enumerate(ids):
-            metadata = metadatas[idx] if idx < len(metadatas) and metadatas[idx] else {}
-            document = documents[idx] if idx < len(documents) else ""
-            distance = distances[idx] if idx < len(distances) else None
-
-            hits.append(
-                {
-                    "id": vector_id,
-                    "document": document,
-                    "metadata": metadata,
-                    "distance": distance,
-                    "rank": idx + 1,
-                }
-            )
-
-        return hits
-
-    @staticmethod
-    def _sanitize_where(where: dict[str, Any]) -> dict[str, str | int | float | bool]:
-        clean: dict[str, str | int | float | bool] = {}
-
-        for key, value in (where or {}).items():
-            if value is None:
-                continue
-
-            clean_key = str(key)
-
-            if isinstance(value, bool):
-                clean[clean_key] = value
-            elif isinstance(value, int):
-                clean[clean_key] = value
-            elif isinstance(value, float):
-                clean[clean_key] = value
-            else:
-                clean[clean_key] = str(value)
-
-        return clean
-
-    @staticmethod
-    def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
-        clean: dict[str, str | int | float | bool] = {}
-
-        for key, value in (metadata or {}).items():
-            clean_key = str(key)
-
-            if value is None:
-                clean[clean_key] = ""
-            elif isinstance(value, bool):
-                clean[clean_key] = value
-            elif isinstance(value, int):
-                clean[clean_key] = value
-            elif isinstance(value, float):
-                clean[clean_key] = value
-            elif isinstance(value, str):
-                clean[clean_key] = value
-            else:
-                clean[clean_key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-        return clean
 ```
 
 

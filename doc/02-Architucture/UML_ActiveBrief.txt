@@ -4,165 +4,142 @@ top to bottom direction
 skinparam linetype ortho
 skinparam classAttributeIconSize 0
 skinparam packageStyle rectangle
-skinparam nodesep 40
-skinparam ranksep 35
+skinparam nodesep 25
+skinparam ranksep 55
+skinparam defaultTextAlignment center
 hide empty members
 
 '──────────────────────────────────────────────────────────────
-' ACTIVE RETRIEVAL BRIEF — MEMORY RECORDING TIME
-' Focus: two new Python files only
+' ACTIVE RETRIEVAL BRIEF — CURRENT COMPACT ARCHITECTURE
+' Compact vertical layout for readable PDF export
 '──────────────────────────────────────────────────────────────
 
-package "Memory Recording Core" {
+package "Memory Recording Core" as MRC {
 
     class MemoryManager {
-        + capture_pair(...) : MemoryRecord
-        - _update_active_retrieval_brief(record:MemoryRecord) : None
+        + capture_pair(...)
+        - update_active_brief(...)
+        - pending_topic_buffer
     }
 
     class MemoryRecord {
-        + record_id : str
-        + parent_id : str
-        + input_text : str
-        + output_text : str
-        + active_retrieval_brief : str
-        + active_retrieval_brief_contributor_ids : List[str]
+        + record_id
+        + input_text
+        + output_text
+        + active_retrieval_brief
+        + contributor_ids
     }
+
+    MemoryManager --> MemoryRecord : creates + saves
 }
 
-package "Memory Compression / ActiveBrief" {
+package "ActiveBrief Compression" as ABC {
 
     class MemorySentenceReducer {
-        + max_tokens_total : int
-        + question_max_tokens : int
-        + window_size_sentences : int
-        + window_overlap_sentences : int
-        + redundancy_threshold : float
-        + embedding_model : str
+        + embedding_model
+        + reduce_with_centroid(...)
+        + reduce_with_query(...)
+    }
 
-        + reduce_with_anchor(
-            input_text:str,
-            output_text:str,
-            anchor_vector:List[float]
-          ) : Dict
-
-        + reduce_with_centroid(
-            input_text:str,
-            output_text:str
-          ) : Dict
-
-        - _allocate_qa_budget(
-            input_tokens:int,
-            output_tokens:int
-          ) : Tuple[int,int]
+    class MemoryActiveBriefRelevanceGate {
+        + activebrief_threshold
+        + pending_topic_threshold
+        + evaluate(...)
     }
 
     class MemoryActiveRetrievalBriefBuilder {
-        + reducer : MemorySentenceReducer
-        + agent_factory : AgentFactory
-        + llm_client : LLMClient
-        + agent_id : str
-        + agent_version : str
-        + target_brief_tokens : int
-
-        + build_for_record(
-            record:MemoryRecord,
-            previous_brief:str
-          ) : Dict
-
-        - _compose_agent_input(
-            record:MemoryRecord,
-            reduced_qa:Dict,
-            previous_brief:str
-          ) : Dict
-
-        - _parse_agent_output(
-            raw_output:str
-          ) : Dict
+        + build_for_record(...)
     }
+
+    MemoryActiveRetrievalBriefBuilder --> MemorySentenceReducer : reduce Q/A
+    MemoryActiveRetrievalBriefBuilder --> MemoryActiveBriefRelevanceGate : decide route
 }
 
-package "Agent Stack" {
+package "Agent Stack" as AG {
 
     class AgentFactory {
-        + get_agent(agent_id:str, version:str) : AgentPrompt
+        + get_agent(...)
     }
 
     class AgentPrompt {
-        + compose(input_payload:Dict) : tuple
-        + parse(raw_output:str) : Dict
+        + compose(...)
+        + parse(...)
     }
 
     class LLMClient {
-        + chat(...) : str
+        + chat(...)
     }
 
     class AgentJSON {
-        data/agents/
-        memory_activebrief_qa_summarizer/
-        memory_activebrief_qa_summarizer_001.json
+        memory_activebrief/*.json
     }
+
+    AgentFactory --> AgentPrompt
+    AgentPrompt --> AgentJSON
 }
 
-package "Runtime Config" {
+package "Runtime Config" as CFG {
 
     class RuntimeConfig {
-        + max_tokens_total : int
-        + question_max_tokens : int
-        + window_size_sentences : int
-        + window_overlap_sentences : int
-        + redundancy_threshold : float
-        + target_brief_tokens : int
+        + embedding_model = text-embedding-3-small
+        + activebrief_threshold
+        + pending_topic_threshold
+        + reducer_limits
+        + target_brief_tokens
+    }
+}
+
+package "Later MemoryMerge Boundary" as MM {
+
+    class MemoryMerge {
+        + reduced_episodic_records
+        + semantic_memory_chunks
+        + activebrief_as_reference
+        + final_memory_context
     }
 }
 
 '──────────────────────────────────────────────────────────────
-' FLOW
+' VERTICAL PACKAGE ORDER
 '──────────────────────────────────────────────────────────────
 
-MemoryManager --> MemoryRecord : creates + saves
+MRC -[hidden]down-> ABC
+ABC -[hidden]down-> AG
+AG -[hidden]down-> CFG
+CFG -[hidden]down-> MM
+
+'──────────────────────────────────────────────────────────────
+' MAIN FLOW
+'──────────────────────────────────────────────────────────────
+
 MemoryManager --> MemoryActiveRetrievalBriefBuilder : after durable save
+MemoryManager --> MemoryActiveBriefRelevanceGate : pending buffer
+MemoryActiveRetrievalBriefBuilder --> AgentFactory : get init/update agent
+MemoryActiveRetrievalBriefBuilder --> LLMClient : only if gate passes
+MemoryActiveRetrievalBriefBuilder --> MemoryRecord : write/copy brief
+MemoryActiveBriefRelevanceGate --> MemoryManager : update/clear pending topic
+RuntimeConfig --> MemorySentenceReducer
+RuntimeConfig --> MemoryActiveBriefRelevanceGate
+RuntimeConfig --> MemoryActiveRetrievalBriefBuilder
+MemoryRecord ..> MemoryMerge : future source
 
-MemoryActiveRetrievalBriefBuilder --> MemorySentenceReducer : reduce_with_centroid()
-MemoryActiveRetrievalBriefBuilder --> MemoryRecord : reads Q/A + previous brief
-MemoryActiveRetrievalBriefBuilder --> AgentFactory : get_agent(...)
-MemoryActiveRetrievalBriefBuilder --> LLMClient : one LLM call
-MemoryActiveRetrievalBriefBuilder --> MemoryRecord : writes new brief
-
-AgentFactory --> AgentPrompt : returns configured prompt
-AgentPrompt --> AgentJSON : loaded from JSON
-
-RuntimeConfig --> MemorySentenceReducer : reducer settings
-RuntimeConfig --> MemoryActiveRetrievalBriefBuilder : target brief size
-
-note right of MemorySentenceReducer
-  Shared deterministic reducer.
-
-  ActiveBrief path:
-  - uses centroid anchor
-
-  Future retrieval compression:
-  - uses external query anchor
-
-  Same core reduction logic.
+note right of MemoryActiveBriefRelevanceGate
+  Routes:
+  - update brief
+  - skip + copy previous
+  - store pending topic
+  - confirm topic shift
 end note
 
 note right of MemoryActiveRetrievalBriefBuilder
-  One LLM call only.
-
-  Input:
-  - previous clean brief
-  - reduced Q/A
-
-  Output:
-  - new active_retrieval_brief
-  - contributor ids
+  Init agent only for first record.
+  Topic shift uses update agent.
 end note
 
-note bottom of MemoryManager
-  ActiveBrief creation happens
-  during Memory Recording,
-  after MemoryRecord is safely saved.
+note bottom of MemoryMerge
+  Semantic memory stays in MemoryMerge,
+  not document A3/A4.
+  ActiveBrief is reference only.
 end note
 
 @enduml

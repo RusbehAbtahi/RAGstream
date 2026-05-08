@@ -16,11 +16,12 @@ It reads:
 
 It writes:
 - raw MemoryContextPack into SuperPrompt
+- synthesized Memory Context into SuperPrompt
+- latest ActiveRetrievalBrief into SuperPrompt
 
 It does NOT run:
 - A3
 - A4
-- MemoryMerge
 - PromptBuilder
 """
 
@@ -34,6 +35,9 @@ from typing import Any
 from ragstream.memory.retrieval.memory_context_pack import MemoryContextPack
 from ragstream.memory.retrieval.memory_index_lookup import MemoryIndexLookup
 from ragstream.memory.retrieval.memory_scoring import MemoryScorer
+from ragstream.memory.compression.memory_compressor import MemoryCompressor
+from ragstream.memory.memory_merge_synthesizer import MemoryMergeSynthesizer
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.textforge.RagLog import LogALL as logger
 from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
@@ -47,6 +51,7 @@ class MemoryRetriever:
     - SQLite lookup is delegated to MemoryIndexLookup
     - scoring is delegated to MemoryScorer
     - candidate storage is delegated to MemoryContextPack
+    - final Memory Context synthesis is delegated to MemoryMergeSynthesizer
     """
 
     def __init__(
@@ -58,6 +63,7 @@ class MemoryRetriever:
     ) -> None:
         self.memory_manager = memory_manager
         self.memory_vector_store = memory_vector_store
+        self.runtime_config = dict(config or {})
 
         # Accept either the full runtime_config or only runtime_config["memory_retrieval"].
         if "memory_retrieval" in (config or {}):
@@ -71,6 +77,8 @@ class MemoryRetriever:
             memory_root=memory_root,
         )
         self.scorer = MemoryScorer(self.config)
+        self.compressor = MemoryCompressor(self.runtime_config)
+        self.memory_synthesizer = MemoryMergeSynthesizer(runtime_config=self.runtime_config)
 
     def run(
         self,
@@ -96,6 +104,7 @@ class MemoryRetriever:
             return self._write_empty_pack(sp, reason="empty_query_text")
 
         direct_recall_key = self._extract_direct_recall_key(sp)
+        active_brief_info = self._find_latest_active_brief_info()
 
         logger(
             f"Memory Retrieval started: file={active_file_id[:8]}",
@@ -109,6 +118,7 @@ class MemoryRetriever:
                 f"active_file_id={active_file_id}\n"
                 f"memory_title={getattr(self.memory_manager, 'title', '')}\n"
                 f"query_text={query_text}\n"
+                f"active_brief_title={active_brief_info.get('active_retrieval_brief_title', '')}\n"
                 f"direct_recall_key={direct_recall_key}\n"
                 f"config={json.dumps(self.config, ensure_ascii=False, indent=2, default=str)}"
             ),
@@ -132,6 +142,8 @@ class MemoryRetriever:
             working_candidates=index_candidates["working_memory"],
             direct_recall_candidate=index_candidates["direct_recall"],
             gold_candidates=index_candidates["gold"],
+            query_text=query_text,
+            active_brief_info=active_brief_info,
             diagnostics={
                 "query_text": query_text,
                 "active_file_id": active_file_id,
@@ -148,7 +160,11 @@ class MemoryRetriever:
             },
         )
 
-        self._write_to_superprompt(sp, pack)
+        self._write_to_superprompt(
+            sp=sp,
+            pack=pack,
+            active_brief_info=active_brief_info,
+        )
 
         self._log_developer_diagnostics(
             query_text=query_text,
@@ -164,6 +180,7 @@ class MemoryRetriever:
                 f"working={len(pack.working_memory_candidates)}, "
                 f"episodic={len(pack.episodic_candidates)}, "
                 f"semantic_chunks={len(pack.semantic_memory_chunks)}, "
+                f"memory_context={1 if pack.synthesized_memory_context else 0}, "
                 f"direct_recall={1 if pack.direct_recall_candidate else 0}"
             ),
             "INFO",
@@ -179,9 +196,21 @@ class MemoryRetriever:
         """
         Build memory retrieval query text from SuperPrompt.
 
-        We intentionally use the same conceptual fields that document retrieval
-        already cares about: task, purpose, context, and fallback prompt_ready.
+        Primary source:
+        - sp.effective_retrieval_query_text filled by PreProcessing.
+
+        Fallback:
+        - build from TASK / PURPOSE / CONTEXT using SuperPromptProjector.
         """
+        effective_query_text = str(getattr(sp, "effective_retrieval_query_text", "") or "").strip()
+        if effective_query_text:
+            return effective_query_text
+
+        try:
+            return SuperPromptProjector.build_query_text(sp)
+        except Exception:
+            pass
+
         body = getattr(sp, "body", {}) or {}
 
         parts: list[str] = []
@@ -297,6 +326,8 @@ class MemoryRetriever:
         working_candidates: list[dict[str, Any]],
         direct_recall_candidate: dict[str, Any] | None,
         gold_candidates: list[dict[str, Any]],
+        query_text: str,
+        active_brief_info: dict[str, Any],
         diagnostics: dict[str, Any],
     ) -> MemoryContextPack:
         """
@@ -312,6 +343,11 @@ class MemoryRetriever:
             gold_candidates=gold_candidates,
         )
 
+        episodic_final = self.compressor.compress_episodic_candidates(
+            episodic_candidates=episodic_final,
+            effective_query_text=query_text,
+        )
+
         for candidate in episodic_final:
             pack.add_episodic_candidate(candidate)
 
@@ -320,6 +356,19 @@ class MemoryRetriever:
 
         pack.set_direct_recall(direct_recall_candidate)
 
+        synthesis_result = self.memory_synthesizer.synthesize(
+            effective_retrieval_query_text=query_text,
+            active_retrieval_brief_title=str(active_brief_info.get("active_retrieval_brief_title", "") or ""),
+            active_retrieval_brief=str(active_brief_info.get("active_retrieval_brief", "") or ""),
+            episodic_candidates=pack.episodic_candidates,
+            semantic_memory_chunks=pack.semantic_memory_chunks,
+        )
+
+        pack.set_synthesized_memory_context(
+            memory_context=str(synthesis_result.get("memory_context", "") or ""),
+            diagnostics=dict(synthesis_result.get("memory_synthesis_diagnostics", {}) or {}),
+        )
+
         pack.set_selection_diagnostics(diagnostics)
         pack.set_token_budget_report(self._estimate_token_budget(pack))
 
@@ -327,22 +376,33 @@ class MemoryRetriever:
 
     def _write_to_superprompt(
         self,
+        *,
         sp: Any,
         pack: MemoryContextPack,
+        active_brief_info: dict[str, Any],
     ) -> None:
         """
-        Store MemoryContextPack into SuperPrompt.
-
-        This keeps raw memory candidates available for GUI and later stages.
+        Store MemoryContextPack, synthesized Memory Context, and ActiveBrief
+        into SuperPrompt.
         """
         setattr(sp, "memory_context_pack", pack)
+        setattr(sp, "memory_context_text", pack.synthesized_memory_context)
+
+        active_title = str(active_brief_info.get("active_retrieval_brief_title", "") or "").strip()
+        active_brief = str(active_brief_info.get("active_retrieval_brief", "") or "").strip()
+
+        setattr(sp, "active_memory_brief_title", active_title)
+        setattr(sp, "active_memory_brief", active_brief)
 
         if not hasattr(sp, "extras") or getattr(sp, "extras") is None:
             setattr(sp, "extras", {})
 
         sp.extras["memory_context_pack"] = pack.to_dict()
+        sp.extras["memory_context_text"] = pack.synthesized_memory_context
         sp.extras["memory_debug_markdown"] = pack.to_debug_markdown()
         sp.extras["memory_retrieval_counts"] = pack.counts()
+        sp.extras["active_memory_brief_title"] = active_title
+        sp.extras["active_memory_brief"] = active_brief
 
     def _query_memory_vectors(
         self,
@@ -630,6 +690,39 @@ class MemoryRetriever:
 
         return result
 
+    def _find_latest_active_brief_info(self) -> dict[str, Any]:
+        """
+        Find latest non-Black ActiveRetrievalBrief in live memory records.
+        """
+        records = list(getattr(self.memory_manager, "records", []) or [])
+
+        for record in reversed(records):
+            tag = str(getattr(record, "tag", "") or "").strip()
+            if tag == "Black":
+                continue
+
+            active_brief = str(getattr(record, "active_retrieval_brief", "") or "").strip()
+            if not active_brief:
+                continue
+
+            return {
+                "record_id": str(getattr(record, "record_id", "") or ""),
+                "active_retrieval_brief_title": str(
+                    getattr(record, "active_retrieval_brief_title", "") or ""
+                ).strip(),
+                "active_retrieval_brief": active_brief,
+                "active_retrieval_brief_contributor_ids": list(
+                    getattr(record, "active_retrieval_brief_contributor_ids", []) or []
+                ),
+            }
+
+        return {
+            "record_id": "",
+            "active_retrieval_brief_title": "",
+            "active_retrieval_brief": "",
+            "active_retrieval_brief_contributor_ids": [],
+        }
+
     def _extract_direct_recall_key(
         self,
         sp: Any,
@@ -658,7 +751,7 @@ class MemoryRetriever:
         """
         Rough token estimate for diagnostics.
 
-        MemoryMerge later owns exact trimming/compression.
+        Exact final answer trimming belongs to later stages.
         """
         data = pack.to_dict()
         text = json.dumps(data, ensure_ascii=False, default=str)
@@ -673,6 +766,7 @@ class MemoryRetriever:
                 "episodic_memory": self.config.get("episodic_memory", {}),
                 "direct_recall": self.config.get("direct_recall", {}),
                 "semantic_memory_chunks": self.config.get("semantic_memory_chunks", {}),
+                "memory_merge_synthesizer": self.runtime_config.get("memory_merge_synthesizer", {}),
             },
         }
 
@@ -683,7 +777,11 @@ class MemoryRetriever:
     ) -> Any:
         pack = MemoryContextPack()
         pack.set_selection_diagnostics({"empty_reason": reason})
-        self._write_to_superprompt(sp, pack)
+        self._write_to_superprompt(
+            sp=sp,
+            pack=pack,
+            active_brief_info=self._find_latest_active_brief_info(),
+        )
         return sp
 
     def _log_developer_diagnostics(

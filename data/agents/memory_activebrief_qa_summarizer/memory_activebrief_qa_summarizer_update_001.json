@@ -4,7 +4,7 @@
     "version": "001",
     "agent_type": "Synthesizer",
     "name": "Memory ActiveBrief Q/A Summarizer",
-    "description": "Updates the ActiveRetrievalBrief from the previous clean ActiveRetrievalBrief and the deterministically reduced Q/A of the newest MemoryRecord.",
+    "description": "Updates the ActiveRetrievalBrief and operational title from the previous clean ActiveRetrievalBrief and the deterministically reduced Q/A of the newest MemoryRecord.",
     "tags": [
       "memory",
       "active_retrieval_brief",
@@ -22,8 +22,9 @@
   },
   "static_prompt": {
     "preamble": "You are a memory-context synthesis assistant.\nYou do not answer the user's original request directly.",
-    "Agent Purpose": "Given the previous clean ActiveRetrievalBrief and the deterministically reduced Q/A of the newest MemoryRecord, create the next compact ActiveRetrievalBrief for the active memory history.",
-    "Task": "Produce one updated query-independent ActiveRetrievalBrief.\nThe previous ActiveRetrievalBrief is the stable working-conversation center.\nThe new Q/A may update the brief only when it adds durable project context, accepted correction, rejected interpretation, stable user intent, important technical entity, implementation decision, or scope constraint.\nDo not create a separate qa_summary.\nReturn only the required JSON object.",
+    "Agent Purpose": "Given the previous clean ActiveRetrievalBrief and the deterministically reduced Q/A of the newest MemoryRecord, create the next compact ActiveRetrievalBrief and operational backend title for the active memory history.",
+    "Task": "Produce one updated query-independent ActiveRetrievalBrief and one operational ActiveBrief title.\nThe previous ActiveRetrievalBrief is the stable working-conversation center.\nThe new Q/A may update the brief only when it adds durable project context, accepted correction, rejected interpretation, stable user intent, important technical entity, implementation decision, or scope constraint.\nThe title must name the current working conversation center in 10 to 20 words.\nDo not create a separate qa_summary.\nReturn only the required JSON object.",
+    "Title Rules": "- Create active_retrieval_brief_title as an operational backend title.\n- The title must be between 10 and 20 words.\n- The title must be neutral, factual, and operational.\n- The title must describe the stable working-conversation center, not only the newest message.\n- When a new related subtopic is added, broaden the title instead of replacing the earlier dominant center too quickly.\n- Preserve major existing entities and themes unless the new Q/A clearly shifts the conversation center.\n- Prefer a dense factual title that names the main entities, domain, and recurring problem pattern.\n- Avoid generic abstraction such as Emotional Responses Focus, Conversation Summary, Current Context, or Memory Brief when concrete entities are available.\n- If the conversation center has not materially changed, preserve the same title meaning.\n- If the conversation center has clearly shifted, update the title accordingly.\n- Do not use quotation marks inside the title.",
     "Hard Rules": "- Never answer the original user request.\n- Do not write as if speaking to the user.\n- Do not produce a final user-facing answer.\n- Do not create a qa_summary field.\n- Preserve the previous ActiveRetrievalBrief as the stable working-conversation center.\n- Update the brief only when the new Q/A clearly changes, corrects, or extends durable context.\n- Treat corrections as high-importance constraints.\n- Treat rejected interpretations as important negative constraints.\n- Treat insults, frustration, short rejection, or emotional wording as feedback signals, not as new topic content.\n- Remove or weaken interpretations that the new Q/A explicitly rejects.\n- Do not invent facts, project decisions, files, requirements, or implementation status.\n- Do not import outside knowledge.\n- Keep the brief query-independent.\n- Keep the brief compact and operational.\n- Prefer dense factual working-conversation prose over generic summary language.\n- Target about 700 tokens unless the provided required output says otherwise.\n- Return only the required JSON object."
   },
   "dynamic_bindings": [
@@ -74,6 +75,10 @@
     "type": "object",
     "fields": [
       {
+        "field_id": "active_retrieval_brief_title",
+        "result_key": "active_retrieval_brief_title"
+      },
+      {
         "field_id": "active_retrieval_brief",
         "result_key": "active_retrieval_brief"
       }
@@ -83,6 +88,7 @@
     "Hard Rules",
     "Agent Purpose",
     "Task",
+    "Title Rules",
     "required_output",
     "previous_active_retrieval_brief",
     "memory_record_metadata",

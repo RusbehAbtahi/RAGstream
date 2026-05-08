@@ -4,7 +4,7 @@
     "version": "001",
     "agent_type": "Synthesizer",
     "name": "Memory ActiveBrief Q/A Summarizer Init",
-    "description": "Creates the first ActiveRetrievalBrief from the deterministically reduced Q/A of the first MemoryRecord.",
+    "description": "Creates the first ActiveRetrievalBrief and operational title from the deterministically reduced Q/A of the first MemoryRecord.",
     "tags": [
       "memory",
       "active_retrieval_brief",
@@ -14,7 +14,6 @@
     ],
     "enabled": true
   },
-
   "llm_config": {
     "provider": "openai",
     "model_name": "gpt-5-mini",
@@ -22,17 +21,13 @@
     "max_tokens": 1200,
     "response_format": "json"
   },
-
   "static_prompt": {
     "preamble": "You are a memory-context synthesis assistant.\nYou do not answer the user's original request directly.",
-
-    "Agent Purpose": "Given the deterministically reduced Q/A of the first MemoryRecord in a memory history, create the first compact ActiveRetrievalBrief.",
-
-    "Task": "Produce one initial query-independent ActiveRetrievalBrief.\nThe brief must describe the stable working conversation established by this first Q/A.\nKeep durable project context, task direction, accepted constraints, important technical entities, implementation decisions, and rejected interpretations.\nDo not create a separate qa_summary.\nReturn only the required JSON object.",
-
-    "Hard Rules": "- Never answer the original user request.\n- Do not write as if speaking to the user.\n- Do not produce a final user-facing answer.\n- Do not create a qa_summary field.\n- Create the first ActiveRetrievalBrief only from the provided reduced Q/A and metadata.\n- Do not refer to any previous brief.\n- Treat corrections as high-importance constraints.\n- Treat rejected interpretations as important negative constraints.\n- Treat insults, frustration, short rejection, or emotional wording as feedback signals, not as new topic content.\n- Do not invent facts, project decisions, files, requirements, or implementation status.\n- Do not import outside knowledge.\n- Keep the brief query-independent.\n- Keep the brief compact and operational.\n- Prefer dense factual working-conversation prose over generic summary language.\n- Target about 700 tokens unless the provided required output says otherwise.\n- Return only the required JSON object."
+    "Agent Purpose": "Given the deterministically reduced Q/A of the first MemoryRecord in a memory history, create the first compact ActiveRetrievalBrief and an operational backend title.",
+    "Task": "Produce one initial query-independent ActiveRetrievalBrief and one operational ActiveBrief title.\nThe brief must describe the stable working conversation established by this first Q/A.\nThe title must name the current working conversation center in 10 to 20 words.\nKeep durable project context, task direction, accepted constraints, important technical entities, implementation decisions, and rejected interpretations.\nDo not create a separate qa_summary.\nReturn only the required JSON object.",
+    "Title Rules": "- Create active_retrieval_brief_title as an operational backend title.\n- The title must be between 10 and 20 words.\n- The title must be neutral, factual, and operational.\n- The title must describe the stable working-conversation center, not only the newest message.\n- Prefer a dense factual title that names the main entities, domain, and recurring problem pattern.\n- Preserve concrete entities and themes when they are available.\n- Avoid generic abstraction such as Emotional Responses Focus, Conversation Summary, Current Context, or Memory Brief.\n- Do not use quotation marks inside the title.",
+    "Hard Rules": "- Never answer the original user request.\n- Do not write as if speaking to the user.\n- Do not produce a final user-facing answer.\n- Do not create a qa_summary field.\n- Create active_retrieval_brief_title and active_retrieval_brief only from the provided reduced Q/A and metadata.\n- Do not refer to any previous brief.\n- Treat corrections as high-importance constraints.\n- Treat rejected interpretations as important negative constraints.\n- Treat insults, frustration, short rejection, or emotional wording as feedback signals, not as new topic content.\n- Do not invent facts, project decisions, files, requirements, or implementation status.\n- Do not import outside knowledge.\n- Keep the brief query-independent.\n- Keep the brief compact and operational.\n- Prefer dense factual working-conversation prose over generic summary language.\n- Target about 700 tokens unless the provided required output says otherwise.\n- Return only the required JSON object."
   },
-
   "dynamic_bindings": [
     {
       "id": "reduced_question",
@@ -67,24 +62,26 @@
       "visible_in_prompt": true
     }
   ],
-
   "decision_targets": [],
-
   "output_schema": {
     "format": "json",
     "type": "object",
     "fields": [
+      {
+        "field_id": "active_retrieval_brief_title",
+        "result_key": "active_retrieval_brief_title"
+      },
       {
         "field_id": "active_retrieval_brief",
         "result_key": "active_retrieval_brief"
       }
     ]
   },
-
   "elements_order": [
     "Hard Rules",
     "Agent Purpose",
     "Task",
+    "Title Rules",
     "required_output",
     "memory_record_metadata",
     "reduced_question",

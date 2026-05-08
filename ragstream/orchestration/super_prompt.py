@@ -38,6 +38,16 @@ class SuperPrompt:
         "body",
         "extras",
 
+        # effective retrieval query
+        "effective_retrieval_query_text",
+
+        # active memory brief
+        "active_memory_brief_title",
+        "active_memory_brief",
+
+        # synthesized memory context
+        "memory_context_text",
+
         # document retrieval artifacts
         "base_context_chunks",
         "views_by_stage",
@@ -84,6 +94,18 @@ class SuperPrompt:
 
         # Free-form diagnostics and stage metadata.
         self.extras: Dict[str, Any] = {}
+
+        # Effective retrieval query.
+        # PreProcessing fills this now from TASK / PURPOSE / CONTEXT.
+        # Later PreProcessing can replace it with a weak/strong-aware query.
+        self.effective_retrieval_query_text: str = ""
+
+        # Active Memory Brief shown below TASK / PURPOSE / CONTEXT.
+        self.active_memory_brief_title: str = ""
+        self.active_memory_brief: str = ""
+
+        # Final synthesized query-relevant Memory Context.
+        self.memory_context_text: str = ""
 
         # Document retrieval artifacts.
         self.base_context_chunks: List["Chunk"] = []

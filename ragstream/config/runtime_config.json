@@ -83,6 +83,30 @@
       ]
     }
   },
+  "memory_compression": {
+    "enabled": true,
+    "effective_query": {
+      "max_tokens": 300,
+      "embedding_model": "text-embedding-3-small"
+    },
+    "episodic_memory": {
+      "enabled": true,
+      "max_tokens_total": 400,
+      "question_max_tokens": 150,
+      "window_size_sentences": 3,
+      "window_overlap_sentences": 1,
+      "redundancy_threshold": 0.92
+    }
+  },
+  "memory_merge_synthesizer": {
+    "enabled": true,
+    "agent_id": "memory_synthesizer",
+    "agent_version": "memory_synthesizer_001",
+    "target_context_tokens": 700,
+    "max_episodic_records": 3,
+    "max_semantic_chunks": 5,
+    "prompt_cache_key": "memory_synthesizer"
+  },
   "memory_active_retrieval_brief": {
     "enabled": true,
     "reducer": {

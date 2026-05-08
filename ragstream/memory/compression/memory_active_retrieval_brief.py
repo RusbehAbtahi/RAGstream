@@ -195,6 +195,7 @@ class MemoryActiveRetrievalBriefBuilder:
             call_name="Memory ActiveBrief Init",
         )
         contributor_ids = [record.record_id]
+        active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
         active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
         logger_dev(
@@ -203,6 +204,7 @@ class MemoryActiveRetrievalBriefBuilder:
                 {
                     "record_id": record.record_id,
                     "route": "init_no_previous_activebrief",
+                    "active_retrieval_brief_title": active_brief_title,
                     "active_retrieval_brief": active_brief,
                     "active_retrieval_brief_contributor_ids": contributor_ids,
                     "pending_topic_buffer_after": {},
@@ -216,6 +218,7 @@ class MemoryActiveRetrievalBriefBuilder:
         )
 
         return {
+            "active_retrieval_brief_title": active_brief_title,
             "active_retrieval_brief": active_brief,
             "active_retrieval_brief_contributor_ids": contributor_ids,
             "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -232,6 +235,7 @@ class MemoryActiveRetrievalBriefBuilder:
         previous_brief_info: JsonDict,
         pending_topic_buffer: dict[str, Any],
     ) -> JsonDict:
+        previous_brief_title = str(previous_brief_info.get("previous_active_retrieval_brief_title", "") or "").strip()
         previous_brief = str(previous_brief_info["previous_active_retrieval_brief"])
         previous_contributor_ids = list(previous_brief_info.get("contributor_ids") or [])
 
@@ -243,9 +247,11 @@ class MemoryActiveRetrievalBriefBuilder:
                 call_name="Memory ActiveBrief Update",
             )
             contributor_ids = self._merge_contributor_ids(previous_contributor_ids, [record.record_id])
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
             return {
+                "active_retrieval_brief_title": active_brief_title,
                 "active_retrieval_brief": active_brief,
                 "active_retrieval_brief_contributor_ids": contributor_ids,
                 "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -270,6 +276,7 @@ class MemoryActiveRetrievalBriefBuilder:
                 call_name="Memory ActiveBrief Update",
             )
             contributor_ids = self._merge_contributor_ids(previous_contributor_ids, [record.record_id])
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
             logger_dev(
@@ -279,6 +286,7 @@ class MemoryActiveRetrievalBriefBuilder:
                         "record_id": record.record_id,
                         "route": gate_result.route,
                         "reason": gate_result.reason,
+                        "active_retrieval_brief_title": active_brief_title,
                         "active_retrieval_brief_contributor_ids": contributor_ids,
                         "pending_topic_buffer_after": {},
                         "gate_diagnostics": gate_result.diagnostics,
@@ -292,6 +300,7 @@ class MemoryActiveRetrievalBriefBuilder:
             )
 
             return {
+                "active_retrieval_brief_title": active_brief_title,
                 "active_retrieval_brief": active_brief,
                 "active_retrieval_brief_contributor_ids": contributor_ids,
                 "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -319,6 +328,7 @@ class MemoryActiveRetrievalBriefBuilder:
                 previous_contributor_ids,
                 [pending_record_id, record.record_id],
             )
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
             logger_dev(
@@ -329,6 +339,7 @@ class MemoryActiveRetrievalBriefBuilder:
                         "pending_record_id": pending_record_id,
                         "route": gate_result.route,
                         "reason": gate_result.reason,
+                        "active_retrieval_brief_title": active_brief_title,
                         "active_retrieval_brief": active_brief,
                         "active_retrieval_brief_contributor_ids": contributor_ids,
                         "pending_topic_buffer_after": {},
@@ -343,6 +354,7 @@ class MemoryActiveRetrievalBriefBuilder:
             )
 
             return {
+                "active_retrieval_brief_title": active_brief_title,
                 "active_retrieval_brief": active_brief,
                 "active_retrieval_brief_contributor_ids": contributor_ids,
                 "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -369,6 +381,7 @@ class MemoryActiveRetrievalBriefBuilder:
                     "route": gate_result.route,
                     "reason": gate_result.reason,
                     "copied_previous_brief_record_id": previous_brief_info.get("record_id", ""),
+                    "active_retrieval_brief_title": previous_brief_title,
                     "active_retrieval_brief": previous_brief,
                     "active_retrieval_brief_contributor_ids": previous_contributor_ids,
                     "pending_topic_buffer_after": self._pending_buffer_log_view(new_pending_buffer),
@@ -383,6 +396,7 @@ class MemoryActiveRetrievalBriefBuilder:
         )
 
         return {
+            "active_retrieval_brief_title": previous_brief_title,
             "active_retrieval_brief": previous_brief,
             "active_retrieval_brief_contributor_ids": previous_contributor_ids,
             "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -595,6 +609,8 @@ class MemoryActiveRetrievalBriefBuilder:
             if not brief:
                 continue
 
+            brief_title = str(getattr(record, "active_retrieval_brief_title", "") or "").strip()
+
             contributor_ids = list(
                 getattr(record, "active_retrieval_brief_contributor_ids", []) or []
             )
@@ -604,12 +620,14 @@ class MemoryActiveRetrievalBriefBuilder:
 
             return {
                 "record_id": record.record_id,
+                "previous_active_retrieval_brief_title": brief_title,
                 "previous_active_retrieval_brief": brief,
                 "contributor_ids": contributor_ids or [record.record_id],
             }
 
         return {
             "record_id": "",
+            "previous_active_retrieval_brief_title": "",
             "previous_active_retrieval_brief": "",
             "contributor_ids": [],
         }
@@ -636,8 +654,10 @@ class MemoryActiveRetrievalBriefBuilder:
     def _build_required_output_text(self) -> str:
         return (
             "{\n"
+            '  "active_retrieval_brief_title": "operational backend title following the JSON Title Rules",\n'
             '  "active_retrieval_brief": "one compact query-independent Current Working Conversation brief"\n'
             "}\n\n"
+            "Follow the JSON Title Rules for active_retrieval_brief_title.\n"
             f"Keep active_retrieval_brief at or below about {self.target_brief_tokens} tokens."
         )
 

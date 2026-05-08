@@ -91,6 +91,7 @@ class MemoryRecord:
         embedded_files_snapshot: list[str] | None = None,
         retrieval_source_mode: str = "QA",
         direct_recall_key: str = "",
+        active_retrieval_brief_title: str = "",
         active_retrieval_brief: str = "",
         active_retrieval_brief_contributor_ids: list[str] | None = None,
         *,
@@ -116,6 +117,7 @@ class MemoryRecord:
         self.active_project_name: str | None = active_project_name
         self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
 
+        self.active_retrieval_brief_title: str = str(active_retrieval_brief_title or "").strip()
         self.active_retrieval_brief: str = str(active_retrieval_brief or "").strip()
         self.active_retrieval_brief_contributor_ids: list[str] = _clean_list(
             active_retrieval_brief_contributor_ids
@@ -177,7 +179,9 @@ class MemoryRecord:
         self,
         active_retrieval_brief: str,
         contributor_ids: list[str] | None = None,
+        active_retrieval_brief_title: str = "",
     ) -> None:
+        self.active_retrieval_brief_title = str(active_retrieval_brief_title or "").strip()
         self.active_retrieval_brief = str(active_retrieval_brief or "").strip()
         self.active_retrieval_brief_contributor_ids = _clean_list(contributor_ids)
 
@@ -197,6 +201,7 @@ class MemoryRecord:
         - source
         - input_hash
         - output_hash
+        - active_retrieval_brief_title
         - active_retrieval_brief
         - active_retrieval_brief_contributor_ids
         """
@@ -234,6 +239,7 @@ class MemoryRecord:
             "source": self.source,
             "input_hash": self.input_hash,
             "output_hash": self.output_hash,
+            "active_retrieval_brief_title": self.active_retrieval_brief_title,
             "active_retrieval_brief": self.active_retrieval_brief,
             "active_retrieval_brief_contributor_ids": self.active_retrieval_brief_contributor_ids,
         }
@@ -312,6 +318,7 @@ class MemoryRecord:
             embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
             retrieval_source_mode=str(data.get("retrieval_source_mode", "QA")),
             direct_recall_key=str(data.get("direct_recall_key", "")),
+            active_retrieval_brief_title=str(data.get("active_retrieval_brief_title", "") or ""),
             active_retrieval_brief=str(data.get("active_retrieval_brief", "") or ""),
             active_retrieval_brief_contributor_ids=list(
                 data.get("active_retrieval_brief_contributor_ids") or []

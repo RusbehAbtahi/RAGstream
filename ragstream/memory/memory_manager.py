@@ -437,12 +437,14 @@ class MemoryManager:
                 pending_topic_buffer=dict(self.pending_activebrief_topic_buffer or {}),
             )
 
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
             contributor_ids = list(result.get("active_retrieval_brief_contributor_ids") or [])
 
             record.update_active_retrieval_brief(
                 active_retrieval_brief=active_brief,
                 contributor_ids=contributor_ids,
+                active_retrieval_brief_title=active_brief_title,
             )
 
             new_buffer = result.get("pending_activebrief_topic_buffer", {})
@@ -455,6 +457,8 @@ class MemoryManager:
                         "record_id": record.record_id,
                         "activebrief_llm_skipped": bool(result.get("activebrief_llm_skipped", False)),
                         "activebrief_gate_route": str(result.get("activebrief_gate_route", "") or ""),
+                        "active_retrieval_brief_title": active_brief_title,
+                        "active_retrieval_brief": active_brief,
                         "active_retrieval_brief_contributor_ids": contributor_ids,
                         "pending_activebrief_topic_buffer": self._pending_buffer_log_view(
                             self.pending_activebrief_topic_buffer

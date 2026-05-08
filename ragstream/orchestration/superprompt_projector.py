@@ -138,6 +138,15 @@ class SuperPromptProjector:
         format_value = (self.sp.body.get("format") or "").strip()
         text_value = (self.sp.body.get("text") or "").strip()
 
+        active_brief_title = str(getattr(self.sp, "active_memory_brief_title", "") or "").strip()
+        active_brief_text = str(getattr(self.sp, "active_memory_brief", "") or "").strip()
+
+        if not active_brief_title:
+            active_brief_title = str((getattr(self.sp, "extras", {}) or {}).get("active_memory_brief_title", "") or "").strip()
+
+        if not active_brief_text:
+            active_brief_text = str((getattr(self.sp, "extras", {}) or {}).get("active_memory_brief", "") or "").strip()
+
         lines.append("## User")
         lines.append("")
 
@@ -155,6 +164,15 @@ class SuperPromptProjector:
             lines.append(context_value)
             lines.append("")
 
+        if active_brief_title or active_brief_text:
+            lines.append("### Active Memory Brief")
+            if active_brief_title:
+                lines.append(f"Title: {active_brief_title}")
+                lines.append("")
+            if active_brief_text:
+                lines.append(active_brief_text)
+                lines.append("")
+
         if format_value:
             lines.append("### Format")
             lines.append(format_value)
@@ -171,50 +189,69 @@ class SuperPromptProjector:
         """
         Render retrieved/condensed context for GUI-visible SuperPrompt preview.
 
-        Retrieval stage now has two raw candidate pools:
-        - document chunks
-        - memory candidates
-
-        Both are rendered here as inspection/debug material.
+        Rules:
+        - show synthesized Memory Context, not raw memory episodes/chunks
+        - show document raw chunks after Retrieval/Reranker/A3
+        - hide document raw chunks after A4/A5
+        - keep document summary context when available
         """
+        memory_context_md = self._render_memory_context_md()
+        document_context_md = self._render_document_context_summary_md()
+        raw_document_evidence_md = self._render_raw_document_evidence_for_stage_md()
+
+        if not memory_context_md and not document_context_md and not raw_document_evidence_md:
+            return ""
+
         lines: List[str] = []
 
         lines.append("## Retrieved Context")
         lines.append("")
 
-        lines.append("### Retrieved Context Summary")
-        lines.append(
-            "The following summary is retrieved from selected project files or memory. "
-            "It is supporting context for the task, not part of the task itself."
-        )
-        lines.append("")
-
-        summary_text = (self.sp.S_CTX_MD or "").strip()
-        if summary_text:
-            lines.append(summary_text)
-        lines.append("")
-
-        lines.append("### Raw Retrieved Evidence")
-        raw_evidence_md = self._render_raw_retrieved_evidence_md()
-        if raw_evidence_md:
-            lines.append(raw_evidence_md)
-
-        raw_memory_md = self._render_raw_memory_retrieval_md()
-        if raw_memory_md:
+        if memory_context_md:
+            lines.append("### Memory Context")
+            lines.append(memory_context_md)
             lines.append("")
-            lines.append(raw_memory_md)
+
+        if document_context_md:
+            lines.append("### Document Context Summary")
+            lines.append(
+                "The following summary is retrieved from selected project files. "
+                "It is supporting context for the task, not part of the task itself."
+            )
+            lines.append("")
+            lines.append(document_context_md)
+            lines.append("")
+
+        if raw_document_evidence_md:
+            lines.append("### Raw Retrieved Evidence")
+            lines.append(raw_document_evidence_md)
 
         return "\n".join(lines).strip()
 
+    def _render_memory_context_md(self) -> str:
+        memory_context = str(getattr(self.sp, "memory_context_text", "") or "").strip()
+
+        if not memory_context:
+            extras = getattr(self.sp, "extras", {}) or {}
+            memory_context = str(extras.get("memory_context_text", "") or "").strip()
+
+        return memory_context
+
+    def _render_document_context_summary_md(self) -> str:
+        return str(getattr(self.sp, "S_CTX_MD", "") or "").strip()
+
+    def _render_raw_document_evidence_for_stage_md(self) -> str:
+        if str(getattr(self.sp, "stage", "") or "").strip() in {"a4", "a5"}:
+            return ""
+
+        return self._render_raw_retrieved_evidence_md()
+
     def _render_raw_memory_retrieval_md(self) -> str:
         """
-        Render raw memory retrieval candidates.
+        Backward-compatible raw memory renderer.
 
-        MemoryRetriever writes the raw debug markdown into:
-            sp.extras["memory_debug_markdown"]
-
-        This is GUI inspection material only.
-        It is not final compressed memory context.
+        The GUI path no longer calls this method because raw memory episodes and
+        raw memory chunks should not be shown in the SuperPrompt preview.
         """
         extras = getattr(self.sp, "extras", {}) or {}
         memory_debug_md = str(extras.get("memory_debug_markdown", "") or "").strip()
