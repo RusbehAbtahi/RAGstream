@@ -101,7 +101,7 @@ class Retriever:
         # SPLADE DB is kept parallel to chroma_db under the same data root.
         self.splade_root = self.chroma_root.parent / "splade_db"
 
-        self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-large")
+        self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-small")
         self.chunker = chunker if chunker is not None else Chunker()
 
         # Keep the chunk class explicit so hydration remains readable and testable.

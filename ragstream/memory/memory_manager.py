@@ -10,6 +10,11 @@ Authority split:
 - .ragmem is append-only and stores stable memory body fields only.
 - .ragmeta.json stores current editable/readable metadata.
 - SQLite mirrors .ragmeta.json for fast lookup/indexing.
+
+ActiveBrief pending-topic buffer:
+- RAM-only.
+- Not written to .ragmem, .ragmeta.json, or SQLite.
+- Used only to detect whether consecutive skipped Q/A pairs form a new topic.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from ragstream.memory.memory_record import (
     RECORD_END,
     RECORD_START,
 )
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
 
 def _utc_now() -> str:
@@ -100,6 +106,12 @@ class MemoryManager:
         self.records: list[MemoryRecord] = []
         self.metainfo: dict[str, Any] = {}
 
+        # RAM-only buffer for topic-shift detection.
+        # If Q/A is skipped as unrelated to the current ActiveBrief,
+        # its reduced text and vectors are kept here.
+        # The next skipped Q/A is compared to this buffer.
+        self.pending_activebrief_topic_buffer: dict[str, Any] = {}
+
         self.tag_catalog: list[str] = ["Gold", "Green", "Black"]
         self.b_file_created: bool = False
 
@@ -131,6 +143,7 @@ class MemoryManager:
         self.title = clean_title
         self.records = []
         self.metainfo = {}
+        self.pending_activebrief_topic_buffer = {}
         self.b_file_created = False
 
         stem = f"{_filename_timestamp()}-{_safe_title(clean_title)}"
@@ -156,6 +169,7 @@ class MemoryManager:
         self.filename_meta = file_row["filename_meta"]
 
         self.records = self._read_ragmem_records(self.ragmem_path)
+        self.pending_activebrief_topic_buffer = {}
         self.b_file_created = self.ragmem_path.exists()
 
         if self.meta_path.exists():
@@ -211,6 +225,8 @@ class MemoryManager:
                 active_project_name=active_project_name,
             )
             self.start_new_history(auto_title)
+
+        self._update_active_retrieval_brief(record)
 
         self.records.append(record)
         self._append_record_to_ragmem(record)
@@ -399,6 +415,75 @@ class MemoryManager:
         self.save_metainfo()
         self.refresh_sqlite_index()
 
+    def _update_active_retrieval_brief(self, record: MemoryRecord) -> None:
+        """
+        Build the ActiveRetrievalBrief for the new MemoryRecord.
+
+        This happens before the record is first written to .ragmem so that
+        active_retrieval_brief remains part of the stable body block.
+
+        The pending-topic buffer is updated here too, because it belongs to
+        the active memory history, not to Streamlit and not to the builder.
+        """
+        try:
+            from ragstream.memory.compression.memory_active_retrieval_brief import (
+                MemoryActiveRetrievalBriefBuilder,
+            )
+
+            builder = MemoryActiveRetrievalBriefBuilder()
+            result = builder.build_for_record(
+                record=record,
+                previous_records=list(self.records),
+                pending_topic_buffer=dict(self.pending_activebrief_topic_buffer or {}),
+            )
+
+            active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
+            contributor_ids = list(result.get("active_retrieval_brief_contributor_ids") or [])
+
+            record.update_active_retrieval_brief(
+                active_retrieval_brief=active_brief,
+                contributor_ids=contributor_ids,
+            )
+
+            new_buffer = result.get("pending_activebrief_topic_buffer", {})
+            self.pending_activebrief_topic_buffer = new_buffer if isinstance(new_buffer, dict) else {}
+
+            logger_dev(
+                "MemoryManager ActiveBrief update result\n"
+                + json.dumps(
+                    {
+                        "record_id": record.record_id,
+                        "activebrief_llm_skipped": bool(result.get("activebrief_llm_skipped", False)),
+                        "activebrief_gate_route": str(result.get("activebrief_gate_route", "") or ""),
+                        "active_retrieval_brief_contributor_ids": contributor_ids,
+                        "pending_activebrief_topic_buffer": self._pending_buffer_log_view(
+                            self.pending_activebrief_topic_buffer
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
+
+        except Exception as e:
+            logger_dev(
+                "ActiveRetrievalBrief generation failed\n"
+                + json.dumps(
+                    {
+                        "record_id": record.record_id,
+                        "error": str(e),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "ERROR",
+                "CONFIDENTIAL",
+            )
+
     def _append_record_to_ragmem(self, record: MemoryRecord) -> None:
         if not self.filename_ragmem:
             raise ValueError("Memory filename is not initialized.")
@@ -517,6 +602,22 @@ class MemoryManager:
         YYYY-MM-DD-HH-mm-memory-record.ragmem
         """
         return "memory-record"
+
+    @staticmethod
+    def _pending_buffer_log_view(buffer: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(buffer, dict) or not buffer:
+            return {}
+
+        return {
+            "record_id": str(buffer.get("record_id", "") or ""),
+            "created_at_utc": str(buffer.get("created_at_utc", "") or ""),
+            "question_vector_count": len(buffer.get("question_vectors", []) or []),
+            "answer_vector_count": len(buffer.get("answer_vectors", []) or []),
+            "vector_count": int(buffer.get("vector_count", 0) or 0),
+            "has_center_vector": bool(buffer.get("center_vector", [])),
+            "reduced_question_preview": str(buffer.get("reduced_question", "") or "")[:500],
+            "reduced_answer_preview": str(buffer.get("reduced_answer", "") or "")[:500],
+        }
 
     def _init_sqlite(self) -> None:
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

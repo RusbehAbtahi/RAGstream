@@ -1,0 +1,168 @@
+@startuml RAGstream_ActiveRetrievalBrief
+
+top to bottom direction
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+skinparam nodesep 40
+skinparam ranksep 35
+hide empty members
+
+'──────────────────────────────────────────────────────────────
+' ACTIVE RETRIEVAL BRIEF — MEMORY RECORDING TIME
+' Focus: two new Python files only
+'──────────────────────────────────────────────────────────────
+
+package "Memory Recording Core" {
+
+    class MemoryManager {
+        + capture_pair(...) : MemoryRecord
+        - _update_active_retrieval_brief(record:MemoryRecord) : None
+    }
+
+    class MemoryRecord {
+        + record_id : str
+        + parent_id : str
+        + input_text : str
+        + output_text : str
+        + active_retrieval_brief : str
+        + active_retrieval_brief_contributor_ids : List[str]
+    }
+}
+
+package "Memory Compression / ActiveBrief" {
+
+    class MemorySentenceReducer {
+        + max_tokens_total : int
+        + question_max_tokens : int
+        + window_size_sentences : int
+        + window_overlap_sentences : int
+        + redundancy_threshold : float
+        + embedding_model : str
+
+        + reduce_with_anchor(
+            input_text:str,
+            output_text:str,
+            anchor_vector:List[float]
+          ) : Dict
+
+        + reduce_with_centroid(
+            input_text:str,
+            output_text:str
+          ) : Dict
+
+        - _allocate_qa_budget(
+            input_tokens:int,
+            output_tokens:int
+          ) : Tuple[int,int]
+    }
+
+    class MemoryActiveRetrievalBriefBuilder {
+        + reducer : MemorySentenceReducer
+        + agent_factory : AgentFactory
+        + llm_client : LLMClient
+        + agent_id : str
+        + agent_version : str
+        + target_brief_tokens : int
+
+        + build_for_record(
+            record:MemoryRecord,
+            previous_brief:str
+          ) : Dict
+
+        - _compose_agent_input(
+            record:MemoryRecord,
+            reduced_qa:Dict,
+            previous_brief:str
+          ) : Dict
+
+        - _parse_agent_output(
+            raw_output:str
+          ) : Dict
+    }
+}
+
+package "Agent Stack" {
+
+    class AgentFactory {
+        + get_agent(agent_id:str, version:str) : AgentPrompt
+    }
+
+    class AgentPrompt {
+        + compose(input_payload:Dict) : tuple
+        + parse(raw_output:str) : Dict
+    }
+
+    class LLMClient {
+        + chat(...) : str
+    }
+
+    class AgentJSON {
+        data/agents/
+        memory_activebrief_qa_summarizer/
+        memory_activebrief_qa_summarizer_001.json
+    }
+}
+
+package "Runtime Config" {
+
+    class RuntimeConfig {
+        + max_tokens_total : int
+        + question_max_tokens : int
+        + window_size_sentences : int
+        + window_overlap_sentences : int
+        + redundancy_threshold : float
+        + target_brief_tokens : int
+    }
+}
+
+'──────────────────────────────────────────────────────────────
+' FLOW
+'──────────────────────────────────────────────────────────────
+
+MemoryManager --> MemoryRecord : creates + saves
+MemoryManager --> MemoryActiveRetrievalBriefBuilder : after durable save
+
+MemoryActiveRetrievalBriefBuilder --> MemorySentenceReducer : reduce_with_centroid()
+MemoryActiveRetrievalBriefBuilder --> MemoryRecord : reads Q/A + previous brief
+MemoryActiveRetrievalBriefBuilder --> AgentFactory : get_agent(...)
+MemoryActiveRetrievalBriefBuilder --> LLMClient : one LLM call
+MemoryActiveRetrievalBriefBuilder --> MemoryRecord : writes new brief
+
+AgentFactory --> AgentPrompt : returns configured prompt
+AgentPrompt --> AgentJSON : loaded from JSON
+
+RuntimeConfig --> MemorySentenceReducer : reducer settings
+RuntimeConfig --> MemoryActiveRetrievalBriefBuilder : target brief size
+
+note right of MemorySentenceReducer
+  Shared deterministic reducer.
+
+  ActiveBrief path:
+  - uses centroid anchor
+
+  Future retrieval compression:
+  - uses external query anchor
+
+  Same core reduction logic.
+end note
+
+note right of MemoryActiveRetrievalBriefBuilder
+  One LLM call only.
+
+  Input:
+  - previous clean brief
+  - reduced Q/A
+
+  Output:
+  - new active_retrieval_brief
+  - contributor ids
+end note
+
+note bottom of MemoryManager
+  ActiveBrief creation happens
+  during Memory Recording,
+  after MemoryRecord is safely saved.
+end note
+
+@enduml

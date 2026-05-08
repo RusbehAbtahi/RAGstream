@@ -22,7 +22,6 @@ import json
 from typing import Any
 
 
-
 class MemoryContextPack:
     """
     Structured runtime result of Memory Retrieval.
@@ -144,10 +143,17 @@ class MemoryContextPack:
             return
 
         for idx, candidate in enumerate(self.episodic_candidates, start=1):
-            score = candidate.get("final_parent_score", candidate.get("score", ""))
+            final_score = candidate.get("final_parent_score", candidate.get("score", ""))
+            semantic_score = candidate.get("semantic_parent_score", "")
+            recency_score = candidate.get("recency_score", "")
+            episode_distance_k = candidate.get("episode_distance_k", "")
+
             lines.append(f"**E{idx}. record_id:** `{candidate.get('record_id', '')}`")
             lines.append(f"- tag: `{candidate.get('tag', '')}`")
-            lines.append(f"- score: `{score}`")
+            lines.append(f"- final_score: `{final_score}`")
+            lines.append(f"- semantic_score: `{semantic_score}`")
+            lines.append(f"- recency_score: `{recency_score}`")
+            lines.append(f"- episode_distance_k: `{episode_distance_k}`")
             lines.append(f"- retrieval_source_mode: `{candidate.get('retrieval_source_mode', '')}`")
             lines.append("")
             lines.append(self._format_qa(candidate))
@@ -164,7 +170,10 @@ class MemoryContextPack:
             lines.append(f"**M{idx}. vector_id:** `{candidate.get('vector_id', candidate.get('id', ''))}`")
             lines.append(f"- record_id: `{candidate.get('record_id', '')}`")
             lines.append(f"- role: `{candidate.get('role', '')}`")
-            lines.append(f"- score: `{candidate.get('score', '')}`")
+            lines.append(f"- final_score: `{candidate.get('score', '')}`")
+            lines.append(f"- semantic_score: `{candidate.get('semantic_score', '')}`")
+            lines.append(f"- recency_score: `{candidate.get('recency_score', '')}`")
+            lines.append(f"- episode_distance_k: `{candidate.get('episode_distance_k', '')}`")
             lines.append("")
             text = str(candidate.get("document", candidate.get("text", ""))).strip()
             if text:

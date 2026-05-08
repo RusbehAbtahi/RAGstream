@@ -31,9 +31,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ragstream.memory.memory_context_pack import MemoryContextPack
-from ragstream.memory.memory_index_lookup import MemoryIndexLookup
-from ragstream.memory.memory_scoring import MemoryScorer
+from ragstream.memory.retrieval.memory_context_pack import MemoryContextPack
+from ragstream.memory.retrieval.memory_index_lookup import MemoryIndexLookup
+from ragstream.memory.retrieval.memory_scoring import MemoryScorer
 from ragstream.textforge.RagLog import LogALL as logger
 from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
@@ -144,6 +144,7 @@ class MemoryRetriever:
                     "gold": len(index_candidates["gold"]),
                     "direct_recall": 1 if index_candidates["direct_recall"] else 0,
                 },
+                "scoring_policy": self.scorer.describe_policy(),
             },
         )
 
@@ -228,6 +229,7 @@ class MemoryRetriever:
         )
 
         metadata_by_record = self._metadata_by_live_record()
+
         scored_hits = self.scorer.score_vector_hits(raw_hits)
         parent_scores = self.scorer.aggregate_parent_scores(
             scored_hits=scored_hits,
@@ -237,6 +239,7 @@ class MemoryRetriever:
         semantic_chunks = self.scorer.select_semantic_chunks(
             scored_hits=scored_hits,
             max_memory_chunks=max_memory_chunks,
+            metadata_by_record=metadata_by_record,
         )
 
         episodic_candidates = self._parent_scores_to_episodic_candidates(
@@ -446,25 +449,39 @@ class MemoryRetriever:
         """
         Build record metadata map from live MemoryManager.records.
 
-        Live records contain body + current metadata after .ragmeta overlay.
+        Adds episode-distance metadata:
+        - latest record gets episode_distance_k = 0
+        - one older record gets episode_distance_k = 1
+        - and so on
+
+        This is intentionally K-based, not clock-time-based.
         """
         result: dict[str, dict[str, Any]] = {}
 
-        for record in getattr(self.memory_manager, "records", []) or []:
+        records = list(getattr(self.memory_manager, "records", []) or [])
+        total_records = len(records)
+
+        for idx, record in enumerate(records):
             record_id = str(getattr(record, "record_id", "") or "").strip()
             if not record_id:
                 continue
 
             if hasattr(record, "to_full_dict"):
-                result[record_id] = record.to_full_dict()
+                data = record.to_full_dict()
             elif hasattr(record, "to_index_dict"):
-                result[record_id] = record.to_index_dict()
+                data = record.to_index_dict()
             else:
-                result[record_id] = {
+                data = {
                     "record_id": record_id,
                     "tag": getattr(record, "tag", ""),
                     "retrieval_source_mode": getattr(record, "retrieval_source_mode", "QA"),
                 }
+
+            data["episode_index"] = idx
+            data["episode_distance_k"] = max(0, total_records - 1 - idx)
+            data["episode_count_in_active_file"] = total_records
+
+            result[record_id] = data
 
         return result
 
@@ -512,6 +529,9 @@ class MemoryRetriever:
     ) -> list[dict[str, Any]]:
         """
         Merge Gold and semantic episodic candidates without duplicate record_ids.
+
+        Gold candidates remain a priority/bypass path and are inserted before
+        normal Green semantic episodic candidates.
         """
         episodic_cfg = self.config.get("episodic_memory", {}) or {}
         max_total_records = int(episodic_cfg.get("max_total_records", 3))
@@ -546,6 +566,7 @@ class MemoryRetriever:
         Overlay live MemoryRecord body/metadata onto candidate dicts when possible.
         """
         live_by_id = self._live_records_by_id()
+        metadata_by_record = self._metadata_by_live_record()
 
         enriched: list[dict[str, Any]] = []
 
@@ -561,6 +582,7 @@ class MemoryRetriever:
                         file_id=str(candidate.get("file_id", getattr(self.memory_manager, "file_id", ""))),
                     )
                 )
+                enriched_candidate.update(metadata_by_record.get(record_id, {}))
                 enriched.append(enriched_candidate)
             else:
                 enriched.append(candidate)
@@ -688,6 +710,7 @@ class MemoryRetriever:
             "semantic_result": semantic_result,
             "index_candidates": index_candidates,
             "memory_context_pack": pack.to_dict(),
+            "scoring_policy": self.scorer.describe_policy(),
         }
 
         logger_dev(

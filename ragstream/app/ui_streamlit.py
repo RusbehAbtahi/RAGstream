@@ -21,13 +21,20 @@ from ragstream.app.ui_files import render_files_tab
 from ragstream.app.ui_metrics import render_metrics_tab
 from ragstream.app.ui_settings import render_settings_tab
 from ragstream.ingestion.embedder import Embedder
-from ragstream.memory.memory_chunker import MemoryChunker
-from ragstream.memory.memory_ingestion_manager import MemoryIngestionManager
+from ragstream.memory.ingestion.memory_chunker import MemoryChunker
+from ragstream.memory.ingestion.memory_ingestion_manager import MemoryIngestionManager
 from ragstream.memory.memory_manager import MemoryManager
-from ragstream.memory.memory_vector_store import MemoryVectorStore
+from ragstream.memory.ingestion.memory_vector_store import MemoryVectorStore
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 
 def _load_runtime_config(project_root: Path) -> dict[str, Any]:

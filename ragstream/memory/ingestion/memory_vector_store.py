@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 
 class MemoryVectorStore:

@@ -52,6 +52,11 @@
       "max_gold_records": 1,
       "gold_max_tokens": 3000,
       "green_max_tokens": 1500,
+      "green_semantic_weight": 0.75,
+      "green_recency_weight": 0.25,
+      "green_half_life_k": 10,
+      "recency_enabled": true,
+      "gold_bypass_recency": true,
       "exclude_tags": [
         "Black"
       ]
@@ -67,7 +72,38 @@
     },
     "semantic_memory_chunks": {
       "enabled": true,
-      "max_memory_chunks": 5
+      "max_memory_chunks": 5,
+      "semantic_weight": 0.9,
+      "recency_weight": 0.1,
+      "half_life_k": 10,
+      "recency_enabled": true,
+      "gold_bypass_recency": true,
+      "exclude_tags": [
+        "Black"
+      ]
+    }
+  },
+  "memory_active_retrieval_brief": {
+    "enabled": true,
+    "reducer": {
+      "max_tokens_total": 3000,
+      "question_max_tokens": 1000,
+      "window_size_sentences": 3,
+      "window_overlap_sentences": 1,
+      "redundancy_threshold": 0.92,
+      "embedding_model": "text-embedding-3-small"
+    },
+    "activebrief_relevance_gate": {
+      "enabled": true,
+      "activebrief_threshold": 0.25,
+      "pending_topic_threshold": 0.25
+    },
+    "llm": {
+      "agent_id": "memory_activebrief_qa_summarizer",
+      "init_agent_version": "memory_activebrief_qa_summarizer_init_001",
+      "update_agent_version": "memory_activebrief_qa_summarizer_update_001",
+      "target_brief_tokens": 700,
+      "prompt_cache_key": "memory_activebrief_qa_summarizer"
     }
   },
   "document_retrieval": {

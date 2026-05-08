@@ -13,7 +13,7 @@ Purpose:
 - For future updates, newly added decisions and implementation changes should be date-stamped inside the relevant section so chronological evolution remains visible.
 - [03.05.2026 / KW18 2026] This update adds the implemented Memory Recording layer, the implemented Memory Ingestion layer, and the corrected TextForge / RagLog logging layer.
 - [06.05.2026 / KW19 2026] This update adds the corrected MemoryRecord persistence authority split, initial Memory Retrieval, MemoryContextPack wiring, server-side Memory Files management, tabbed Streamlit structure, auto-created memory histories, and the future ActiveRetrievalBrief requirement.
-
+- [06.05.2026 / KW19 2026] This update also adds K-based recency scoring for Green episodic memory and semantic memory chunks.
 ---
 
 ## 1. High-level picture
@@ -690,6 +690,29 @@ token_budget_report
   * Direct Recall limits,
   * semantic memory chunk limits.
 
+  * [06.05.2026 / KW19 2026] Memory Retrieval scoring now includes K-based recency weighting. In this model, `k = 0` means the latest MemoryRecord, `k = 1` means one episode older, and so on.
+* [06.05.2026 / KW19 2026] Green episodic memory now combines semantic relevance and recency:
+
+  final_parent_score =
+    green_semantic_weight * semantic_parent_score
+  + green_recency_weight  * recency_score
+
+* [06.05.2026 / KW19 2026] Semantic memory chunks also combine semantic relevance and recency, but with weaker recency influence than Green episodic memory.
+* [06.05.2026 / KW19 2026] Current default values in `runtime_config.json` are:
+
+  Green episodic memory:
+  - semantic = 0.75
+  - recency = 0.25
+  - half_life_k = 10
+
+  Semantic memory chunks:
+  - semantic = 0.90
+  - recency = 0.10
+  - half_life_k = 10
+
+* [06.05.2026 / KW19 2026] Gold and Direct Recall remain outside the normal recency-decay path. Black records remain excluded from automatic Memory Retrieval.
+* [06.05.2026 / KW19 2026] `MemoryContextPack` debug output now shows `semantic_score`, `recency_score`, `final_score`, and `episode_distance_k` for memory candidates.
+
 ### 2.19 Server-side Memory Files tab is implemented
 
 * [06.05.2026 / KW19 2026] The FILES tab is implemented as the official server-side memory-history manager.
@@ -977,6 +1000,7 @@ It already has:
 * [06.05.2026 / KW19 2026] corrected MemoryRecord persistence authority split,
 * [06.05.2026 / KW19 2026] auto-created memory histories from first accepted MemoryRecord,
 * [06.05.2026 / KW19 2026] initial Memory Retrieval with `MemoryContextPack`,
+* [06.05.2026 / KW19 2026] K-based semantic/recency scoring for Green episodic memory and semantic memory chunks,
 * [06.05.2026 / KW19 2026] raw memory retrieval display inside SuperPrompt rendering,
 * [06.05.2026 / KW19 2026] server-side FILES tab for New / Load / Rename / Delete memory histories,
 * [06.05.2026 / KW19 2026] file-level delete cleanup across physical files, SQLite, and memory vectors,

@@ -1,0 +1,93 @@
+{
+  "agent_meta": {
+    "agent_id": "memory_activebrief_qa_summarizer",
+    "version": "001",
+    "agent_type": "Synthesizer",
+    "name": "Memory ActiveBrief Q/A Summarizer Init",
+    "description": "Creates the first ActiveRetrievalBrief from the deterministically reduced Q/A of the first MemoryRecord.",
+    "tags": [
+      "memory",
+      "active_retrieval_brief",
+      "synthesizer",
+      "init",
+      "ragstream"
+    ],
+    "enabled": true
+  },
+
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-5-mini",
+    "temperature": 0.0,
+    "max_tokens": 1200,
+    "response_format": "json"
+  },
+
+  "static_prompt": {
+    "preamble": "You are a memory-context synthesis assistant.\nYou do not answer the user's original request directly.",
+
+    "Agent Purpose": "Given the deterministically reduced Q/A of the first MemoryRecord in a memory history, create the first compact ActiveRetrievalBrief.",
+
+    "Task": "Produce one initial query-independent ActiveRetrievalBrief.\nThe brief must describe the stable working conversation established by this first Q/A.\nKeep durable project context, task direction, accepted constraints, important technical entities, implementation decisions, and rejected interpretations.\nDo not create a separate qa_summary.\nReturn only the required JSON object.",
+
+    "Hard Rules": "- Never answer the original user request.\n- Do not write as if speaking to the user.\n- Do not produce a final user-facing answer.\n- Do not create a qa_summary field.\n- Create the first ActiveRetrievalBrief only from the provided reduced Q/A and metadata.\n- Do not refer to any previous brief.\n- Treat corrections as high-importance constraints.\n- Treat rejected interpretations as important negative constraints.\n- Treat insults, frustration, short rejection, or emotional wording as feedback signals, not as new topic content.\n- Do not invent facts, project decisions, files, requirements, or implementation status.\n- Do not import outside knowledge.\n- Keep the brief query-independent.\n- Keep the brief compact and operational.\n- Prefer dense factual working-conversation prose over generic summary language.\n- Target about 700 tokens unless the provided required output says otherwise.\n- Return only the required JSON object."
+  },
+
+  "dynamic_bindings": [
+    {
+      "id": "reduced_question",
+      "prompt_text": "## Reduced MemoryRecord Question / Input",
+      "bind_from": "ActiveBrief.reduced_question",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "reduced_answer",
+      "prompt_text": "## Reduced MemoryRecord Answer / Output",
+      "bind_from": "ActiveBrief.reduced_answer",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "memory_record_metadata",
+      "prompt_text": "## MemoryRecord Metadata",
+      "bind_from": "ActiveBrief.memory_record_metadata",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "required_output",
+      "prompt_text": "## Required Output",
+      "bind_from": "ActiveBrief.required_output",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    }
+  ],
+
+  "decision_targets": [],
+
+  "output_schema": {
+    "format": "json",
+    "type": "object",
+    "fields": [
+      {
+        "field_id": "active_retrieval_brief",
+        "result_key": "active_retrieval_brief"
+      }
+    ]
+  },
+
+  "elements_order": [
+    "Hard Rules",
+    "Agent Purpose",
+    "Task",
+    "required_output",
+    "memory_record_metadata",
+    "reduced_question",
+    "reduced_answer"
+  ]
+}

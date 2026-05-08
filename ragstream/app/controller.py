@@ -40,7 +40,14 @@ from ragstream.retrieval.reranker import Reranker
 from ragstream.retrieval.retriever_mem import MemoryRetriever
 
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 
 class AppController:
@@ -354,7 +361,7 @@ class AppController:
         store = VectorStoreChroma(persist_dir=str(self.chroma_root / project_name))
         sparse_store = VectorStoreSplade(persist_dir=str(self.splade_root / project_name))
         chunker = Chunker()
-        embedder = Embedder(model="text-embedding-3-large")
+        embedder = Embedder(model="text-embedding-3-small")
         sparse_embedder = SpladeEmbedder(device="cpu")
 
         stats = manager.run(

@@ -91,6 +91,8 @@ class MemoryRecord:
         embedded_files_snapshot: list[str] | None = None,
         retrieval_source_mode: str = "QA",
         direct_recall_key: str = "",
+        active_retrieval_brief: str = "",
+        active_retrieval_brief_contributor_ids: list[str] | None = None,
         *,
         record_id: str | None = None,
         created_at_utc: str | None = None,
@@ -113,6 +115,11 @@ class MemoryRecord:
 
         self.active_project_name: str | None = active_project_name
         self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
+
+        self.active_retrieval_brief: str = str(active_retrieval_brief or "").strip()
+        self.active_retrieval_brief_contributor_ids: list[str] = _clean_list(
+            active_retrieval_brief_contributor_ids
+        )
 
         self.input_hash: str = input_hash or _sha256(self.input_text)
         self.output_hash: str = output_hash or _sha256(self.output_text)
@@ -166,6 +173,14 @@ class MemoryRecord:
         if direct_recall_key is not None:
             self.direct_recall_key = _clean_direct_recall_key(direct_recall_key)
 
+    def update_active_retrieval_brief(
+        self,
+        active_retrieval_brief: str,
+        contributor_ids: list[str] | None = None,
+    ) -> None:
+        self.active_retrieval_brief = str(active_retrieval_brief or "").strip()
+        self.active_retrieval_brief_contributor_ids = _clean_list(contributor_ids)
+
     def update_metadata_overlay(
         self,
         metadata: dict[str, Any],
@@ -182,6 +197,8 @@ class MemoryRecord:
         - source
         - input_hash
         - output_hash
+        - active_retrieval_brief
+        - active_retrieval_brief_contributor_ids
         """
         if not isinstance(metadata, dict):
             return
@@ -217,6 +234,8 @@ class MemoryRecord:
             "source": self.source,
             "input_hash": self.input_hash,
             "output_hash": self.output_hash,
+            "active_retrieval_brief": self.active_retrieval_brief,
+            "active_retrieval_brief_contributor_ids": self.active_retrieval_brief_contributor_ids,
         }
 
     def to_ragmem_block(self) -> str:
@@ -231,7 +250,7 @@ class MemoryRecord:
         - .ragmeta.json per-record metadata
         - SQLite mirror rows
 
-        It does not duplicate full input_text or output_text.
+        It does not duplicate full input_text, output_text, or full ActiveBrief text.
         """
         return {
             "record_id": self.record_id,
@@ -293,6 +312,10 @@ class MemoryRecord:
             embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
             retrieval_source_mode=str(data.get("retrieval_source_mode", "QA")),
             direct_recall_key=str(data.get("direct_recall_key", "")),
+            active_retrieval_brief=str(data.get("active_retrieval_brief", "") or ""),
+            active_retrieval_brief_contributor_ids=list(
+                data.get("active_retrieval_brief_contributor_ids") or []
+            ),
             record_id=str(data.get("record_id") or uuid.uuid4().hex),
             created_at_utc=str(data.get("created_at_utc") or _utc_now()),
             auto_keywords=(

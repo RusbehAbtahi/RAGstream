@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from ragstream.memory.memory_file_manager import MemoryFileManager
+from ragstream.memory.storage.memory_file_manager import MemoryFileManager
 from ragstream.memory.memory_manager import MemoryManager
 from ragstream.textforge.RagLog import LogALL as logger
 

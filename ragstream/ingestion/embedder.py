@@ -10,7 +10,7 @@ from openai import OpenAI
 
 class Embedder:
     """High-level embedding interface using OpenAI API."""
-    def __init__(self, model: str = "text-embedding-3-large"):
+    def __init__(self, model: str = "text-embedding-3-small"):
         load_dotenv()  # Load .env file
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
