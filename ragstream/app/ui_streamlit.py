@@ -188,6 +188,9 @@ def init_session_state() -> None:
     if "retrieval_top_k" not in st.session_state:
         st.session_state["retrieval_top_k"] = 30
 
+    if "use_a2_promptshaper_llm" not in st.session_state:
+        st.session_state["use_a2_promptshaper_llm"] = True
+
     if "use_retrieval_splade" not in st.session_state:
         st.session_state["use_retrieval_splade"] = False
 

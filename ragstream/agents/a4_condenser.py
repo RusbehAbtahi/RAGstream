@@ -35,6 +35,8 @@ from ragstream.agents.a4_det_processing import (
     prepare_active_class_definitions,
     build_grouped_chunk_package,
     finalize_a4_output,
+    has_a4_useful_chunks,
+    finalize_a4_empty_selection,
 )
 from ragstream.agents.a4_llm_helper import A4LLMHelper
 
@@ -75,6 +77,11 @@ class A4Condenser:
         """
         if sp is None:
             raise ValueError("A4Condenser.run: 'sp' must not be None")
+        if not has_a4_useful_chunks(sp, max_candidates=self._max_candidates):
+            return finalize_a4_empty_selection(
+                sp=sp,
+                reason="a3_selected_zero_useful_chunks",
+            )
 
         json_paths = self._build_agent_json_paths()
 

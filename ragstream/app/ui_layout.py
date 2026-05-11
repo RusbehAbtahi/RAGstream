@@ -327,8 +327,8 @@ def render_right_panel() -> None:
     with b2c4:  # Prompt Builder button
         st.button("Prompt Builder", key="btn_builder", use_container_width=True)
 
-    topk_c, gap_c, opt_c1, opt_c2 = st.columns([0.5, 1, 1, 1],
-                                               gap="small")  # row: Top-K + spacer + 2 checkboxes
+    topk_c, gap_c, opt_c1, opt_c2, opt_c3 = st.columns([0.5, 0.5, 1, 1, 1],
+                                                       gap="small")  # row: Top-K + spacer + 3 checkboxes
 
     with topk_c:  # number input: Retrieval Top-K
         st.number_input(
@@ -342,13 +342,19 @@ def render_right_panel() -> None:
     with gap_c:  # empty spacer between Top-K and first checkbox
         st.empty()
 
-    with opt_c1:  # checkbox: use Retrieval Splade
+    with opt_c1:  # checkbox: use A2 PromptShaper LLM
+        st.checkbox(
+            "use A2 PromptShaper LLM",
+            key="use_a2_promptshaper_llm",
+        )
+
+    with opt_c2:  # checkbox: use Retrieval Splade
         st.checkbox(
             "use Retrieval Splade",
             key="use_retrieval_splade",
         )
 
-    with opt_c2:  # checkbox: use Reranking Colbert
+    with opt_c3:  # checkbox: use Reranking Colbert
         st.checkbox(
             "use Reranking Colbert",
             key="use_reranking_colbert",

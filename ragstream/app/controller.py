@@ -188,9 +188,17 @@ class AppController:
         logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 
-    def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:
+    def run_a2_promptshaper(
+        self,
+        sp: SuperPrompt,
+        *,
+        use_llm: bool = True,
+    ) -> SuperPrompt:
         """Run A2 on the current SuperPrompt."""
-        return self.a2_promptshaper.run(sp)
+        return self.a2_promptshaper.run(
+            sp,
+            use_llm=bool(use_llm),
+        )
 
     def run_a3(self, sp: SuperPrompt) -> SuperPrompt:
         """

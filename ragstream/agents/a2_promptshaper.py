@@ -54,6 +54,7 @@ class A2PromptShaper:
         *,
         agent_id: str = "a2_promptshaper",
         version: str = "003",
+        use_llm: bool = True,
     ) -> SuperPrompt:
         """
         Main entry point for A2.
@@ -63,54 +64,61 @@ class A2PromptShaper:
         # For now, all 5 fields are active. Later we can respect user-locked ones.
         active_fields: List[str] = ["system", "audience", "tone", "depth", "confidence"]
 
-        inputs: Dict[str, str] = {
-            "prompt_under_evaluation": self._build_prompt_under_evaluation(sp),
-            # Changed:
-            # decision_targets now come from the top-level JSON config and are
-            # rendered inside AgentPrompt / compose_texts, not from A2 runtime payload.
-            "required_output": self._build_required_output_text(agent, active_fields),
-        }
+        if use_llm:
+            inputs: Dict[str, str] = {
+                "prompt_under_evaluation": self._build_prompt_under_evaluation(sp),
+                # Changed:
+                # decision_targets now come from the top-level JSON config and are
+                # rendered inside AgentPrompt / compose_texts, not from A2 runtime payload.
+                "required_output": self._build_required_output_text(agent, active_fields),
+            }
 
-        messages, response_format = agent.compose(
-            input_payload=inputs,
-            active_fields=active_fields,
-        )
-
-        SimpleLogger.info("A2PromptShaper → LLM messages:")
-        try:
-            SimpleLogger.info(json.dumps(messages, ensure_ascii=False, indent=2))
-        except Exception:
-            SimpleLogger.info(repr(messages))
-
-        if not getattr(agent, "model_name", None):
-            raise RuntimeError(
-                "A2PromptShaper: AgentPrompt has no model_name configured (JSON missing?)"
-            )
-        if not hasattr(agent, "temperature") or not hasattr(agent, "max_output_tokens"):
-            raise RuntimeError(
-                "A2PromptShaper: AgentPrompt missing temperature/max_output_tokens configuration"
+            messages, response_format = agent.compose(
+                input_payload=inputs,
+                active_fields=active_fields,
             )
 
-        raw_result: Union[str, JsonDict] = self._llm_client.chat(
-            messages=messages,
-            model_name=agent.model_name,
-            temperature=agent.temperature,
-            max_output_tokens=agent.max_output_tokens,
-            response_format=response_format,
-            prompt_cache_key=f"{agent_id}_{version}",  # Added: stable cache key for repeated A2 prompts of the same agent/version.
-           # prompt_cache_retention="in_memory",  # Added: explicit short-lived cache retention for repeated near-term A2 calls.
-        )
+            SimpleLogger.info("A2PromptShaper → LLM messages:")
+            try:
+                SimpleLogger.info(json.dumps(messages, ensure_ascii=False, indent=2))
+            except Exception:
+                SimpleLogger.info(repr(messages))
 
-        SimpleLogger.info("A2PromptShaper ← LLM raw result:")
-        try:
-            if isinstance(raw_result, dict):
-                SimpleLogger.info(json.dumps(raw_result, ensure_ascii=False, indent=2))
-            else:
-                SimpleLogger.info(str(raw_result))
-        except Exception:
-            SimpleLogger.info(repr(raw_result))
+            if not getattr(agent, "model_name", None):
+                raise RuntimeError(
+                    "A2PromptShaper: AgentPrompt has no model_name configured (JSON missing?)"
+                )
+            if not hasattr(agent, "temperature") or not hasattr(agent, "max_output_tokens"):
+                raise RuntimeError(
+                    "A2PromptShaper: AgentPrompt missing temperature/max_output_tokens configuration"
+                )
 
-        parsed_result = agent.parse(raw_result, active_fields=active_fields)
+            raw_result: Union[str, JsonDict] = self._llm_client.chat(
+                messages=messages,
+                model_name=agent.model_name,
+                temperature=agent.temperature,
+                max_output_tokens=agent.max_output_tokens,
+                response_format=response_format,
+                prompt_cache_key=f"{agent_id}_{version}",  # Added: stable cache key for repeated A2 prompts of the same agent/version.
+               # prompt_cache_retention="in_memory",  # Added: explicit short-lived cache retention for repeated near-term A2 calls.
+            )
+
+            SimpleLogger.info("A2PromptShaper ← LLM raw result:")
+            try:
+                if isinstance(raw_result, dict):
+                    SimpleLogger.info(json.dumps(raw_result, ensure_ascii=False, indent=2))
+                else:
+                    SimpleLogger.info(str(raw_result))
+            except Exception:
+                SimpleLogger.info(repr(raw_result))
+
+            parsed_result = agent.parse(raw_result, active_fields=active_fields)
+
+        else:
+            parsed_result = self._build_default_selector_result(
+                agent=agent,
+                active_fields=active_fields,
+            )
 
         # Deterministic A2 safety layer:
         # - remove every selected id that does not belong to the corresponding field catalog
@@ -149,12 +157,55 @@ class A2PromptShaper:
                 sp.body[key] = text
 
         sp.extras["a2_selected_ids"] = selected_ids
+        sp.extras["a2_llm_used"] = bool(use_llm)
+        sp.extras["a2_mode"] = "llm" if use_llm else "deterministic_defaults"
 
         sp.history_of_stages.append("a2")
         sp.stage = "a2"
         sp.compose_prompt_ready()
 
         return sp
+
+    def _build_default_selector_result(
+        self,
+        *,
+        agent: Any,
+        active_fields: List[str],
+    ) -> JsonDict:
+        """
+        Build deterministic selector output from catalog defaults.
+        """
+        result: JsonDict = {}
+
+        defaults: Dict[str, Any] = getattr(agent, "defaults", {}) or {}
+        enums: Dict[str, List[str]] = getattr(agent, "enums", {}) or {}
+
+        target_by_id: Dict[str, Dict[str, Any]] = {}
+        for target in getattr(agent, "decision_targets", []) or []:
+            field_id = str(target.get("id", "") or "").strip()
+            if field_id:
+                target_by_id[field_id] = target
+
+        for field_id in active_fields:
+            target = target_by_id.get(field_id, {}) or {}
+            max_selected = int(target.get("max_selected", 1) or 1)
+
+            value = defaults.get(field_id)
+
+            if value is None or value == "":
+                allowed_values = enums.get(field_id, []) or []
+                if not allowed_values:
+                    continue
+
+                if max_selected > 1:
+                    value = list(allowed_values[:max_selected])
+                else:
+                    value = allowed_values[0]
+
+            result[field_id] = value
+
+        SimpleLogger.info("A2PromptShaper: LLM call skipped; deterministic defaults used.")
+        return result
 
     def _sanitize_selector_result(
         self,

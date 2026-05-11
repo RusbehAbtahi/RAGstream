@@ -46,7 +46,12 @@ def do_a2_promptshaper() -> None:
     ctrl: AppController = st.session_state.controller
     sp: SuperPrompt = st.session_state.sp
 
-    sp = ctrl.run_a2_promptshaper(sp)
+    use_llm = bool(st.session_state.get("use_a2_promptshaper_llm", True))
+
+    sp = ctrl.run_a2_promptshaper(
+        sp,
+        use_llm=use_llm,
+    )
 
     st.session_state.sp = sp
     st.session_state.sp_a2 = copy.deepcopy(sp)

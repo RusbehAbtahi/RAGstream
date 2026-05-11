@@ -617,3 +617,64 @@ def _sanitize_chunk_text(text: str) -> str:
     result = re.sub(r"(?m)^---\s*$", "[RULE]", result)
 
     return result.strip()
+def has_a4_useful_chunks(
+    sp: SuperPrompt,
+    *,
+    max_candidates: int = 30,
+) -> bool:
+    if sp is None:
+        return False
+
+    a3_rows = list(sp.views_by_stage.get("a3", []))[: int(max_candidates)]
+    if not a3_rows:
+        return False
+
+    item_decisions = (getattr(sp, "extras", {}) or {}).get("a3_item_decisions", {}) or {}
+
+    chunk_by_id: Dict[str, Any] = {}
+    for chunk in getattr(sp, "base_context_chunks", []) or []:
+        chunk_by_id[str(chunk.id)] = chunk
+
+    for row in a3_rows:
+        real_chunk_id = str(row[0])
+        item_info = item_decisions.get(real_chunk_id, {}) or {}
+        usefulness_label = str(item_info.get("usefulness_label", "") or "").strip().lower()
+
+        if usefulness_label == "useful" and real_chunk_id in chunk_by_id:
+            return True
+
+    return False
+
+
+def finalize_a4_empty_selection(
+    *,
+    sp: SuperPrompt,
+    reason: str = "a3_selected_zero_useful_chunks",
+) -> SuperPrompt:
+    if sp is None:
+        raise ValueError("finalize_a4_empty_selection: 'sp' must not be None")
+
+    if not hasattr(sp, "extras") or getattr(sp, "extras") is None:
+        sp.extras = {}
+
+    a3_rows = list(sp.views_by_stage.get("a3", []) or [])
+
+    stage_rows: List[Tuple[str, float, A3ChunkStatus]] = []
+    for row in a3_rows:
+        stage_rows.append((str(row[0]), 0.0, A3ChunkStatus.DISCARDED))
+
+    sp.S_CTX_MD = ""
+    sp.final_selection_ids = []
+    sp.views_by_stage["a4"] = stage_rows
+    sp.stage = "a4"
+    sp.history_of_stages.append("a4")
+
+    sp.extras["a4_skipped"] = True
+    sp.extras["a4_skip_reason"] = reason
+    sp.extras["a4_budget_profile"] = "empty_selection"
+    sp.extras["a4_active_classes"] = []
+    sp.extras["a4_groups"] = []
+    sp.extras["a4_effective_output_token_limit"] = 0
+
+    sp.compose_prompt_ready()
+    return sp
