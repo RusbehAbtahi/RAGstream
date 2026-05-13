@@ -14,13 +14,259 @@ from typing import Any
 import streamlit as st
 
 from ragstream.app.controller import AppController
+from ragstream.app.pipeline_runner import (
+    PIPELINE_TOTAL_STEPS,
+    pipeline_stage_name,
+    run_prompt_builder_stage,
+)
 from ragstream.memory.memory_actions import capture_memory_pair
 from ragstream.memory.memory_manager import MemoryManager
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.textforge.RagLog import LogALL as logger
 
 
+def _pipeline_is_running() -> bool:
+    return bool(st.session_state.get("pipeline_running", False))
+
+
+def _guard_pipeline_running(action_name: str) -> bool:
+    """
+    Logical execution lock only.
+
+    This does not disable or grey out widgets.
+    It only prevents another action from being executed while the full
+    Prompt Builder pipeline is already running.
+    """
+    if not _pipeline_is_running():
+        return False
+
+    logger(
+        f"{action_name} ignored: Prompt Builder pipeline is running.",
+        "WARN",
+        "PUBLIC",
+    )
+    return True
+
+
+def _set_pipeline_status(
+    stage_name: str,
+    step_index: int,
+    total_steps: int,
+    message: str,
+) -> None:
+    progress = 0.0
+    if total_steps > 0:
+        progress = max(0.0, min(1.0, float(step_index) / float(total_steps)))
+
+    st.session_state["pipeline_status"] = {
+        "stage_name": stage_name,
+        "step_index": int(step_index),
+        "total_steps": int(total_steps),
+        "message": message,
+        "progress": progress,
+    }
+
+
+def request_prompt_builder_run() -> None:
+    """
+    Start the Prompt Builder state machine.
+
+    The pipeline is executed one stage per Streamlit rerun. This keeps the GUI
+    visually normal between stages and avoids one long blocking callback.
+    """
+    if _guard_pipeline_running("Prompt Builder"):
+        return
+
+    try:
+        ctrl: AppController = st.session_state.controller
+
+        user_text = str(st.session_state.get("prompt_text", "") or "").strip()
+        if not user_text:
+            logger(
+                "Prompt Builder cannot run because Prompt is empty.",
+                "WARN",
+                "PUBLIC",
+            )
+            st.error("Prompt is empty. Prompt Builder cannot run.")
+            return
+
+        project_name = _resolve_active_project(ctrl)
+        top_k = int(st.session_state.get("retrieval_top_k", 100))
+
+        use_a2_promptshaper_llm = bool(st.session_state.get("use_a2_promptshaper_llm", True))
+        use_retrieval_splade = bool(st.session_state.get("use_retrieval_splade", False))
+        use_reranking_colbert = bool(st.session_state.get("use_reranking_colbert", False))
+        st.session_state.sp = SuperPrompt()
+        st.session_state.sp_pre = SuperPrompt()
+        st.session_state.sp_a2 = SuperPrompt()
+        st.session_state.sp_rtv = SuperPrompt()
+        st.session_state.sp_rrk = SuperPrompt()
+        st.session_state.sp_a3 = SuperPrompt()
+        st.session_state.sp_a4 = SuperPrompt()
+        st.session_state["super_prompt_text"] = ""
+
+        st.session_state["pipeline_running"] = True
+        st.session_state["pipeline_stage_index"] = 0
+        st.session_state["pipeline_stage_armed"] = False
+        st.session_state["pipeline_config"] = {
+            "user_text": user_text,
+            "project_name": project_name,
+            "top_k": top_k,
+            "use_a2_promptshaper_llm": use_a2_promptshaper_llm,
+            "use_retrieval_splade": use_retrieval_splade,
+            "use_reranking_colbert": use_reranking_colbert,
+        }
+
+        _set_pipeline_status(
+            stage_name="Queued",
+            step_index=0,
+            total_steps=PIPELINE_TOTAL_STEPS,
+            message="Prompt Builder pipeline queued.",
+        )
+
+        logger(
+            (
+                "Prompt Builder started: "
+                f"A2_LLM={use_a2_promptshaper_llm}, "
+                f"SPLADE={use_retrieval_splade}, "
+                f"ColBERT={use_reranking_colbert}, "
+                f"top_k={top_k}, "
+                f"project={project_name}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
+        st.rerun()
+
+    except Exception as e:
+        logger(str(e), "ERROR", "PUBLIC")
+        st.error(str(e))
+
+
+def run_next_prompt_builder_step() -> None:
+    """
+    Advance the Prompt Builder pipeline state machine by one visual/execution phase.
+
+    Two-phase logic per stage:
+    1. Arm phase:
+       - write status for the next stage
+       - rerun so the user sees that status before the stage starts
+    2. Execute phase:
+       - run exactly one pipeline stage
+       - write SuperPrompt / snapshots
+       - rerun to expose logs and move to the next stage
+    """
+    if not _pipeline_is_running():
+        return
+
+    step_index = int(st.session_state.get("pipeline_stage_index", 0) or 0)
+
+    if step_index >= PIPELINE_TOTAL_STEPS:
+        st.session_state["pipeline_running"] = False
+        st.session_state["pipeline_stage_armed"] = False
+        _set_pipeline_status(
+            stage_name="Done",
+            step_index=PIPELINE_TOTAL_STEPS,
+            total_steps=PIPELINE_TOTAL_STEPS,
+            message="Prompt Builder pipeline completed.",
+        )
+        return
+
+    stage_name = pipeline_stage_name(step_index)
+
+    if not bool(st.session_state.get("pipeline_stage_armed", False)):
+        _set_pipeline_status(
+            stage_name=stage_name,
+            step_index=step_index + 1,
+            total_steps=PIPELINE_TOTAL_STEPS,
+            message=f"Running {stage_name}.",
+        )
+        st.session_state["pipeline_stage_armed"] = True
+        st.rerun()
+
+    try:
+        ctrl: AppController = st.session_state.controller
+        config = st.session_state.get("pipeline_config", {}) or {}
+
+        current_sp = st.session_state.get("sp")
+        if not isinstance(current_sp, SuperPrompt):
+            current_sp = None
+
+        logger(
+            f"Prompt Builder stage running: {step_index + 1}/{PIPELINE_TOTAL_STEPS} — {stage_name}",
+            "INFO",
+            "PUBLIC",
+        )
+
+        result = run_prompt_builder_stage(
+            step_index=step_index,
+            ctrl=ctrl,
+            sp=current_sp,
+            user_text=str(config.get("user_text", "") or ""),
+            project_name=str(config.get("project_name", "") or ""),
+            top_k=int(config.get("top_k", st.session_state.get("retrieval_top_k", 100)) or 100),
+            use_a2_promptshaper_llm=bool(config.get("use_a2_promptshaper_llm", True)),
+            use_retrieval_splade=bool(config.get("use_retrieval_splade", False)),
+            use_reranking_colbert=bool(config.get("use_reranking_colbert", False)),
+            memory_manager=st.session_state.get("memory_manager"),
+            ensure_memory_retrieval_configured=_ensure_memory_retrieval_configured,
+        )
+
+        sp: SuperPrompt = result["sp"]
+        snapshots: dict[str, SuperPrompt] = result.get("snapshots", {}) or {}
+
+        st.session_state.sp = sp
+
+        for snapshot_key, snapshot_value in snapshots.items():
+            st.session_state[snapshot_key] = snapshot_value
+
+        st.session_state["super_prompt_text"] = sp.prompt_ready
+
+        logger(
+            f"Prompt Builder stage finished: {step_index + 1}/{PIPELINE_TOTAL_STEPS} — {stage_name}",
+            "INFO",
+            "PUBLIC",
+        )
+
+        next_step_index = step_index + 1
+        st.session_state["pipeline_stage_index"] = next_step_index
+        st.session_state["pipeline_stage_armed"] = False
+
+        if next_step_index >= PIPELINE_TOTAL_STEPS:
+            st.session_state["pipeline_running"] = False
+            _set_pipeline_status(
+                stage_name="Done",
+                step_index=PIPELINE_TOTAL_STEPS,
+                total_steps=PIPELINE_TOTAL_STEPS,
+                message="Prompt Builder pipeline completed.",
+            )
+            logger(
+                "Prompt Builder finished.",
+                "INFO",
+                "PUBLIC",
+            )
+
+        st.rerun()
+
+    except Exception as e:
+        st.session_state["pipeline_running"] = False
+        st.session_state["pipeline_stage_armed"] = False
+        _set_pipeline_status(
+            stage_name="Failed",
+            step_index=step_index + 1,
+            total_steps=PIPELINE_TOTAL_STEPS,
+            message=str(e),
+        )
+        logger(str(e), "ERROR", "PUBLIC")
+        st.error(str(e))
+        st.rerun()
+
+
 def do_preprocess() -> None:
+    if _guard_pipeline_running("PreProcessing"):
+        return
+
     ctrl: AppController = st.session_state.controller
     user_text = st.session_state.get("prompt_text", "")
 
@@ -47,6 +293,9 @@ def do_preprocess() -> None:
 
 def do_a2_promptshaper() -> None:
     """A2 button callback."""
+    if _guard_pipeline_running("A2 PromptShaper"):
+        return
+
     ctrl: AppController = st.session_state.controller
     sp: SuperPrompt = st.session_state.sp
 
@@ -64,6 +313,9 @@ def do_a2_promptshaper() -> None:
 
 def do_feed_memory_manually() -> None:
     """Manual memory feed button callback."""
+    if _guard_pipeline_running("Manual Memory Feed"):
+        return
+
     prompt_text = st.session_state.get("prompt_text", "")
     output_text = st.session_state.get("manual_memory_feed_text", "")
 
@@ -220,24 +472,32 @@ def _ensure_memory_retrieval_configured(ctrl: AppController) -> None:
     )
 
 
+def _resolve_active_project(ctrl: AppController) -> str:
+    project_name = st.session_state.get("active_project")
+    if not project_name:
+        available_projects = ctrl.list_projects()
+        if available_projects:
+            project_name = available_projects[0]
+            st.session_state["active_project"] = project_name
+
+    if not project_name or project_name == "(no projects yet)":
+        raise ValueError("No active project is available.")
+
+    return str(project_name)
+
+
 def do_retrieval() -> None:
     """Retrieval button callback."""
+    if _guard_pipeline_running("Retrieval"):
+        return
+
     try:
         ctrl: AppController = st.session_state.controller
         sp: SuperPrompt = st.session_state.sp
 
         _ensure_memory_retrieval_configured(ctrl)
 
-        project_name = st.session_state.get("active_project")
-        if not project_name:
-            available_projects = ctrl.list_projects()
-            if available_projects:
-                project_name = available_projects[0]
-                st.session_state["active_project"] = project_name
-
-        if not project_name or project_name == "(no projects yet)":
-            st.error("No active project is available for Retrieval.")
-            return
+        project_name = _resolve_active_project(ctrl)
 
         top_k = int(st.session_state.get("retrieval_top_k", 100))
         use_retrieval_splade = bool(st.session_state.get("use_retrieval_splade", False))
@@ -268,9 +528,16 @@ def do_retrieval() -> None:
 
 def do_reranker() -> None:
     """ReRanker button callback."""
+    if _guard_pipeline_running("ReRanker"):
+        return
+
     try:
         ctrl: AppController = st.session_state.controller
         sp: SuperPrompt = st.session_state.sp
+
+        if getattr(ctrl, "reranker", None) is None:
+            st.error("ReRanker is not initialized yet.")
+            return
 
         use_reranking_colbert = bool(st.session_state.get("use_reranking_colbert", False))
 
@@ -291,6 +558,9 @@ def do_reranker() -> None:
 
 def do_a3_nli_gate() -> None:
     """A3 button callback."""
+    if _guard_pipeline_running("A3 NLI Gate"):
+        return
+
     try:
         ctrl: AppController = st.session_state.controller
         sp: SuperPrompt = st.session_state.sp
@@ -307,6 +577,9 @@ def do_a3_nli_gate() -> None:
 
 def do_a4_condenser() -> None:
     """A4 button callback."""
+    if _guard_pipeline_running("A4 Condenser"):
+        return
+
     try:
         ctrl: AppController = st.session_state.controller
         sp: SuperPrompt = st.session_state.sp
@@ -324,6 +597,9 @@ def do_a4_condenser() -> None:
 
 def do_create_project() -> None:
     """Create Project form callback."""
+    if _guard_pipeline_running("Create Project"):
+        return
+
     try:
         ctrl: AppController = st.session_state.controller
         result = ctrl.create_project(st.session_state.get("new_project_name", ""))
@@ -350,6 +626,9 @@ def do_create_project() -> None:
 
 def do_add_files() -> None:
     """Add Files form callback."""
+    if _guard_pipeline_running("Add Files"):
+        return
+
     try:
         ctrl: AppController = st.session_state.controller
 

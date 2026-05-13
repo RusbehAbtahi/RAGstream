@@ -10,6 +10,8 @@ from __future__ import annotations
 import html
 import time
 
+from typing import Any
+
 import streamlit as st
 
 from ragstream.app.controller import AppController
@@ -23,6 +25,8 @@ from ragstream.app.ui_actions import (
     do_preprocess,
     do_reranker,
     do_retrieval,
+    request_prompt_builder_run,
+    run_next_prompt_builder_step,
 )
 
 
@@ -125,27 +129,66 @@ def inject_base_css() -> None:
 
 
 
-            /* Manual memory feed button */
+            /* Primary buttons: used intentionally for Prompt Builder */
             div[data-testid="stButton"] > button[kind="primary"] {
-                background-color: #3F48CC !important;
-                border-color: #3F48CC !important;
+                background-color: #BB0000 !important;
+                border-color: #BB0000 !important;
                 color: white !important;
+                font-weight: 800 !important;
             }
 
             div[data-testid="stButton"] > button[kind="primary"]:hover {
-                background-color: #3F48CC !important;
-                border-color: #3F48CC !important;
+                background-color: #990000 !important;
+                border-color: #990000 !important;
                 color: white !important;
             }
 
             div[data-testid="stButton"] > button[kind="primary"]:focus {
-                background-color: #3F48CC !important;
-                border-color: #3F48CC !important;
+                background-color: #BB0000 !important;
+                border-color: #BB0000 !important;
                 color: white !important;
             }
 
             div[data-testid="stButton"] > button[kind="primary"] p {
                 color: white !important;
+                font-weight: 800 !important;
+            }
+
+            /* Manual memory feed button */
+            button[aria-label="Feed Memory Manually"] {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+                font-weight: 600 !important;
+            }
+
+            button[aria-label="Feed Memory Manually"]:hover {
+                background-color: #3F48CC !important;
+                border-color: #3F48CC !important;
+                color: white !important;
+            }
+
+            button[aria-label="Feed Memory Manually"] p {
+                color: white !important;
+            }
+
+            /* Prompt Builder button */
+            button[aria-label="Prompt Builder"] {
+                background-color: #BB0000 !important;
+                border-color: #BB0000 !important;
+                color: white !important;
+                font-weight: 800 !important;
+            }
+
+            button[aria-label="Prompt Builder"]:hover {
+                background-color: #990000 !important;
+                border-color: #990000 !important;
+                color: white !important;
+            }
+
+            button[aria-label="Prompt Builder"] p {
+                color: white !important;
+                font-weight: 800 !important;
             }
 
             /* Manual memory feed edit box */
@@ -204,6 +247,15 @@ def render_page() -> None:
     RIGHT:
       Memory
       Buttons / Top-K / project controls / status
+
+    Important execution order:
+    - Right panel is rendered first because button actions and the Prompt Builder
+      step machine may update st.session_state["super_prompt_text"].
+    - The Super-Prompt widget with key="super_prompt_text" is created later in
+      render_left_panel().
+    - This avoids Streamlit's error:
+      st.session_state.super_prompt_text cannot be modified after the widget
+      with key super_prompt_text is instantiated.
     """
     # Main 2-column layout
     gutter_l, col_left, spacer, col_right, gutter_r = st.columns([0.6, 4, 0.25, 4, 0.6], gap="small")
@@ -250,8 +302,6 @@ def render_left_panel() -> None:
 def render_right_panel() -> None:
     """Right panel: Memory at top, all controls below."""
     ctrl: AppController = st.session_state.controller
-    retrieval_ready = getattr(ctrl, "retriever", None) is not None
-    reranker_ready = getattr(ctrl, "reranker", None) is not None
 
     # Memory section
     render_memory_records(height=420)
@@ -266,7 +316,6 @@ def render_right_panel() -> None:
             "Feed Memory Manually",
             key="btn_feed_memory_manually",
             use_container_width=True,
-            type="primary",
         ):
             do_feed_memory_manually()
 
@@ -297,7 +346,6 @@ def render_right_panel() -> None:
             "Retrieval",
             key="btn_retrieval",
             use_container_width=True,
-            disabled=not retrieval_ready,
         ):
             do_retrieval()
 
@@ -306,7 +354,6 @@ def render_right_panel() -> None:
             "ReRanker",
             key="btn_reranker",
             use_container_width=True,
-            disabled=not reranker_ready,
         ):
             do_reranker()
 
@@ -325,7 +372,8 @@ def render_right_panel() -> None:
         st.button("A5 Format Enforcer", key="btn_a5", use_container_width=True)
 
     with b2c4:  # Prompt Builder button
-        st.button("Prompt Builder", key="btn_builder", use_container_width=True)
+        if st.button("Prompt Builder", key="btn_builder", use_container_width=True, type="primary"):
+            request_prompt_builder_run()
 
     topk_c, gap_c, opt_c1, opt_c2, opt_c3 = st.columns([0.5, 0.5, 1, 1, 1],
                                                        gap="small")  # row: Top-K + spacer + 3 checkboxes
@@ -362,6 +410,11 @@ def render_right_panel() -> None:
 
     st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
 
+    # Pipeline status bar
+    render_pipeline_status()
+
+    st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+
     # TextForge GUI log / status log
     render_textforge_gui_log(height=150)
 
@@ -369,6 +422,34 @@ def render_right_panel() -> None:
 
     # Project controls / file ingestion
     render_project_area(ctrl)
+
+    # Prompt Builder step-machine advance.
+    # This is intentionally called before render_left_panel() creates the
+    # super_prompt_text widget, because each stage may update that session key.
+    run_next_prompt_builder_step()
+
+
+def render_pipeline_status() -> Any:
+    """Render only the Prompt Builder pipeline progress bar."""
+    status = st.session_state.get("pipeline_status")
+    if not isinstance(status, dict):
+        status = {
+            "stage_name": "Idle",
+            "step_index": 0,
+            "total_steps": 6,
+            "message": "No pipeline run active.",
+            "progress": 0.0,
+        }
+
+    stage_name = str(status.get("stage_name", "Idle") or "Idle")
+    step_index = int(status.get("step_index", 0) or 0)
+    total_steps = int(status.get("total_steps", 6) or 6)
+    progress = float(status.get("progress", 0.0) or 0.0)
+
+    st.progress(
+        progress,
+        text=f"{step_index}/{total_steps} — {stage_name}",
+    )
 
 
 def render_textforge_gui_log(height: int = 150) -> None:
