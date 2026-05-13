@@ -13,17 +13,21 @@ Job:
 - Expect a JSON object with SYSTEM / AUDIENCE / TONE / DEPTH / CONFIDENCE.
 - Update the same SuperPrompt in place.
 - Rebuild sp.prompt_ready and mark stage='a2'.
+
+Logging policy:
+- PUBLIC: compact stage summary visible in GUI and CLI.
+- INTERNAL: selector ids / sanitization details visible in CLI/internal logs, not GUI.
+- No full prompt or raw LLM output logging in normal mode.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Union
-import json
 
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
-from ragstream.utils.logging import SimpleLogger
+from ragstream.textforge.RagLog import LogALL as logger
 
 
 JsonDict = Dict[str, Any]
@@ -64,12 +68,19 @@ class A2PromptShaper:
         # For now, all 5 fields are active. Later we can respect user-locked ones.
         active_fields: List[str] = ["system", "audience", "tone", "depth", "confidence"]
 
+        logger(
+            (
+                "A2 started: "
+                f"mode={'llm' if use_llm else 'deterministic_defaults'}, "
+                f"agent={agent_id}/{version}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
         if use_llm:
             inputs: Dict[str, str] = {
                 "prompt_under_evaluation": self._build_prompt_under_evaluation(sp),
-                # Changed:
-                # decision_targets now come from the top-level JSON config and are
-                # rendered inside AgentPrompt / compose_texts, not from A2 runtime payload.
                 "required_output": self._build_required_output_text(agent, active_fields),
             }
 
@@ -77,12 +88,6 @@ class A2PromptShaper:
                 input_payload=inputs,
                 active_fields=active_fields,
             )
-
-            SimpleLogger.info("A2PromptShaper → LLM messages:")
-            try:
-                SimpleLogger.info(json.dumps(messages, ensure_ascii=False, indent=2))
-            except Exception:
-                SimpleLogger.info(repr(messages))
 
             if not getattr(agent, "model_name", None):
                 raise RuntimeError(
@@ -93,24 +98,25 @@ class A2PromptShaper:
                     "A2PromptShaper: AgentPrompt missing temperature/max_output_tokens configuration"
                 )
 
+            logger(
+                (
+                    "A2 LLM call prepared: "
+                    f"model={agent.model_name}, "
+                    f"max_output_tokens={agent.max_output_tokens}, "
+                    f"active_fields={len(active_fields)}"
+                ),
+                "INFO",
+                "INTERNAL",
+            )
+
             raw_result: Union[str, JsonDict] = self._llm_client.chat(
                 messages=messages,
                 model_name=agent.model_name,
                 temperature=agent.temperature,
                 max_output_tokens=agent.max_output_tokens,
                 response_format=response_format,
-                prompt_cache_key=f"{agent_id}_{version}",  # Added: stable cache key for repeated A2 prompts of the same agent/version.
-               # prompt_cache_retention="in_memory",  # Added: explicit short-lived cache retention for repeated near-term A2 calls.
+                prompt_cache_key=f"{agent_id}_{version}",
             )
-
-            SimpleLogger.info("A2PromptShaper ← LLM raw result:")
-            try:
-                if isinstance(raw_result, dict):
-                    SimpleLogger.info(json.dumps(raw_result, ensure_ascii=False, indent=2))
-                else:
-                    SimpleLogger.info(str(raw_result))
-            except Exception:
-                SimpleLogger.info(repr(raw_result))
 
             parsed_result = agent.parse(raw_result, active_fields=active_fields)
 
@@ -160,6 +166,22 @@ class A2PromptShaper:
         sp.extras["a2_llm_used"] = bool(use_llm)
         sp.extras["a2_mode"] = "llm" if use_llm else "deterministic_defaults"
 
+        logger(
+            f"A2 selected ids: {selected_ids}",
+            "INFO",
+            "INTERNAL",
+        )
+
+        logger(
+            (
+                "A2 finished: "
+                f"mode={'llm' if use_llm else 'deterministic_defaults'}, "
+                f"selected_fields={len(selected_ids)}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
         sp.history_of_stages.append("a2")
         sp.stage = "a2"
         sp.compose_prompt_ready()
@@ -204,7 +226,11 @@ class A2PromptShaper:
 
             result[field_id] = value
 
-        SimpleLogger.info("A2PromptShaper: LLM call skipped; deterministic defaults used.")
+        logger(
+            "A2 LLM call skipped; deterministic defaults used.",
+            "INFO",
+            "PUBLIC",
+        )
         return result
 
     def _sanitize_selector_result(
@@ -249,9 +275,13 @@ class A2PromptShaper:
             allowed_set = set(allowed_ids)
 
             if not allowed_set:
-                SimpleLogger.warning(
-                    f"A2PromptShaper: no enum/catalog values available for field '{field_id}'; "
-                    "preserving preprocessing value."
+                logger(
+                    (
+                        f"A2 sanitize: no enum/catalog values available for field '{field_id}'; "
+                        "preserving preprocessing value."
+                    ),
+                    "WARN",
+                    "INTERNAL",
                 )
                 continue
 
@@ -269,22 +299,34 @@ class A2PromptShaper:
                     removed_items.append(item)
 
             if removed_items:
-                SimpleLogger.warning(
-                    f"A2PromptShaper: removed invalid option(s) for field '{field_id}': "
-                    f"{removed_items}"
+                logger(
+                    (
+                        f"A2 sanitize: removed invalid option(s) for field '{field_id}': "
+                        f"{removed_items}"
+                    ),
+                    "WARN",
+                    "INTERNAL",
                 )
 
             if not valid_items:
-                SimpleLogger.warning(
-                    f"A2PromptShaper: field '{field_id}' became empty after sanitization; "
-                    "preserving preprocessing value."
+                logger(
+                    (
+                        f"A2 sanitize: field '{field_id}' became empty after sanitization; "
+                        "preserving preprocessing value."
+                    ),
+                    "WARN",
+                    "INTERNAL",
                 )
                 continue
 
             if len(valid_items) > max_selected:
-                SimpleLogger.warning(
-                    f"A2PromptShaper: field '{field_id}' returned too many valid options; "
-                    f"keeping first {max_selected}: {valid_items[:max_selected]}"
+                logger(
+                    (
+                        f"A2 sanitize: field '{field_id}' returned too many valid options; "
+                        f"keeping first {max_selected}: {valid_items[:max_selected]}"
+                    ),
+                    "WARN",
+                    "INTERNAL",
                 )
                 valid_items = valid_items[:max_selected]
 

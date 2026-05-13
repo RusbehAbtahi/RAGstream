@@ -253,6 +253,13 @@ def do_retrieval() -> None:
 
         st.session_state.sp = sp
         st.session_state.sp_rtv = copy.deepcopy(sp)
+
+        # Retrieval now also initializes an A3-ready passthrough view
+        # under views_by_stage["reranked"].
+        # Therefore sp_rrk can safely mirror this state until real ColBERT
+        # ReRanker overwrites it.
+        st.session_state.sp_rrk = copy.deepcopy(sp)
+
         st.session_state["super_prompt_text"] = sp.prompt_ready
 
     except Exception as e:

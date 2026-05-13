@@ -54,6 +54,7 @@ from typing import Any, Iterable
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.preprocessing.prompt_schema import PromptSchema
 from ragstream.preprocessing.preprocessing import preprocess
+from ragstream.preprocessing.activebrief_relation_classifier import ActiveBriefRelationClassifier
 
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
@@ -123,6 +124,12 @@ class AppController:
             llm_client=self.llm_client,
         )
 
+        # ActiveBrief relation classifier.
+        self.activebrief_relation_classifier = ActiveBriefRelationClassifier(
+            agent_factory=self.agent_factory,
+            llm_client=self.llm_client,
+        )
+
         # A3 agent.
         self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
@@ -170,6 +177,7 @@ class AppController:
         self.retriever = Retriever(
             doc_root=str(self.doc_root),
             chroma_root=str(self.chroma_root),
+            runtime_config=self.runtime_config,
         )
 
         self.reranker = Reranker()
@@ -216,7 +224,13 @@ class AppController:
             "CONFIDENTIAL",
         )
 
-    def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
+    def preprocess(
+        self,
+        user_text: str,
+        sp: SuperPrompt,
+        *,
+        memory_manager: Any | None = None,
+    ) -> SuperPrompt:
         """
         Keep existing behavior:
         - Ignore empty/whitespace-only input.
@@ -228,12 +242,27 @@ class AppController:
 
         logger("PreProcessing started.", "INFO", "PUBLIC")
         preprocess(text, sp, self.schema)
+
+        sp = self.activebrief_relation_classifier.run(
+            sp=sp,
+            memory_manager=memory_manager,
+            raw_user_text=text,
+        )
+
         logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 
-    def run_a2_promptshaper(self, sp: SuperPrompt) -> SuperPrompt:
+    def run_a2_promptshaper(
+        self,
+        sp: SuperPrompt,
+        *,
+        use_llm: bool = True,
+    ) -> SuperPrompt:
         """Run A2 on the current SuperPrompt."""
-        return self.a2_promptshaper.run(sp)
+        return self.a2_promptshaper.run(
+            sp,
+            use_llm=bool(use_llm),
+        )
 
     def run_a3(self, sp: SuperPrompt) -> SuperPrompt:
         """
@@ -1188,7 +1217,11 @@ def do_preprocess() -> None:
     st.session_state.sp_a4 = SuperPrompt()
 
     sp: SuperPrompt = st.session_state.sp
-    sp = ctrl.preprocess(user_text, sp)
+    sp = ctrl.preprocess(
+        user_text,
+        sp,
+        memory_manager=st.session_state.get("memory_manager"),
+    )
 
     st.session_state.sp = sp
     st.session_state.sp_pre = copy.deepcopy(sp)
@@ -1200,7 +1233,12 @@ def do_a2_promptshaper() -> None:
     ctrl: AppController = st.session_state.controller
     sp: SuperPrompt = st.session_state.sp
 
-    sp = ctrl.run_a2_promptshaper(sp)
+    use_llm = bool(st.session_state.get("use_a2_promptshaper_llm", True))
+
+    sp = ctrl.run_a2_promptshaper(
+        sp,
+        use_llm=use_llm,
+    )
 
     st.session_state.sp = sp
     st.session_state.sp_a2 = copy.deepcopy(sp)
@@ -2389,8 +2427,8 @@ def render_right_panel() -> None:
     with b2c4:  # Prompt Builder button
         st.button("Prompt Builder", key="btn_builder", use_container_width=True)
 
-    topk_c, gap_c, opt_c1, opt_c2 = st.columns([0.5, 1, 1, 1],
-                                               gap="small")  # row: Top-K + spacer + 2 checkboxes
+    topk_c, gap_c, opt_c1, opt_c2, opt_c3 = st.columns([0.5, 0.5, 1, 1, 1],
+                                                       gap="small")  # row: Top-K + spacer + 3 checkboxes
 
     with topk_c:  # number input: Retrieval Top-K
         st.number_input(
@@ -2404,13 +2442,19 @@ def render_right_panel() -> None:
     with gap_c:  # empty spacer between Top-K and first checkbox
         st.empty()
 
-    with opt_c1:  # checkbox: use Retrieval Splade
+    with opt_c1:  # checkbox: use A2 PromptShaper LLM
+        st.checkbox(
+            "use A2 PromptShaper LLM",
+            key="use_a2_promptshaper_llm",
+        )
+
+    with opt_c2:  # checkbox: use Retrieval Splade
         st.checkbox(
             "use Retrieval Splade",
             key="use_retrieval_splade",
         )
 
-    with opt_c2:  # checkbox: use Reranking Colbert
+    with opt_c3:  # checkbox: use Reranking Colbert
         st.checkbox(
             "use Reranking Colbert",
             key="use_reranking_colbert",
@@ -2924,6 +2968,9 @@ def init_session_state() -> None:
 
     if "retrieval_top_k" not in st.session_state:
         st.session_state["retrieval_top_k"] = 30
+
+    if "use_a2_promptshaper_llm" not in st.session_state:
+        st.session_state["use_a2_promptshaper_llm"] = True
 
     if "use_retrieval_splade" not in st.session_state:
         st.session_state["use_retrieval_splade"] = False
@@ -5769,6 +5816,16 @@ class SuperPrompt:
         "body",
         "extras",
 
+        # effective retrieval query
+        "effective_retrieval_query_text",
+
+        # active memory brief
+        "active_memory_brief_title",
+        "active_memory_brief",
+
+        # synthesized memory context
+        "memory_context_text",
+
         # document retrieval artifacts
         "base_context_chunks",
         "views_by_stage",
@@ -5815,6 +5872,18 @@ class SuperPrompt:
 
         # Free-form diagnostics and stage metadata.
         self.extras: Dict[str, Any] = {}
+
+        # Effective retrieval query.
+        # PreProcessing fills this now from TASK / PURPOSE / CONTEXT.
+        # Later PreProcessing can replace it with a weak/strong-aware query.
+        self.effective_retrieval_query_text: str = ""
+
+        # Active Memory Brief shown below TASK / PURPOSE / CONTEXT.
+        self.active_memory_brief_title: str = ""
+        self.active_memory_brief: str = ""
+
+        # Final synthesized query-relevant Memory Context.
+        self.memory_context_text: str = ""
 
         # Document retrieval artifacts.
         self.base_context_chunks: List["Chunk"] = []
@@ -5993,6 +6062,15 @@ class SuperPromptProjector:
         format_value = (self.sp.body.get("format") or "").strip()
         text_value = (self.sp.body.get("text") or "").strip()
 
+        active_brief_title = str(getattr(self.sp, "active_memory_brief_title", "") or "").strip()
+        active_brief_text = str(getattr(self.sp, "active_memory_brief", "") or "").strip()
+
+        if not active_brief_title:
+            active_brief_title = str((getattr(self.sp, "extras", {}) or {}).get("active_memory_brief_title", "") or "").strip()
+
+        if not active_brief_text:
+            active_brief_text = str((getattr(self.sp, "extras", {}) or {}).get("active_memory_brief", "") or "").strip()
+
         lines.append("## User")
         lines.append("")
 
@@ -6010,6 +6088,15 @@ class SuperPromptProjector:
             lines.append(context_value)
             lines.append("")
 
+        if active_brief_title or active_brief_text:
+            lines.append("### Active Memory Brief")
+            if active_brief_title:
+                lines.append(f"Title: {active_brief_title}")
+                lines.append("")
+            if active_brief_text:
+                lines.append(active_brief_text)
+                lines.append("")
+
         if format_value:
             lines.append("### Format")
             lines.append(format_value)
@@ -6026,50 +6113,69 @@ class SuperPromptProjector:
         """
         Render retrieved/condensed context for GUI-visible SuperPrompt preview.
 
-        Retrieval stage now has two raw candidate pools:
-        - document chunks
-        - memory candidates
-
-        Both are rendered here as inspection/debug material.
+        Rules:
+        - show synthesized Memory Context, not raw memory episodes/chunks
+        - show document raw chunks after Retrieval/Reranker/A3
+        - hide document raw chunks after A4/A5
+        - keep document summary context when available
         """
+        memory_context_md = self._render_memory_context_md()
+        document_context_md = self._render_document_context_summary_md()
+        raw_document_evidence_md = self._render_raw_document_evidence_for_stage_md()
+
+        if not memory_context_md and not document_context_md and not raw_document_evidence_md:
+            return ""
+
         lines: List[str] = []
 
         lines.append("## Retrieved Context")
         lines.append("")
 
-        lines.append("### Retrieved Context Summary")
-        lines.append(
-            "The following summary is retrieved from selected project files or memory. "
-            "It is supporting context for the task, not part of the task itself."
-        )
-        lines.append("")
-
-        summary_text = (self.sp.S_CTX_MD or "").strip()
-        if summary_text:
-            lines.append(summary_text)
-        lines.append("")
-
-        lines.append("### Raw Retrieved Evidence")
-        raw_evidence_md = self._render_raw_retrieved_evidence_md()
-        if raw_evidence_md:
-            lines.append(raw_evidence_md)
-
-        raw_memory_md = self._render_raw_memory_retrieval_md()
-        if raw_memory_md:
+        if memory_context_md:
+            lines.append("### Memory Context")
+            lines.append(memory_context_md)
             lines.append("")
-            lines.append(raw_memory_md)
+
+        if document_context_md:
+            lines.append("### Document Context Summary")
+            lines.append(
+                "The following summary is retrieved from selected project files. "
+                "It is supporting context for the task, not part of the task itself."
+            )
+            lines.append("")
+            lines.append(document_context_md)
+            lines.append("")
+
+        if raw_document_evidence_md:
+            lines.append("### Raw Retrieved Evidence")
+            lines.append(raw_document_evidence_md)
 
         return "\n".join(lines).strip()
 
+    def _render_memory_context_md(self) -> str:
+        memory_context = str(getattr(self.sp, "memory_context_text", "") or "").strip()
+
+        if not memory_context:
+            extras = getattr(self.sp, "extras", {}) or {}
+            memory_context = str(extras.get("memory_context_text", "") or "").strip()
+
+        return memory_context
+
+    def _render_document_context_summary_md(self) -> str:
+        return str(getattr(self.sp, "S_CTX_MD", "") or "").strip()
+
+    def _render_raw_document_evidence_for_stage_md(self) -> str:
+        if str(getattr(self.sp, "stage", "") or "").strip() in {"a4", "a5"}:
+            return ""
+
+        return self._render_raw_retrieved_evidence_md()
+
     def _render_raw_memory_retrieval_md(self) -> str:
         """
-        Render raw memory retrieval candidates.
+        Backward-compatible raw memory renderer.
 
-        MemoryRetriever writes the raw debug markdown into:
-            sp.extras["memory_debug_markdown"]
-
-        This is GUI inspection material only.
-        It is not final compressed memory context.
+        The GUI path no longer calls this method because raw memory episodes and
+        raw memory chunks should not be shown in the SuperPrompt preview.
         """
         extras = getattr(self.sp, "extras", {}) or {}
         memory_debug_md = str(extras.get("memory_debug_markdown", "") or "").strip()
@@ -7584,6 +7690,7 @@ class Retriever:
         chroma_root: str,
         embedder: Embedder | None = None,
         chunker: Chunker | None = None,
+        runtime_config: dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize Retrieval with explicit project roots and shared helpers.
@@ -7606,6 +7713,7 @@ class Retriever:
 
         self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-small")
         self.chunker = chunker if chunker is not None else Chunker()
+        self.runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
 
         # Keep the chunk class explicit so hydration remains readable and testable.
         self.chunk_cls = Chunk
@@ -7653,9 +7761,11 @@ class Retriever:
             top_k=top_k,
         )
 
+        ranked_rows_emb = self._apply_hard_embedding_floor(ranked_rows_emb)
+
         ranked_rows_splade: List[RankedRow]
 
-        if use_retrieval_splade:
+        if use_retrieval_splade and ranked_rows_emb:
             candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
 
             try:
@@ -7742,6 +7852,28 @@ class Retriever:
     # -----------------------------------------------------------------
     # Internal helpers kept in retriever.py
     # -----------------------------------------------------------------
+
+    def _apply_hard_embedding_floor(
+        self,
+        ranked_rows_emb: List[RankedRow],
+    ) -> List[RankedRow]:
+        """
+        Remove dense retrieval rows below the configured hard embedding floor.
+
+        The dense row score is the embedding similarity score that later appears
+        as Emb=... in the SuperPrompt raw retrieved evidence.
+        """
+        document_retrieval_config = self.runtime_config.get("document_retrieval", {}) or {}
+        hard_embedding_floor = float(document_retrieval_config.get("hard_embedding_floor", 0.0) or 0.0)
+
+        if hard_embedding_floor <= 0.0:
+            return ranked_rows_emb
+
+        return [
+            (str(chunk_id), float(score), dict(meta or {}))
+            for chunk_id, score, meta in ranked_rows_emb
+            if float(score) >= hard_embedding_floor
+        ]
 
     def _project_rrf_metadata_to_retrieval_contract(
         self,
@@ -8125,11 +8257,12 @@ It reads:
 
 It writes:
 - raw MemoryContextPack into SuperPrompt
+- synthesized Memory Context into SuperPrompt
+- latest ActiveRetrievalBrief into SuperPrompt
 
 It does NOT run:
 - A3
 - A4
-- MemoryMerge
 - PromptBuilder
 """
 
@@ -8143,9 +8276,17 @@ from typing import Any
 from ragstream.memory.retrieval.memory_context_pack import MemoryContextPack
 from ragstream.memory.retrieval.memory_index_lookup import MemoryIndexLookup
 from ragstream.memory.retrieval.memory_scoring import MemoryScorer
+from ragstream.memory.compression.memory_compressor import MemoryCompressor
+from ragstream.memory.memory_merge_synthesizer import MemoryMergeSynthesizer
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 class MemoryRetriever:
     """
@@ -8156,6 +8297,7 @@ class MemoryRetriever:
     - SQLite lookup is delegated to MemoryIndexLookup
     - scoring is delegated to MemoryScorer
     - candidate storage is delegated to MemoryContextPack
+    - final Memory Context synthesis is delegated to MemoryMergeSynthesizer
     """
 
     def __init__(
@@ -8167,6 +8309,7 @@ class MemoryRetriever:
     ) -> None:
         self.memory_manager = memory_manager
         self.memory_vector_store = memory_vector_store
+        self.runtime_config = dict(config or {})
 
         # Accept either the full runtime_config or only runtime_config["memory_retrieval"].
         if "memory_retrieval" in (config or {}):
@@ -8180,6 +8323,8 @@ class MemoryRetriever:
             memory_root=memory_root,
         )
         self.scorer = MemoryScorer(self.config)
+        self.compressor = MemoryCompressor(self.runtime_config)
+        self.memory_synthesizer = MemoryMergeSynthesizer(runtime_config=self.runtime_config)
 
     def run(
         self,
@@ -8205,6 +8350,7 @@ class MemoryRetriever:
             return self._write_empty_pack(sp, reason="empty_query_text")
 
         direct_recall_key = self._extract_direct_recall_key(sp)
+        active_brief_info = self._find_latest_active_brief_info()
 
         logger(
             f"Memory Retrieval started: file={active_file_id[:8]}",
@@ -8218,6 +8364,7 @@ class MemoryRetriever:
                 f"active_file_id={active_file_id}\n"
                 f"memory_title={getattr(self.memory_manager, 'title', '')}\n"
                 f"query_text={query_text}\n"
+                f"active_brief_title={active_brief_info.get('active_retrieval_brief_title', '')}\n"
                 f"direct_recall_key={direct_recall_key}\n"
                 f"config={json.dumps(self.config, ensure_ascii=False, indent=2, default=str)}"
             ),
@@ -8241,6 +8388,8 @@ class MemoryRetriever:
             working_candidates=index_candidates["working_memory"],
             direct_recall_candidate=index_candidates["direct_recall"],
             gold_candidates=index_candidates["gold"],
+            query_text=query_text,
+            active_brief_info=active_brief_info,
             diagnostics={
                 "query_text": query_text,
                 "active_file_id": active_file_id,
@@ -8257,7 +8406,11 @@ class MemoryRetriever:
             },
         )
 
-        self._write_to_superprompt(sp, pack)
+        self._write_to_superprompt(
+            sp=sp,
+            pack=pack,
+            active_brief_info=active_brief_info,
+        )
 
         self._log_developer_diagnostics(
             query_text=query_text,
@@ -8273,6 +8426,7 @@ class MemoryRetriever:
                 f"working={len(pack.working_memory_candidates)}, "
                 f"episodic={len(pack.episodic_candidates)}, "
                 f"semantic_chunks={len(pack.semantic_memory_chunks)}, "
+                f"memory_context={1 if pack.synthesized_memory_context else 0}, "
                 f"direct_recall={1 if pack.direct_recall_candidate else 0}"
             ),
             "INFO",
@@ -8288,9 +8442,21 @@ class MemoryRetriever:
         """
         Build memory retrieval query text from SuperPrompt.
 
-        We intentionally use the same conceptual fields that document retrieval
-        already cares about: task, purpose, context, and fallback prompt_ready.
+        Primary source:
+        - sp.effective_retrieval_query_text filled by PreProcessing.
+
+        Fallback:
+        - build from TASK / PURPOSE / CONTEXT using SuperPromptProjector.
         """
+        effective_query_text = str(getattr(sp, "effective_retrieval_query_text", "") or "").strip()
+        if effective_query_text:
+            return effective_query_text
+
+        try:
+            return SuperPromptProjector.build_query_text(sp)
+        except Exception:
+            pass
+
         body = getattr(sp, "body", {}) or {}
 
         parts: list[str] = []
@@ -8406,6 +8572,8 @@ class MemoryRetriever:
         working_candidates: list[dict[str, Any]],
         direct_recall_candidate: dict[str, Any] | None,
         gold_candidates: list[dict[str, Any]],
+        query_text: str,
+        active_brief_info: dict[str, Any],
         diagnostics: dict[str, Any],
     ) -> MemoryContextPack:
         """
@@ -8421,6 +8589,11 @@ class MemoryRetriever:
             gold_candidates=gold_candidates,
         )
 
+        episodic_final = self.compressor.compress_episodic_candidates(
+            episodic_candidates=episodic_final,
+            effective_query_text=query_text,
+        )
+
         for candidate in episodic_final:
             pack.add_episodic_candidate(candidate)
 
@@ -8429,6 +8602,19 @@ class MemoryRetriever:
 
         pack.set_direct_recall(direct_recall_candidate)
 
+        synthesis_result = self.memory_synthesizer.synthesize(
+            effective_retrieval_query_text=query_text,
+            active_retrieval_brief_title=str(active_brief_info.get("active_retrieval_brief_title", "") or ""),
+            active_retrieval_brief=str(active_brief_info.get("active_retrieval_brief", "") or ""),
+            episodic_candidates=pack.episodic_candidates,
+            semantic_memory_chunks=pack.semantic_memory_chunks,
+        )
+
+        pack.set_synthesized_memory_context(
+            memory_context=str(synthesis_result.get("memory_context", "") or ""),
+            diagnostics=dict(synthesis_result.get("memory_synthesis_diagnostics", {}) or {}),
+        )
+
         pack.set_selection_diagnostics(diagnostics)
         pack.set_token_budget_report(self._estimate_token_budget(pack))
 
@@ -8436,22 +8622,33 @@ class MemoryRetriever:
 
     def _write_to_superprompt(
         self,
+        *,
         sp: Any,
         pack: MemoryContextPack,
+        active_brief_info: dict[str, Any],
     ) -> None:
         """
-        Store MemoryContextPack into SuperPrompt.
-
-        This keeps raw memory candidates available for GUI and later stages.
+        Store MemoryContextPack, synthesized Memory Context, and ActiveBrief
+        into SuperPrompt.
         """
         setattr(sp, "memory_context_pack", pack)
+        setattr(sp, "memory_context_text", pack.synthesized_memory_context)
+
+        active_title = str(active_brief_info.get("active_retrieval_brief_title", "") or "").strip()
+        active_brief = str(active_brief_info.get("active_retrieval_brief", "") or "").strip()
+
+        setattr(sp, "active_memory_brief_title", active_title)
+        setattr(sp, "active_memory_brief", active_brief)
 
         if not hasattr(sp, "extras") or getattr(sp, "extras") is None:
             setattr(sp, "extras", {})
 
         sp.extras["memory_context_pack"] = pack.to_dict()
+        sp.extras["memory_context_text"] = pack.synthesized_memory_context
         sp.extras["memory_debug_markdown"] = pack.to_debug_markdown()
         sp.extras["memory_retrieval_counts"] = pack.counts()
+        sp.extras["active_memory_brief_title"] = active_title
+        sp.extras["active_memory_brief"] = active_brief
 
     def _query_memory_vectors(
         self,
@@ -8739,6 +8936,39 @@ class MemoryRetriever:
 
         return result
 
+    def _find_latest_active_brief_info(self) -> dict[str, Any]:
+        """
+        Find latest non-Black ActiveRetrievalBrief in live memory records.
+        """
+        records = list(getattr(self.memory_manager, "records", []) or [])
+
+        for record in reversed(records):
+            tag = str(getattr(record, "tag", "") or "").strip()
+            if tag == "Black":
+                continue
+
+            active_brief = str(getattr(record, "active_retrieval_brief", "") or "").strip()
+            if not active_brief:
+                continue
+
+            return {
+                "record_id": str(getattr(record, "record_id", "") or ""),
+                "active_retrieval_brief_title": str(
+                    getattr(record, "active_retrieval_brief_title", "") or ""
+                ).strip(),
+                "active_retrieval_brief": active_brief,
+                "active_retrieval_brief_contributor_ids": list(
+                    getattr(record, "active_retrieval_brief_contributor_ids", []) or []
+                ),
+            }
+
+        return {
+            "record_id": "",
+            "active_retrieval_brief_title": "",
+            "active_retrieval_brief": "",
+            "active_retrieval_brief_contributor_ids": [],
+        }
+
     def _extract_direct_recall_key(
         self,
         sp: Any,
@@ -8767,7 +8997,7 @@ class MemoryRetriever:
         """
         Rough token estimate for diagnostics.
 
-        MemoryMerge later owns exact trimming/compression.
+        Exact final answer trimming belongs to later stages.
         """
         data = pack.to_dict()
         text = json.dumps(data, ensure_ascii=False, default=str)
@@ -8782,6 +9012,7 @@ class MemoryRetriever:
                 "episodic_memory": self.config.get("episodic_memory", {}),
                 "direct_recall": self.config.get("direct_recall", {}),
                 "semantic_memory_chunks": self.config.get("semantic_memory_chunks", {}),
+                "memory_merge_synthesizer": self.runtime_config.get("memory_merge_synthesizer", {}),
             },
         }
 
@@ -8792,7 +9023,11 @@ class MemoryRetriever:
     ) -> Any:
         pack = MemoryContextPack()
         pack.set_selection_diagnostics({"empty_reason": reason})
-        self._write_to_superprompt(sp, pack)
+        self._write_to_superprompt(
+            sp=sp,
+            pack=pack,
+            active_brief_info=self._find_latest_active_brief_info(),
+        )
         return sp
 
     def _log_developer_diagnostics(
@@ -9412,8 +9647,14 @@ from ragstream.memory.memory_record import (
     RECORD_END,
     RECORD_START,
 )
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
 
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -9816,12 +10057,14 @@ class MemoryManager:
                 pending_topic_buffer=dict(self.pending_activebrief_topic_buffer or {}),
             )
 
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
             contributor_ids = list(result.get("active_retrieval_brief_contributor_ids") or [])
 
             record.update_active_retrieval_brief(
                 active_retrieval_brief=active_brief,
                 contributor_ids=contributor_ids,
+                active_retrieval_brief_title=active_brief_title,
             )
 
             new_buffer = result.get("pending_activebrief_topic_buffer", {})
@@ -9834,6 +10077,8 @@ class MemoryManager:
                         "record_id": record.record_id,
                         "activebrief_llm_skipped": bool(result.get("activebrief_llm_skipped", False)),
                         "activebrief_gate_route": str(result.get("activebrief_gate_route", "") or ""),
+                        "active_retrieval_brief_title": active_brief_title,
+                        "active_retrieval_brief": active_brief,
                         "active_retrieval_brief_contributor_ids": contributor_ids,
                         "pending_activebrief_topic_buffer": self._pending_buffer_log_view(
                             self.pending_activebrief_topic_buffer
@@ -10081,6 +10326,340 @@ class MemoryManager:
             )
 ```
 
+### ~\ragstream\memory\memory_merge_synthesizer.py
+```python
+# ragstream/memory/memory_merge_synthesizer.py
+# -*- coding: utf-8 -*-
+"""
+MemoryMergeSynthesizer
+======================
+
+Runtime-only Memory Context synthesizer.
+
+Purpose:
+- receive compressed episodic Q/A candidates
+- receive semantic memory chunks
+- receive effective_retrieval_query_text
+- receive ActiveRetrievalBrief as anti-duplication reference
+- call one LLM synthesizer agent
+- produce one compact query-relevant Memory Context
+
+Important:
+- This does not modify durable MemoryRecord truth.
+- This does not write .ragmem, .ragmeta.json, SQLite, or vectors.
+- The synthesized Memory Context is query-dependent runtime data.
+"""
+
+from __future__ import annotations
+
+import json
+
+from pathlib import Path
+from typing import Any
+
+from ragstream.orchestration.agent_factory import AgentFactory
+from ragstream.orchestration.agent_prompt import AgentPrompt
+from ragstream.orchestration.llm_client import LLMClient
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
+
+JsonDict = dict[str, Any]
+
+
+class MemoryMergeSynthesizer:
+    def __init__(
+        self,
+        *,
+        runtime_config: JsonDict | None = None,
+        agent_factory: AgentFactory | None = None,
+        llm_client: LLMClient | None = None,
+    ) -> None:
+        self.runtime_config = runtime_config if isinstance(runtime_config, dict) else self._load_runtime_config()
+
+        cfg = self.runtime_config.get("memory_merge_synthesizer", {}) or {}
+
+        self.enabled = bool(cfg.get("enabled", True))
+        self.agent_id = str(cfg.get("agent_id", "memory_synthesizer"))
+        self.agent_version = str(cfg.get("agent_version", "memory_synthesizer_001"))
+        self.target_context_tokens = int(cfg.get("target_context_tokens", 700))
+        self.max_episodic_records = int(cfg.get("max_episodic_records", 3))
+        self.max_semantic_chunks = int(cfg.get("max_semantic_chunks", 5))
+        self.prompt_cache_key = str(cfg.get("prompt_cache_key", "memory_synthesizer"))
+
+        self.agent_factory = agent_factory or AgentFactory()
+        self.llm_client = llm_client or LLMClient()
+
+    def synthesize(
+        self,
+        *,
+        effective_retrieval_query_text: str,
+        active_retrieval_brief_title: str,
+        active_retrieval_brief: str,
+        episodic_candidates: list[dict[str, Any]],
+        semantic_memory_chunks: list[dict[str, Any]],
+    ) -> JsonDict:
+        if not self.enabled:
+            return self._skipped_result(
+                reason="disabled",
+                effective_retrieval_query_text=effective_retrieval_query_text,
+                episodic_candidates=episodic_candidates,
+                semantic_memory_chunks=semantic_memory_chunks,
+            )
+
+        selected_episodes = list(episodic_candidates or [])[: self.max_episodic_records]
+        selected_chunks = list(semantic_memory_chunks or [])[: self.max_semantic_chunks]
+
+        evidence_text = self._build_memory_evidence_text(
+            episodic_candidates=selected_episodes,
+            semantic_memory_chunks=selected_chunks,
+        )
+
+        if not evidence_text.strip():
+            return self._skipped_result(
+                reason="no_memory_evidence",
+                effective_retrieval_query_text=effective_retrieval_query_text,
+                episodic_candidates=episodic_candidates,
+                semantic_memory_chunks=semantic_memory_chunks,
+            )
+
+        payload = {
+            "effective_retrieval_query_text": str(effective_retrieval_query_text or "").strip(),
+            "active_retrieval_brief_title": str(active_retrieval_brief_title or "").strip(),
+            "active_retrieval_brief": str(active_retrieval_brief or "").strip(),
+            "memory_evidence": evidence_text,
+            "required_output": self._build_required_output_text(),
+        }
+
+        try:
+            result = self._run_agent_call(
+                call_name="Memory Merge Synthesizer",
+                input_payload=payload,
+            )
+
+            memory_context = str(result.get("memory_context", "") or "").strip()
+
+            diagnostics = {
+                "llm_skipped": False,
+                "reason": "synthesized",
+                "target_context_tokens": self.target_context_tokens,
+                "episodic_candidate_count": len(selected_episodes),
+                "semantic_memory_chunk_count": len(selected_chunks),
+                "memory_context_chars": len(memory_context),
+                "usage": result.get("_usage", {}),
+                "model_name": result.get("_model_name", ""),
+                "status": result.get("_status", ""),
+                "incomplete_reason": result.get("_incomplete_reason", ""),
+            }
+
+            logger_dev(
+                "MEMORY MERGE SYNTHESIZER RESULT\n"
+                + json.dumps(
+                    {
+                        "diagnostics": diagnostics,
+                        "memory_context": memory_context,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
+
+            return {
+                "memory_context": memory_context,
+                "memory_synthesis_diagnostics": diagnostics,
+                "memory_synthesis_llm_skipped": False,
+            }
+
+        except Exception as e:
+            diagnostics = {
+                "llm_skipped": True,
+                "reason": "synthesis_failed",
+                "error": str(e),
+                "target_context_tokens": self.target_context_tokens,
+                "episodic_candidate_count": len(selected_episodes),
+                "semantic_memory_chunk_count": len(selected_chunks),
+            }
+
+            logger_dev(
+                "MEMORY MERGE SYNTHESIZER FAILED\n"
+                + json.dumps(diagnostics, ensure_ascii=False, indent=2, default=str),
+                "ERROR",
+                "CONFIDENTIAL",
+            )
+
+            return {
+                "memory_context": "",
+                "memory_synthesis_diagnostics": diagnostics,
+                "memory_synthesis_llm_skipped": True,
+            }
+
+    def _run_agent_call(
+        self,
+        *,
+        call_name: str,
+        input_payload: JsonDict,
+    ) -> JsonDict:
+        agent_prompt = self.agent_factory.get_agent(
+            self.agent_id,
+            self.agent_version,
+        )
+
+        messages, response_format = agent_prompt.compose(input_payload=input_payload)
+
+        response = self.llm_client.responses(
+            messages=messages,
+            model_name=agent_prompt.model_name,
+            max_output_tokens=agent_prompt.max_output_tokens,
+            reasoning_effort="minimal",
+            return_metadata=True,
+            prompt_cache_key=self.prompt_cache_key,
+        )
+
+        raw_content = str(response.get("content", "") or "")
+        parsed = agent_prompt.parse(raw_content)
+
+        parsed["_usage"] = response.get("usage", {}) or {}
+        parsed["_model_name"] = response.get("model_name", "")
+        parsed["_status"] = response.get("status", "")
+        parsed["_incomplete_reason"] = response.get("incomplete_reason", "")
+
+        return parsed
+
+    def _build_memory_evidence_text(
+        self,
+        *,
+        episodic_candidates: list[dict[str, Any]],
+        semantic_memory_chunks: list[dict[str, Any]],
+    ) -> str:
+        lines: list[str] = []
+
+        if episodic_candidates:
+            lines.append("## Reduced Episodic Memory Episodes")
+            lines.append("")
+
+            for idx, candidate in enumerate(episodic_candidates, start=1):
+                record_id = str(candidate.get("record_id", "") or "").strip()
+                tag = str(candidate.get("tag", "") or "").strip()
+                source = str(candidate.get("episodic_source", "") or "").strip()
+                score = candidate.get("final_parent_score", candidate.get("score", ""))
+
+                question = str(
+                    candidate.get("compressed_input_text", candidate.get("input_text", "")) or ""
+                ).strip()
+                answer = str(
+                    candidate.get("compressed_output_text", candidate.get("output_text", "")) or ""
+                ).strip()
+
+                lines.append(f"### Episode {idx}")
+                lines.append(f"record_id: {record_id}")
+                if tag:
+                    lines.append(f"tag: {tag}")
+                if source:
+                    lines.append(f"source: {source}")
+                if score != "":
+                    lines.append(f"score: {score}")
+                lines.append("")
+
+                if question:
+                    lines.append("QUESTION:")
+                    lines.append(question)
+                    lines.append("")
+
+                if answer:
+                    lines.append("ANSWER:")
+                    lines.append(answer)
+                    lines.append("")
+
+        if semantic_memory_chunks:
+            lines.append("## Semantic Memory Chunks")
+            lines.append("")
+
+            for idx, chunk in enumerate(semantic_memory_chunks, start=1):
+                record_id = str(chunk.get("record_id", "") or "").strip()
+                vector_id = str(chunk.get("vector_id", chunk.get("id", "")) or "").strip()
+                role = str(chunk.get("role", "") or "").strip()
+                score = chunk.get("score", "")
+                text = str(chunk.get("document", chunk.get("text", "")) or "").strip()
+
+                lines.append(f"### Semantic Chunk {idx}")
+                if vector_id:
+                    lines.append(f"vector_id: {vector_id}")
+                if record_id:
+                    lines.append(f"record_id: {record_id}")
+                if role:
+                    lines.append(f"role: {role}")
+                if score != "":
+                    lines.append(f"score: {score}")
+                lines.append("")
+
+                if text:
+                    lines.append("TEXT:")
+                    lines.append(text)
+                    lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def _build_required_output_text(self) -> str:
+        return (
+            "{\n"
+            '  "memory_context": "query-relevant synthesized Memory Context"\n'
+            "}\n\n"
+            f"Keep memory_context at or below about {self.target_context_tokens} tokens."
+        )
+
+    def _skipped_result(
+        self,
+        *,
+        reason: str,
+        effective_retrieval_query_text: str,
+        episodic_candidates: list[dict[str, Any]],
+        semantic_memory_chunks: list[dict[str, Any]],
+    ) -> JsonDict:
+        diagnostics = {
+            "llm_skipped": True,
+            "reason": reason,
+            "target_context_tokens": self.target_context_tokens,
+            "effective_retrieval_query_chars": len(str(effective_retrieval_query_text or "")),
+            "episodic_candidate_count": len(episodic_candidates or []),
+            "semantic_memory_chunk_count": len(semantic_memory_chunks or []),
+        }
+
+        logger_dev(
+            "MEMORY MERGE SYNTHESIZER SKIPPED\n"
+            + json.dumps(diagnostics, ensure_ascii=False, indent=2, default=str),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return {
+            "memory_context": "",
+            "memory_synthesis_diagnostics": diagnostics,
+            "memory_synthesis_llm_skipped": True,
+        }
+
+    @staticmethod
+    def _load_runtime_config() -> JsonDict:
+        root = Path(__file__).resolve().parents[2]
+        path = root / "config" / "runtime_config.json"
+
+        if not path.exists():
+            return {}
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+```
+
 ### ~\ragstream\memory\memory_record.py
 ```python
 # ragstream/memory/memory_record.py
@@ -10176,6 +10755,7 @@ class MemoryRecord:
         embedded_files_snapshot: list[str] | None = None,
         retrieval_source_mode: str = "QA",
         direct_recall_key: str = "",
+        active_retrieval_brief_title: str = "",
         active_retrieval_brief: str = "",
         active_retrieval_brief_contributor_ids: list[str] | None = None,
         *,
@@ -10201,6 +10781,7 @@ class MemoryRecord:
         self.active_project_name: str | None = active_project_name
         self.embedded_files_snapshot: list[str] = list(embedded_files_snapshot or [])
 
+        self.active_retrieval_brief_title: str = str(active_retrieval_brief_title or "").strip()
         self.active_retrieval_brief: str = str(active_retrieval_brief or "").strip()
         self.active_retrieval_brief_contributor_ids: list[str] = _clean_list(
             active_retrieval_brief_contributor_ids
@@ -10262,7 +10843,9 @@ class MemoryRecord:
         self,
         active_retrieval_brief: str,
         contributor_ids: list[str] | None = None,
+        active_retrieval_brief_title: str = "",
     ) -> None:
+        self.active_retrieval_brief_title = str(active_retrieval_brief_title or "").strip()
         self.active_retrieval_brief = str(active_retrieval_brief or "").strip()
         self.active_retrieval_brief_contributor_ids = _clean_list(contributor_ids)
 
@@ -10282,6 +10865,7 @@ class MemoryRecord:
         - source
         - input_hash
         - output_hash
+        - active_retrieval_brief_title
         - active_retrieval_brief
         - active_retrieval_brief_contributor_ids
         """
@@ -10319,6 +10903,7 @@ class MemoryRecord:
             "source": self.source,
             "input_hash": self.input_hash,
             "output_hash": self.output_hash,
+            "active_retrieval_brief_title": self.active_retrieval_brief_title,
             "active_retrieval_brief": self.active_retrieval_brief,
             "active_retrieval_brief_contributor_ids": self.active_retrieval_brief_contributor_ids,
         }
@@ -10397,6 +10982,7 @@ class MemoryRecord:
             embedded_files_snapshot=list(data.get("embedded_files_snapshot") or []),
             retrieval_source_mode=str(data.get("retrieval_source_mode", "QA")),
             direct_recall_key=str(data.get("direct_recall_key", "")),
+            active_retrieval_brief_title=str(data.get("active_retrieval_brief_title", "") or ""),
             active_retrieval_brief=str(data.get("active_retrieval_brief", "") or ""),
             active_retrieval_brief_contributor_ids=list(
                 data.get("active_retrieval_brief_contributor_ids") or []
@@ -10461,8 +11047,13 @@ from ragstream.memory.compression.memory_activebrief_relevance_gate import (
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.agent_prompt import AgentPrompt
 from ragstream.orchestration.llm_client import LLMClient
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 JsonDict = dict[str, Any]
 
@@ -10612,6 +11203,7 @@ class MemoryActiveRetrievalBriefBuilder:
             call_name="Memory ActiveBrief Init",
         )
         contributor_ids = [record.record_id]
+        active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
         active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
         logger_dev(
@@ -10620,6 +11212,7 @@ class MemoryActiveRetrievalBriefBuilder:
                 {
                     "record_id": record.record_id,
                     "route": "init_no_previous_activebrief",
+                    "active_retrieval_brief_title": active_brief_title,
                     "active_retrieval_brief": active_brief,
                     "active_retrieval_brief_contributor_ids": contributor_ids,
                     "pending_topic_buffer_after": {},
@@ -10633,6 +11226,7 @@ class MemoryActiveRetrievalBriefBuilder:
         )
 
         return {
+            "active_retrieval_brief_title": active_brief_title,
             "active_retrieval_brief": active_brief,
             "active_retrieval_brief_contributor_ids": contributor_ids,
             "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -10649,6 +11243,7 @@ class MemoryActiveRetrievalBriefBuilder:
         previous_brief_info: JsonDict,
         pending_topic_buffer: dict[str, Any],
     ) -> JsonDict:
+        previous_brief_title = str(previous_brief_info.get("previous_active_retrieval_brief_title", "") or "").strip()
         previous_brief = str(previous_brief_info["previous_active_retrieval_brief"])
         previous_contributor_ids = list(previous_brief_info.get("contributor_ids") or [])
 
@@ -10660,9 +11255,11 @@ class MemoryActiveRetrievalBriefBuilder:
                 call_name="Memory ActiveBrief Update",
             )
             contributor_ids = self._merge_contributor_ids(previous_contributor_ids, [record.record_id])
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
             return {
+                "active_retrieval_brief_title": active_brief_title,
                 "active_retrieval_brief": active_brief,
                 "active_retrieval_brief_contributor_ids": contributor_ids,
                 "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -10687,6 +11284,7 @@ class MemoryActiveRetrievalBriefBuilder:
                 call_name="Memory ActiveBrief Update",
             )
             contributor_ids = self._merge_contributor_ids(previous_contributor_ids, [record.record_id])
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
             logger_dev(
@@ -10696,6 +11294,7 @@ class MemoryActiveRetrievalBriefBuilder:
                         "record_id": record.record_id,
                         "route": gate_result.route,
                         "reason": gate_result.reason,
+                        "active_retrieval_brief_title": active_brief_title,
                         "active_retrieval_brief_contributor_ids": contributor_ids,
                         "pending_topic_buffer_after": {},
                         "gate_diagnostics": gate_result.diagnostics,
@@ -10709,6 +11308,7 @@ class MemoryActiveRetrievalBriefBuilder:
             )
 
             return {
+                "active_retrieval_brief_title": active_brief_title,
                 "active_retrieval_brief": active_brief,
                 "active_retrieval_brief_contributor_ids": contributor_ids,
                 "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -10736,6 +11336,7 @@ class MemoryActiveRetrievalBriefBuilder:
                 previous_contributor_ids,
                 [pending_record_id, record.record_id],
             )
+            active_brief_title = str(result.get("active_retrieval_brief_title", "") or "").strip()
             active_brief = str(result.get("active_retrieval_brief", "") or "").strip()
 
             logger_dev(
@@ -10746,6 +11347,7 @@ class MemoryActiveRetrievalBriefBuilder:
                         "pending_record_id": pending_record_id,
                         "route": gate_result.route,
                         "reason": gate_result.reason,
+                        "active_retrieval_brief_title": active_brief_title,
                         "active_retrieval_brief": active_brief,
                         "active_retrieval_brief_contributor_ids": contributor_ids,
                         "pending_topic_buffer_after": {},
@@ -10760,6 +11362,7 @@ class MemoryActiveRetrievalBriefBuilder:
             )
 
             return {
+                "active_retrieval_brief_title": active_brief_title,
                 "active_retrieval_brief": active_brief,
                 "active_retrieval_brief_contributor_ids": contributor_ids,
                 "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -10786,6 +11389,7 @@ class MemoryActiveRetrievalBriefBuilder:
                     "route": gate_result.route,
                     "reason": gate_result.reason,
                     "copied_previous_brief_record_id": previous_brief_info.get("record_id", ""),
+                    "active_retrieval_brief_title": previous_brief_title,
                     "active_retrieval_brief": previous_brief,
                     "active_retrieval_brief_contributor_ids": previous_contributor_ids,
                     "pending_topic_buffer_after": self._pending_buffer_log_view(new_pending_buffer),
@@ -10800,6 +11404,7 @@ class MemoryActiveRetrievalBriefBuilder:
         )
 
         return {
+            "active_retrieval_brief_title": previous_brief_title,
             "active_retrieval_brief": previous_brief,
             "active_retrieval_brief_contributor_ids": previous_contributor_ids,
             "reduced_qa_diagnostics": reduced_qa.diagnostics,
@@ -11012,6 +11617,8 @@ class MemoryActiveRetrievalBriefBuilder:
             if not brief:
                 continue
 
+            brief_title = str(getattr(record, "active_retrieval_brief_title", "") or "").strip()
+
             contributor_ids = list(
                 getattr(record, "active_retrieval_brief_contributor_ids", []) or []
             )
@@ -11021,12 +11628,14 @@ class MemoryActiveRetrievalBriefBuilder:
 
             return {
                 "record_id": record.record_id,
+                "previous_active_retrieval_brief_title": brief_title,
                 "previous_active_retrieval_brief": brief,
                 "contributor_ids": contributor_ids or [record.record_id],
             }
 
         return {
             "record_id": "",
+            "previous_active_retrieval_brief_title": "",
             "previous_active_retrieval_brief": "",
             "contributor_ids": [],
         }
@@ -11053,8 +11662,10 @@ class MemoryActiveRetrievalBriefBuilder:
     def _build_required_output_text(self) -> str:
         return (
             "{\n"
+            '  "active_retrieval_brief_title": "operational backend title following the JSON Title Rules",\n'
             '  "active_retrieval_brief": "one compact query-independent Current Working Conversation brief"\n'
             "}\n\n"
+            "Follow the JSON Title Rules for active_retrieval_brief_title.\n"
             f"Keep active_retrieval_brief at or below about {self.target_brief_tokens} tokens."
         )
 
@@ -11152,8 +11763,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from ragstream.ingestion.embedder import Embedder
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 Vector = list[float]
 
@@ -11650,6 +12266,338 @@ class MemoryActiveBriefRelevanceGate:
         return result
 ```
 
+### ~\ragstream\memory\compression\memory_compressor.py
+```python
+# ragstream/memory/compression/memory_compressor.py
+# -*- coding: utf-8 -*-
+"""
+MemoryCompressor
+================
+
+Runtime-only memory compression helper.
+
+Current Part-I responsibility:
+- receive effective_retrieval_query_text
+- reduce it to the configured query token budget
+- embed the reduced query once
+- use that query vector as anchor
+- reduce selected episodic Q/A candidates with MemorySentenceReducer
+
+Important:
+- This does not modify MemoryRecord truth.
+- This does not write .ragmem, .ragmeta.json, SQLite, or vectors.
+- Compression output is query-dependent runtime data only.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+
+from typing import Any
+
+from ragstream.ingestion.embedder import Embedder
+from ragstream.memory.compression.memory_sentence_reducer import MemorySentenceReducer
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
+Vector = list[float]
+
+
+class MemoryCompressor:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+    ) -> None:
+        runtime_config = dict(config or {})
+
+        if "memory_compression" in runtime_config:
+            cfg = dict(runtime_config.get("memory_compression", {}) or {})
+        else:
+            cfg = dict(runtime_config or {})
+
+        self.config = cfg
+        self.enabled = bool(cfg.get("enabled", True))
+
+        query_cfg = dict(cfg.get("effective_query", {}) or {})
+        episodic_cfg = dict(cfg.get("episodic_memory", {}) or {})
+
+        self.query_max_tokens = int(query_cfg.get("max_tokens", 300))
+        self.embedding_model = str(query_cfg.get("embedding_model", "text-embedding-3-small"))
+
+        self.episodic_enabled = bool(episodic_cfg.get("enabled", True))
+        self.episodic_max_tokens_total = int(episodic_cfg.get("max_tokens_total", 400))
+        self.episodic_question_max_tokens = int(episodic_cfg.get("question_max_tokens", 150))
+
+        self.window_size_sentences = int(episodic_cfg.get("window_size_sentences", 3))
+        self.window_overlap_sentences = int(episodic_cfg.get("window_overlap_sentences", 1))
+        self.redundancy_threshold = float(episodic_cfg.get("redundancy_threshold", 0.92))
+
+        self._embedder = Embedder(model=self.embedding_model)
+
+        self._episode_reducer = MemorySentenceReducer(
+            max_tokens_total=self.episodic_max_tokens_total,
+            question_max_tokens=self.episodic_question_max_tokens,
+            window_size_sentences=self.window_size_sentences,
+            window_overlap_sentences=self.window_overlap_sentences,
+            redundancy_threshold=self.redundancy_threshold,
+            embedding_model=self.embedding_model,
+        )
+
+    def is_enabled(self) -> bool:
+        return bool(self.enabled)
+
+    def compress_episodic_candidates(
+        self,
+        episodic_candidates: list[dict[str, Any]],
+        effective_query_text: str,
+    ) -> list[dict[str, Any]]:
+        """
+        Reduce episodic Q/A candidates against one query anchor vector.
+
+        The returned candidates keep all original candidate keys and add
+        compressed runtime-only fields.
+        """
+        candidates = list(episodic_candidates or [])
+
+        if not self.enabled or not self.episodic_enabled:
+            logger_dev(
+                "MEMORY COMPRESSION SKIPPED\n"
+                + str(
+                    {
+                        "reason": "disabled",
+                        "enabled": self.enabled,
+                        "episodic_enabled": self.episodic_enabled,
+                        "candidate_count": len(candidates),
+                    }
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
+            return candidates
+
+        query_info = self.build_query_anchor(effective_query_text)
+        query_anchor_vector = list(query_info.get("query_anchor_vector", []) or [])
+
+        if not query_anchor_vector:
+            logger_dev(
+                "MEMORY COMPRESSION SKIPPED\n"
+                + str(
+                    {
+                        "reason": "empty_query_anchor_vector",
+                        "candidate_count": len(candidates),
+                        "query_diagnostics": query_info.get("diagnostics", {}),
+                        "reduced_query_text": query_info.get("reduced_query_text", ""),
+                    }
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
+            return candidates
+
+        compressed: list[dict[str, Any]] = []
+
+        for candidate in candidates:
+            compressed.append(
+                self.compress_episodic_candidate(
+                    candidate=candidate,
+                    query_anchor_vector=query_anchor_vector,
+                    query_diagnostics=query_info.get("diagnostics", {}),
+                )
+            )
+
+        logger_dev(
+            "MEMORY COMPRESSION RESULT\n"
+            + str(
+                {
+                    "candidate_count_before": len(candidates),
+                    "candidate_count_after": len(compressed),
+                    "query_original_tokens_estimated": self._count_tokens(effective_query_text),
+                    "query_reduced_tokens_estimated": self._count_tokens(
+                        str(query_info.get("reduced_query_text", "") or "")
+                    ),
+                    "reduced_query_text": str(query_info.get("reduced_query_text", "") or ""),
+                    "episodes": [
+                        {
+                            "record_id": str(item.get("record_id", "") or ""),
+                            "memory_compression_mode": str(item.get("memory_compression_mode", "") or ""),
+                            "input_tokens_before": self._count_tokens(str(item.get("input_text", "") or "")),
+                            "output_tokens_before": self._count_tokens(str(item.get("output_text", "") or "")),
+                            "compressed_input_tokens": self._count_tokens(str(item.get("compressed_input_text", "") or "")),
+                            "compressed_output_tokens": self._count_tokens(str(item.get("compressed_output_text", "") or "")),
+                            "compressed_input_text": str(item.get("compressed_input_text", "") or ""),
+                            "compressed_output_text": str(item.get("compressed_output_text", "") or ""),
+                        }
+                        for item in compressed
+                    ],
+                }
+            ),
+            "DEBUG",
+            "CONFIDENTIAL",
+        )
+
+        return compressed
+
+    def compress_episodic_candidate(
+        self,
+        *,
+        candidate: dict[str, Any],
+        query_anchor_vector: Vector,
+        query_diagnostics: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Reduce one episodic MemoryRecord candidate.
+
+        Original input_text/output_text stay unchanged in the candidate.
+        Reduced Q/A is added as runtime compression fields.
+        """
+        item = dict(candidate or {})
+
+        input_text = str(item.get("input_text", "") or "")
+        output_text = str(item.get("output_text", "") or "")
+
+        reduced = self._episode_reducer.reduce_with_anchor(
+            input_text=input_text,
+            output_text=output_text,
+            anchor_vector=query_anchor_vector,
+        )
+
+        item["compressed_input_text"] = reduced.reduced_question
+        item["compressed_output_text"] = reduced.reduced_answer
+        item["memory_compression_mode"] = "query_anchor_episode"
+        item["memory_compression_query_diagnostics"] = dict(query_diagnostics or {})
+        item["memory_compression_diagnostics"] = reduced.diagnostics
+
+        return item
+
+    def build_query_anchor(
+        self,
+        effective_query_text: str,
+    ) -> dict[str, Any]:
+        """
+        Reduce effective query to max query_max_tokens and embed it once.
+        """
+        original_query = str(effective_query_text or "").strip()
+        reduced_query = self.reduce_query_text(original_query)
+
+        if not reduced_query:
+            return {
+                "reduced_query_text": "",
+                "query_anchor_vector": [],
+                "diagnostics": {
+                    "reason": "empty_query",
+                    "query_max_tokens": self.query_max_tokens,
+                },
+            }
+
+        query_anchor_vector = self._embed_query(reduced_query)
+
+        return {
+            "reduced_query_text": reduced_query,
+            "query_anchor_vector": query_anchor_vector,
+            "diagnostics": {
+                "mode": "query_anchor",
+                "embedding_model": self.embedding_model,
+                "query_max_tokens": self.query_max_tokens,
+                "original_query_tokens_estimated": self._count_tokens(original_query),
+                "reduced_query_tokens_estimated": self._count_tokens(reduced_query),
+            },
+        }
+
+    def reduce_query_text(
+        self,
+        query_text: str,
+    ) -> str:
+        """
+        Reduce query text to query_max_tokens by preserving sentence order.
+
+        This is deterministic. It removes sentences beyond the budget.
+        It does not call an LLM.
+        """
+        clean = str(query_text or "").strip()
+        if not clean:
+            return ""
+
+        if self._count_tokens(clean) <= self.query_max_tokens:
+            return clean
+
+        sentences = self._split_sentences(clean)
+
+        if not sentences:
+            return clean[: max(1, self.query_max_tokens * 4)].strip()
+
+        selected: list[str] = []
+        used_tokens = 0
+
+        for sentence in sentences:
+            sentence = str(sentence or "").strip()
+            if not sentence:
+                continue
+
+            sentence_tokens = self._count_tokens(sentence)
+
+            if used_tokens + sentence_tokens > self.query_max_tokens:
+                continue
+
+            selected.append(sentence)
+            used_tokens += sentence_tokens
+
+        if selected:
+            return " ".join(selected).strip()
+
+        return sentences[0][: max(1, self.query_max_tokens * 4)].strip()
+
+    def _embed_query(
+        self,
+        query_text: str,
+    ) -> Vector:
+        vectors = self._embedder.embed([query_text])
+        vector = vectors[0]
+
+        if hasattr(vector, "tolist"):
+            vector = vector.tolist()
+
+        return [float(value) for value in vector]
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        clean = str(text or "").strip()
+        if not clean:
+            return []
+
+        clean = re.sub(r"\n{2,}", "\n", clean)
+        rough_parts = re.split(r"(?<=[.!?])\s+|\n+", clean)
+
+        sentences: list[str] = []
+        for part in rough_parts:
+            item = str(part or "").strip()
+            if item:
+                sentences.append(item)
+
+        if not sentences and clean:
+            sentences.append(clean)
+
+        return sentences
+
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        clean = str(text or "")
+        if not clean:
+            return 0
+
+        try:
+            import tiktoken  # type: ignore
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(clean))
+        except Exception:
+            return max(1, math.ceil(len(clean) / 4))
+```
+
 ### ~\ragstream\memory\compression\memory_sentence_reducer.py
 ```python
 # ragstream/memory/compression/memory_sentence_reducer.py
@@ -11689,8 +12637,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from ragstream.ingestion.embedder import Embedder
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 Vector = list[float]
 
@@ -13137,7 +14090,7 @@ class MemoryVectorStore:
 
 ### ~\ragstream\memory\retrieval\memory_context_pack.py
 ```python
-# ragstream/memory/memory_context_pack.py
+# ragstream/memory/retrieval/memory_context_pack.py
 # -*- coding: utf-8 -*-
 """
 MemoryContextPack
@@ -13148,9 +14101,9 @@ This object is NOT durable memory truth.
 It is only the run-local candidate package written into SuperPrompt after
 the Retrieval button has run.
 
-It keeps raw memory candidates visible before later stages perform:
-- A3 / A4 semantic filtering and condensation
-- MemoryMerge
+It keeps raw memory candidates available for later stages:
+- Memory compression
+- Memory synthesis / MemoryMerge
 - final PromptBuilder rendering
 """
 
@@ -13176,11 +14129,17 @@ class MemoryContextPack:
         # Parent MemoryRecord candidates selected from semantic scoring and Gold lookup.
         self.episodic_candidates: list[dict[str, Any]] = []
 
-        # Raw question/answer vector-hit chunks selected for later A3/A4 mixing.
+        # Raw question/answer vector-hit chunks selected for later synthesis.
         self.semantic_memory_chunks: list[dict[str, Any]] = []
 
         # One Direct Recall candidate, usually selected by exact key lookup.
         self.direct_recall_candidate: dict[str, Any] | None = None
+
+        # Final synthesized query-relevant Memory Context.
+        self.synthesized_memory_context: str = ""
+
+        # Diagnostics from MemoryMerge synthesis.
+        self.memory_synthesis_diagnostics: dict[str, Any] = {}
 
         # Human/developer-readable explanation of selections and exclusions.
         self.selection_diagnostics: dict[str, Any] = {}
@@ -13207,6 +14166,15 @@ class MemoryContextPack:
         """Set the Direct Recall candidate for this run."""
         self.direct_recall_candidate = candidate if candidate else None
 
+    def set_synthesized_memory_context(
+        self,
+        memory_context: str,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        """Store the final synthesized Memory Context for this run."""
+        self.synthesized_memory_context = str(memory_context or "").strip()
+        self.memory_synthesis_diagnostics = dict(diagnostics or {})
+
     def set_selection_diagnostics(self, diagnostics: dict[str, Any]) -> None:
         """Store diagnostic information explaining the retrieval result."""
         self.selection_diagnostics = diagnostics or {}
@@ -13222,6 +14190,8 @@ class MemoryContextPack:
             "episodic_candidates": self.episodic_candidates,
             "semantic_memory_chunks": self.semantic_memory_chunks,
             "direct_recall_candidate": self.direct_recall_candidate,
+            "synthesized_memory_context": self.synthesized_memory_context,
+            "memory_synthesis_diagnostics": self.memory_synthesis_diagnostics,
             "selection_diagnostics": self.selection_diagnostics,
             "token_budget_report": self.token_budget_report,
             "counts": self.counts(),
@@ -13234,23 +14204,25 @@ class MemoryContextPack:
             "episodic_candidates": len(self.episodic_candidates),
             "semantic_memory_chunks": len(self.semantic_memory_chunks),
             "direct_recall_candidate": 1 if self.direct_recall_candidate else 0,
+            "synthesized_memory_context": 1 if self.synthesized_memory_context else 0,
         }
 
     def to_debug_markdown(self) -> str:
         """
-        Render raw memory candidates for GUI inspection.
+        Render raw memory candidates for developer inspection.
 
         This is intentionally not final prompt context.
-        It is a development/audit view after Retrieval.
+        The GUI projector no longer shows this raw memory block by default.
         """
         lines: list[str] = []
 
         lines.append("### Raw Memory Retrieval Candidates")
         lines.append("")
         lines.append("These are raw memory candidates produced by the Retrieval stage.")
-        lines.append("They are not compressed memory and not final prompt context.")
+        lines.append("They are not final prompt context.")
         lines.append("")
 
+        self._append_synthesized_memory_context(lines)
         self._append_working_memory(lines)
         self._append_episodic_memory(lines)
         self._append_semantic_chunks(lines)
@@ -13258,6 +14230,18 @@ class MemoryContextPack:
         self._append_diagnostics(lines)
 
         return "\n".join(lines).strip()
+
+    def _append_synthesized_memory_context(self, lines: list[str]) -> None:
+        lines.append("#### Synthesized Memory Context")
+        if not self.synthesized_memory_context:
+            lines.append("(none)")
+            lines.append("")
+            return
+
+        lines.append("```text")
+        lines.append(self.synthesized_memory_context)
+        lines.append("```")
+        lines.append("")
 
     def _append_working_memory(self, lines: list[str]) -> None:
         lines.append("#### Working Memory Candidates")
@@ -13339,20 +14323,25 @@ class MemoryContextPack:
 
     def _append_diagnostics(self, lines: list[str]) -> None:
         lines.append("#### Selection Diagnostics")
-        if not self.selection_diagnostics:
+        if not self.selection_diagnostics and not self.memory_synthesis_diagnostics:
             lines.append("(none)")
             lines.append("")
             return
 
+        diagnostics = {
+            "selection_diagnostics": self.selection_diagnostics,
+            "memory_synthesis_diagnostics": self.memory_synthesis_diagnostics,
+        }
+
         lines.append("```json")
-        lines.append(json.dumps(self.selection_diagnostics, ensure_ascii=False, indent=2, default=str))
+        lines.append(json.dumps(diagnostics, ensure_ascii=False, indent=2, default=str))
         lines.append("```")
         lines.append("")
 
     @staticmethod
     def _format_qa(candidate: dict[str, Any]) -> str:
-        input_text = str(candidate.get("input_text", "") or "").strip()
-        output_text = str(candidate.get("output_text", "") or "").strip()
+        input_text = str(candidate.get("compressed_input_text", candidate.get("input_text", "")) or "").strip()
+        output_text = str(candidate.get("compressed_output_text", candidate.get("output_text", "")) or "").strip()
 
         lines: list[str] = []
 
@@ -13399,8 +14388,13 @@ from typing import Any
 
 from ragstream.memory.memory_record import RECORD_END, RECORD_START
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 class MemoryIndexLookup:
     """
@@ -13839,8 +14833,13 @@ import math
 from typing import Any
 
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 class MemoryScorer:
     """
@@ -14374,8 +15373,13 @@ from typing import Any
 
 from ragstream.memory.memory_manager import MemoryManager
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

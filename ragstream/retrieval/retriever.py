@@ -399,10 +399,10 @@ class Retriever:
         return valid_ranked_rows, hydrated
 
     def _write_stage_to_superprompt(
-        self,
-        sp: SuperPrompt,
-        ranked_rows: List[RankedRow],
-        hydrated_chunks: List[Chunk],
+            self,
+            sp: SuperPrompt,
+            ranked_rows: List[RankedRow],
+            hydrated_chunks: List[Chunk],
     ) -> None:
         """
         Persist the Retrieval result into the evolving SuperPrompt.
@@ -412,11 +412,14 @@ class Retriever:
             the hydrated Chunk objects in retrieval order
         - views_by_stage["retrieval"]:
             ordered triples (chunk_id, retrieval_score, SELECTED)
-            where retrieval_score is now the final fused RRF score
+            where retrieval_score is the current retrieval score
+        - views_by_stage["reranked"]:
+            A3-ready passthrough view initialized from Retrieval.
+            If real ColBERT ReRanker runs later, it overwrites this view.
         - final_selection_ids:
             ordered chunk IDs from the current retrieval result
         - stage/history:
-            bookkeeping for the pipeline lifecycle
+            Retrieval remains the current lifecycle stage.
         """
         if len(ranked_rows) != len(hydrated_chunks):
             raise RuntimeError(
@@ -426,13 +429,33 @@ class Retriever:
         sp.base_context_chunks = list(hydrated_chunks)
 
         retrieval_view: List[tuple[str, float, A3ChunkStatus]] = []
+        a3_ready_view: List[tuple[str, float, A3ChunkStatus]] = []
         final_ids: List[str] = []
 
-        for chunk_id, score, _meta in ranked_rows:
-            retrieval_view.append((str(chunk_id), float(score), A3ChunkStatus.SELECTED))
-            final_ids.append(str(chunk_id))
+        for position, (chunk_id, score, _meta) in enumerate(ranked_rows, start=1):
+            chunk_id_str = str(chunk_id)
+            score_float = float(score)
+
+            retrieval_view.append((chunk_id_str, score_float, A3ChunkStatus.SELECTED))
+            a3_ready_view.append((chunk_id_str, score_float, A3ChunkStatus.SELECTED))
+            final_ids.append(chunk_id_str)
 
         sp.views_by_stage["retrieval"] = retrieval_view
+
+        # Important:
+        # Retrieval initializes an A3-ready candidate view immediately.
+        # This is not real ColBERT reranking.
+        # It is a deterministic passthrough so A3 can run directly after Retrieval.
+        # If ColBERT is enabled later, Reranker.run(...) overwrites this key.
+        sp.views_by_stage["reranked"] = a3_ready_view
+
         sp.final_selection_ids = final_ids
         sp.stage = "retrieval"
         sp.history_of_stages.append("retrieval")
+
+        if not hasattr(sp, "extras") or sp.extras is None:
+            sp.extras = {}
+
+        sp.extras["a3_ready_source"] = "retrieval_passthrough"
+        sp.extras["a3_ready_candidate_count"] = len(a3_ready_view)
+        sp.extras["reranked_is_passthrough"] = True

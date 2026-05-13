@@ -4,18 +4,37 @@
 A3 NLI Gate agent.
 
 Job:
-- Read the current SuperPrompt after ReRanker.
+- Read the current SuperPrompt after ReRanker, or after Retrieval passthrough.
 - Build one combined user prompt block for evaluation.
 - Build one evidence chunk block with local ids 1..N.
 - Ask AgentFactory for the A3 AgentPrompt configuration.
 - Use AgentPrompt.compose(...) to build SYSTEM + USER messages.
 - Call LLMClient with those messages, using ONLY model settings coming from JSON.
 - Expect a JSON object with:
-    - selection_band
     - item_decisions[] containing chunk_id / usefulness_label
 - Update the same SuperPrompt in place.
-- Preserve reranker order in views_by_stage["a3"].
+- Preserve candidate order in views_by_stage["a3"].
 - Rebuild sp.prompt_ready and mark stage='a3'.
+
+A3 scope:
+- A3 is a usefulness classifier over already retrieved/reranked chunks.
+- A3 is not a prompt-validity gate.
+- A3 is not a garbage detector.
+- A3 is not a retrieval-stage replacement.
+- A3 is not a memory-merge component.
+
+A3 selection rule:
+- The LLM classifies every candidate chunk as useful, borderline, or discarded.
+- Python keeps useful chunks only.
+- Python enforces only a maximum useful count.
+- Python does not force a minimum number of useful chunks.
+- Borderline chunks are not promoted automatically.
+- If no chunk is useful, A4 empty-selection safety handles the next step.
+
+Logging policy:
+- PUBLIC: compact stage summary visible in GUI and CLI.
+- INTERNAL: compact per-chunk decisions visible in CLI/internal logs, not GUI.
+- Full LLM input/output logging is disabled in normal mode.
 """
 
 from __future__ import annotations
@@ -23,14 +42,21 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Union
 import json
 import re
+import time
 
 from ragstream.orchestration.super_prompt import SuperPrompt, A3ChunkStatus
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
-from ragstream.utils.logging import SimpleLogger
+from ragstream.textforge.RagLog import LogALL as logger
+from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
 
 JsonDict = Dict[str, Any]
+
+# Keep full prompt / raw model I/O logging off in normal mode.
+# Important: full debug payloads are built only inside an explicit if-block,
+# so normal mode does not pay the JSON-dump cost.
+A3_FULL_LLM_LOG_ENABLED = False
 
 
 class A3NLIGate:
@@ -53,14 +79,19 @@ class A3NLIGate:
         llm_client: LLMClient,
         *,
         max_candidates: int = 30,
-        useful_hard_min: int = 4,
-        useful_hard_max: int = 24,
+        useful_hard_min: int = 0,
+        useful_hard_max: int = 12,
     ) -> None:
         self._factory = agent_factory
         self._llm_client = llm_client
         self._max_candidates = int(max_candidates)
-        self._useful_hard_min = int(useful_hard_min)
-        self._useful_hard_max = int(useful_hard_max)
+
+        # Kept only for backward-compatible constructor calls.
+        # A3 no longer forces a minimum number of useful chunks.
+        self._useful_hard_min = 0
+
+        # A3 now enforces only the maximum useful count.
+        self._useful_hard_max = int(useful_hard_max) if int(useful_hard_max) > 0 else 12
 
     def run(
         self,
@@ -72,13 +103,39 @@ class A3NLIGate:
         """
         Main entry point for A3.
         """
+        t0 = time.perf_counter()
+
+        candidate_source = "reranked"
         reranked_rows = list(sp.views_by_stage.get("reranked", []))[: self._max_candidates]
+
         if not reranked_rows:
-            raise RuntimeError("A3NLIGate: no reranked candidates available. Run ReRanker first.")
+            candidate_source = "retrieval"
+            reranked_rows = list(sp.views_by_stage.get("retrieval", []))[: self._max_candidates]
+
+        if not reranked_rows:
+            logger(
+                "A3 skipped: no candidate chunks available. Run Retrieval first.",
+                "WARN",
+                "PUBLIC",
+            )
+            raise RuntimeError("A3NLIGate: no candidate chunks available. Run Retrieval first.")
+
+        candidate_count = len(reranked_rows)
+
+        logger(
+            f"A3 started: candidates={candidate_count}, source={candidate_source}.",
+            "INFO",
+            "PUBLIC",
+        )
 
         evidence_chunks_text, local_to_real = self._build_evidence_chunks_text(sp, reranked_rows)
         if not evidence_chunks_text:
-            raise RuntimeError("A3NLIGate: could not build evidence chunk text from reranked rows.")
+            logger(
+                "A3 failed: could not build evidence chunk text.",
+                "ERROR",
+                "PUBLIC",
+            )
+            raise RuntimeError("A3NLIGate: could not build evidence chunk text from candidate rows.")
 
         user_prompt_text = self._build_user_prompt_under_evaluation(sp)
         required_output_text = self._build_required_output_text(len(local_to_real))
@@ -91,13 +148,38 @@ class A3NLIGate:
 
         agent = self._factory.get_agent(agent_id=agent_id, version=version)
 
+        logger(
+            (
+                "A3 LLM call prepared: "
+                f"model={agent.model_name}, "
+                f"candidate_count={candidate_count}, "
+                f"source={candidate_source}"
+            ),
+            "INFO",
+            "INTERNAL",
+        )
+
         messages, response_format = agent.compose(input_payload=inputs)
 
-        SimpleLogger.info("A3NLIGate → LLM messages:")
-        try:
-            SimpleLogger.info(json.dumps(messages, ensure_ascii=False, indent=2))
-        except Exception:
-            SimpleLogger.info(repr(messages))
+        if A3_FULL_LLM_LOG_ENABLED:
+            logger_dev(
+                "A3 FULL LLM INPUT\n"
+                + json.dumps(
+                    {
+                        "agent_id": agent_id,
+                        "version": version,
+                        "model_name": agent.model_name,
+                        "candidate_count": candidate_count,
+                        "messages": messages,
+                        "response_format": response_format,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
 
         raw_result: Union[str, JsonDict] = self._llm_client.chat(
             messages=messages,
@@ -105,24 +187,32 @@ class A3NLIGate:
             temperature=agent.temperature,
             max_output_tokens=agent.max_output_tokens,
             response_format=response_format,
-            prompt_cache_key=f"{agent_id}_{version}",  # Added: stable cache key for repeated A3 prompts of the same agent/version.
-          #  prompt_cache_retention="in_memory",  # Added: explicit short-lived cache retention for repeated near-term A3 calls.
+            prompt_cache_key=f"{agent_id}_{version}",
         )
 
-        SimpleLogger.info("A3NLIGate ← LLM raw result:")
-        try:
+        if A3_FULL_LLM_LOG_ENABLED:
             if isinstance(raw_result, dict):
-                SimpleLogger.info(json.dumps(raw_result, ensure_ascii=False, indent=2))
+                raw_result_text = json.dumps(raw_result, ensure_ascii=False, indent=2, default=str)
             else:
-                SimpleLogger.info(str(raw_result))
-        except Exception:
-            SimpleLogger.info(repr(raw_result))
+                raw_result_text = str(raw_result)
 
-        parsed_result = agent.parse(raw_result)
+            logger_dev(
+                "A3 FULL LLM RAW RESULT\n" + raw_result_text,
+                "DEBUG",
+                "CONFIDENTIAL",
+            )
 
-        selection_band = str(parsed_result.get("selection_band", "") or "").strip().lower()
-        if not selection_band:
-            selection_band = "unknown"
+        try:
+            parsed_result = agent.parse(raw_result)
+            parse_ok = True
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            logger(
+                f"A3 parse failed: latency_ms={elapsed_ms}, error={exc}",
+                "ERROR",
+                "PUBLIC",
+            )
+            raise
 
         item_root = agent.output_schema.get("root_key", "item_decisions")
         parsed_items = parsed_result.get(item_root, []) or []
@@ -142,7 +232,9 @@ class A3NLIGate:
                 if not real_chunk_id:
                     continue
 
-                usefulness_label = str(item.get("usefulness_label", "") or "").strip() or "borderline"
+                usefulness_label = str(item.get("usefulness_label", "") or "").strip().lower()
+                if usefulness_label not in {"useful", "borderline", "discarded"}:
+                    usefulness_label = "borderline"
 
                 decisions_by_real_id[real_chunk_id] = {
                     "chunk_id": real_chunk_id,
@@ -155,6 +247,9 @@ class A3NLIGate:
 
         useful_ids: List[str] = []
         borderline_ids: List[str] = []
+        discarded_ids: List[str] = []
+
+        decision_log_lines: List[str] = []
 
         for rank_index, row in enumerate(reranked_rows, start=1):
             real_chunk_id = str(row[0])
@@ -164,11 +259,15 @@ class A3NLIGate:
                 stage_score = 0.0
 
             decision = decisions_by_real_id.get(real_chunk_id, {})
-            usefulness_label = str(decision.get("usefulness_label", "") or "").strip() or "borderline"
+            usefulness_label = str(decision.get("usefulness_label", "") or "").strip().lower()
+            if usefulness_label not in {"useful", "borderline", "discarded"}:
+                usefulness_label = "borderline"
+
             local_chunk_id = str(decision.get("local_chunk_id", "") or rank_index)
 
             if usefulness_label == "discarded":
                 stage_status = A3ChunkStatus.DISCARDED
+                discarded_ids.append(real_chunk_id)
             else:
                 stage_status = A3ChunkStatus.SELECTED
 
@@ -186,24 +285,68 @@ class A3NLIGate:
             elif usefulness_label == "borderline":
                 borderline_ids.append(real_chunk_id)
 
-        # Deterministic post-check:
-        # - default working set = useful_only
-        # - hard ceiling = 24
-        # - fallback: if fewer than 4, promote best borderlines by reranker order
-        selected_ids: List[str] = useful_ids[: self._useful_hard_max]
+            decision_log_lines.append(
+                (
+                    f"rank={rank_index} | "
+                    f"local_chunk_id={local_chunk_id} | "
+                    f"label={usefulness_label} | "
+                    f"score={stage_score:.8f} | "
+                    f"chunk_id={real_chunk_id}"
+                )
+            )
 
-        if len(selected_ids) < self._useful_hard_min:
-            for real_chunk_id in borderline_ids:
-                if real_chunk_id not in selected_ids:
-                    selected_ids.append(real_chunk_id)
-                if len(selected_ids) >= self._useful_hard_min:
-                    break
+        # Final A3 selection:
+        # - useful chunks only
+        # - maximum useful count only
+        # - no minimum useful count
+        # - no automatic borderline promotion
+        selected_ids: List[str] = useful_ids[: self._useful_hard_max]
 
         sp.views_by_stage["a3"] = ordered_stage_rows
         sp.final_selection_ids = selected_ids
-        sp.extras["a3_selection_band"] = selection_band
         sp.extras["a3_item_decisions"] = ordered_decision_map
         sp.extras["a3_selected_ids"] = selected_ids
+        sp.extras["a3_candidate_source"] = candidate_source
+        sp.extras["a3_candidate_count"] = candidate_count
+        sp.extras["a3_parse_ok"] = parse_ok
+        sp.extras["a3_max_useful"] = self._useful_hard_max
+        sp.extras["a3_min_useful_forced"] = 0
+
+        # Remove stale selection_band if this SuperPrompt object was reused
+        # after an older A3 implementation.
+        sp.extras.pop("a3_selection_band", None)
+
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+        logger(
+            (
+                "A3 finished: "
+                f"candidates={candidate_count}, "
+                f"useful={len(useful_ids)}, "
+                f"borderline={len(borderline_ids)}, "
+                f"discarded={len(discarded_ids)}, "
+                f"selected={len(selected_ids)}, "
+                f"max_useful={self._useful_hard_max}, "
+                f"model={agent.model_name}, "
+                f"latency_ms={elapsed_ms}"
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
+        if decision_log_lines:
+            logger(
+                "A3 chunk decisions:\n" + "\n".join(decision_log_lines),
+                "INFO",
+                "INTERNAL",
+            )
+
+        if selected_ids:
+            logger(
+                "A3 selected ids: " + ", ".join(str(item) for item in selected_ids),
+                "INFO",
+                "INTERNAL",
+            )
 
         sp.history_of_stages.append("a3")
         sp.stage = "a3"
@@ -287,7 +430,7 @@ class A3NLIGate:
 
     def _build_required_output_text(self, n_chunks: int) -> str:
         """
-        Build the exact A3-specific JSON shape text shown to the LLM.
+        Build the A3-specific JSON shape text shown to the LLM.
         Wrapped with one outer XML-like structure only.
         """
         lines: List[str] = []
@@ -295,7 +438,6 @@ class A3NLIGate:
         lines.append("Return exactly one JSON object in this shape:")
         lines.append("")
         lines.append("{")
-        lines.append('  "selection_band": "high | medium | low",')
         lines.append('  "item_decisions": [')
 
         for idx in range(1, n_chunks + 1):

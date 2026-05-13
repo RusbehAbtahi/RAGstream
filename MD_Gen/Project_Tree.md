@@ -61,6 +61,7 @@
 │   │   │   ├── __pycache__
 │   │   │   ├── memory_active_retrieval_brief.py
 │   │   │   ├── memory_activebrief_relevance_gate.py
+│   │   │   ├── memory_compressor.py
 │   │   │   └── memory_sentence_reducer.py
 │   │   ├── ingestion
 │   │   │   ├── __init__.py
@@ -70,6 +71,7 @@
 │   │   │   └── memory_vector_store.py
 │   │   ├── memory_actions.py
 │   │   ├── memory_manager.py
+│   │   ├── memory_merge_synthesizer.py
 │   │   ├── memory_record.py
 │   │   ├── retrieval
 │   │   │   ├── __init__.py
@@ -100,6 +102,7 @@
 │   │   └── superprompt_projector.py
 │   ├── preprocessing
 │   │   ├── __pycache__
+│   │   ├── activebrief_relation_classifier.py
 │   │   ├── name_matcher.py
 │   │   ├── preprocessing.py
 │   │   └── prompt_schema.py
@@ -160,21 +163,33 @@
     │   │   │   └── a4_1_001.json
     │   │   └── final_condenser
     │   │       └── a4_3_001.json
-    │   └── memory_activebrief_qa_summarizer
-    │       ├── memory_activebrief_qa_summarizer_init_001.json
-    │       └── memory_activebrief_qa_summarizer_update_001.json
+    │   ├── activebrief_relation_classifier
+    │   │   └── activebrief_relation_classifier_001.json
+    │   ├── memory_activebrief_qa_summarizer
+    │   │   ├── memory_activebrief_qa_summarizer_init_001.json
+    │   │   └── memory_activebrief_qa_summarizer_update_001.json
+    │   └── memory_synthesizer
+    │       └── memory_synthesizer_001.json
     ├── chroma_db
+    │   ├── EMb treshhold
+    │   │   ├── a436251d-1b0f-4f9b-91cd-dd13446fc2de
+    │   │   └── file_manifest.json
     │   ├── MOVIES
     │   │   ├── 5a90e8ef-39b2-44be-9e13-c87268f9e221
     │   │   └── file_manifest.json
-    │   └── TESt2
-    │       ├── c46756c6-1e4c-44a9-8685-e3023a9551d7
+    │   ├── TESt2
+    │   │   ├── c46756c6-1e4c-44a9-8685-e3023a9551d7
+    │   │   └── file_manifest.json
+    │   └── UINTTEST
+    │       ├── 39588d8d-2378-4c9f-9eec-6e6bb7fbea27
     │       └── file_manifest.json
     ├── doc_raw
+    │   ├── EMb treshhold
     │   ├── MOVIES
     │   │   └── Movie_Scarface.txt
-    │   └── TESt2
-    │       ├── Movie_Scarface.txt
+    │   ├── TESt2
+    │   │   ├── Movie_Scarface.txt
+    │   └── UINTTEST
     ├── logs
     │   ├── archive
     │   ├── backups
@@ -187,13 +202,24 @@
     │   │   ├── 2026-05-07-16-33-memory-record.ragmeta.json
     │   │   ├── 2026-05-07-17-01-memory-record.ragmeta.json
     │   │   ├── 2026-05-07-17-59-memory-record.ragmeta.json
-    │   │   └── 2026-05-07-18-24-memory-record.ragmeta.json
+    │   │   ├── 2026-05-07-18-24-memory-record.ragmeta.json
+    │   │   ├── 2026-05-08-16-27-memory-record.ragmeta.json
+    │   │   ├── 2026-05-08-16-48-memory-record.ragmeta.json
+    │   │   ├── 2026-05-08-16-55-memory-record.ragmeta.json
+    │   │   ├── 2026-05-08-17-05-memory-record.ragmeta.json
+    │   │   ├── 2026-05-08-18-39-memory-record.ragmeta.json
+    │   │   ├── 2026-05-08-18-52-memory-record.ragmeta.json
+    │   │   ├── 2026-05-08-23-13-memory-record.ragmeta.json
+    │   │   ├── 2026-05-13-12-02-memory-record.ragmeta.json
+    │   │   └── 2026-05-13-14-24-TEST.ragmeta.json
     │   └── vector_db
     │       ├── 1128b4bb-998c-47e7-81fc-244ccb598bf9
     ├── np_store
     │   └── project1
     ├── project1
     └── splade_db
+        ├── EMb treshhold
         ├── MOVIES
-        └── TESt2
+        ├── TESt2
+        └── UINTTEST
 ```
