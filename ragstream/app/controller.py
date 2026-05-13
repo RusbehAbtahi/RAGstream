@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from ragstream.orchestration.super_prompt import SuperPrompt
 from ragstream.preprocessing.prompt_schema import PromptSchema
 from ragstream.preprocessing.preprocessing import preprocess
+from ragstream.preprocessing.activebrief_relation_classifier import ActiveBriefRelationClassifier
 
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
@@ -80,6 +81,12 @@ class AppController:
             llm_client=self.llm_client,
         )
 
+        # ActiveBrief relation classifier.
+        self.activebrief_relation_classifier = ActiveBriefRelationClassifier(
+            agent_factory=self.agent_factory,
+            llm_client=self.llm_client,
+        )
+
         # A3 agent.
         self.a3_nli_gate = A3NLIGate(
             agent_factory=self.agent_factory,
@@ -127,6 +134,7 @@ class AppController:
         self.retriever = Retriever(
             doc_root=str(self.doc_root),
             chroma_root=str(self.chroma_root),
+            runtime_config=self.runtime_config,
         )
 
         self.reranker = Reranker()
@@ -173,7 +181,13 @@ class AppController:
             "CONFIDENTIAL",
         )
 
-    def preprocess(self, user_text: str, sp: SuperPrompt) -> SuperPrompt:
+    def preprocess(
+        self,
+        user_text: str,
+        sp: SuperPrompt,
+        *,
+        memory_manager: Any | None = None,
+    ) -> SuperPrompt:
         """
         Keep existing behavior:
         - Ignore empty/whitespace-only input.
@@ -185,6 +199,13 @@ class AppController:
 
         logger("PreProcessing started.", "INFO", "PUBLIC")
         preprocess(text, sp, self.schema)
+
+        sp = self.activebrief_relation_classifier.run(
+            sp=sp,
+            memory_manager=memory_manager,
+            raw_user_text=text,
+        )
+
         logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
 

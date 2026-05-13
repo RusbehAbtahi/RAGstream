@@ -13,8 +13,13 @@ from typing import Any
 
 from ragstream.memory.memory_manager import MemoryManager
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

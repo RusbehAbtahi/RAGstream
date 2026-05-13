@@ -132,7 +132,8 @@
   },
   "document_retrieval": {
     "semantic_stage_max_total_chunks": 30,
-    "max_document_chunks_for_a3": 25
+    "max_document_chunks_for_a3": 25,
+    "hard_embedding_floor": 0.2
   },
   "a4_condenser": {
     "max_output_tokens": 5000

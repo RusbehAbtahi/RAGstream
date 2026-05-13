@@ -468,7 +468,7 @@ def LOGDeveloper(
     Standalone developer logger.
 
     Import pattern:
-        from ragstream.textforge.RagLog import LOGDeveloper as logger_dev
+        from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
 
     Usage:
         logger_dev("A4 token usage: ...", "DEBUG", "CONFIDENTIAL")

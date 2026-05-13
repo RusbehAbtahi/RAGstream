@@ -81,6 +81,7 @@ class Retriever:
         chroma_root: str,
         embedder: Embedder | None = None,
         chunker: Chunker | None = None,
+        runtime_config: dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize Retrieval with explicit project roots and shared helpers.
@@ -103,6 +104,7 @@ class Retriever:
 
         self.embedder = embedder if embedder is not None else Embedder(model="text-embedding-3-small")
         self.chunker = chunker if chunker is not None else Chunker()
+        self.runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
 
         # Keep the chunk class explicit so hydration remains readable and testable.
         self.chunk_cls = Chunk
@@ -150,9 +152,11 @@ class Retriever:
             top_k=top_k,
         )
 
+        ranked_rows_emb = self._apply_hard_embedding_floor(ranked_rows_emb)
+
         ranked_rows_splade: List[RankedRow]
 
-        if use_retrieval_splade:
+        if use_retrieval_splade and ranked_rows_emb:
             candidate_ids = [str(chunk_id) for chunk_id, _score, _meta in ranked_rows_emb]
 
             try:
@@ -239,6 +243,28 @@ class Retriever:
     # -----------------------------------------------------------------
     # Internal helpers kept in retriever.py
     # -----------------------------------------------------------------
+
+    def _apply_hard_embedding_floor(
+        self,
+        ranked_rows_emb: List[RankedRow],
+    ) -> List[RankedRow]:
+        """
+        Remove dense retrieval rows below the configured hard embedding floor.
+
+        The dense row score is the embedding similarity score that later appears
+        as Emb=... in the SuperPrompt raw retrieved evidence.
+        """
+        document_retrieval_config = self.runtime_config.get("document_retrieval", {}) or {}
+        hard_embedding_floor = float(document_retrieval_config.get("hard_embedding_floor", 0.0) or 0.0)
+
+        if hard_embedding_floor <= 0.0:
+            return ranked_rows_emb
+
+        return [
+            (str(chunk_id), float(score), dict(meta or {}))
+            for chunk_id, score, meta in ranked_rows_emb
+            if float(score) >= hard_embedding_floor
+        ]
 
     def _project_rrf_metadata_to_retrieval_contract(
         self,

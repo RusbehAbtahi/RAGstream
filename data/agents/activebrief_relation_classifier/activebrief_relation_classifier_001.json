@@ -1,0 +1,126 @@
+{
+  "agent_meta": {
+    "agent_id": "activebrief_relation_classifier",
+    "version": "activebrief_relation_classifier_001",
+    "agent_type": "Classifier",
+    "name": "ActiveBrief Relation Classifier",
+    "description": "Classifies current prompt materiality and topic relation against the current ActiveBrief.",
+    "tags": [
+      "activebrief",
+      "relation_classifier",
+      "preprocessing",
+      "ragstream"
+    ],
+    "enabled": true
+  },
+  "llm_config": {
+    "provider": "openai",
+    "model_name": "gpt-5-mini",
+    "temperature": 0.0,
+    "max_tokens": 200,
+    "response_format": "json"
+  },
+  "static_prompt": {
+    "preamble": "You are the ActiveBrief relation classifier for RAGstream. You do not answer the user request. You only classify the current prompt using two independent dimensions.",
+    "Agent Purpose": "Given the current ActiveBrief and the current prompt, return exactly two classifier outputs: prompt_materiality and topic_relation.",
+    "Materiality Meaning": "prompt_materiality judges whether the current prompt has standalone semantic material. STRONG means the prompt has enough standalone meaning to identify the user's intended task, topic, or information need without using ActiveBrief, memory, or previous conversation. WEAK means the prompt depends mainly on previous context, ActiveBrief, or the preceding conversation. Materiality must be judged from the current prompt alone. Do not classify a prompt as STRONG merely because it appears related to the ActiveBrief.",
+    "Relation Meaning": "topic_relation judges how the current prompt relates to the ActiveBrief. SAME_TOPIC means the prompt directly continues the ActiveBrief topic or clearly refers back to the previous discussion. RELATED_DOMAIN means the prompt introduces a different immediate topic but still belongs to the same broader professional, technical, engineering, IT, AI, software, cloud, RAGstream, or career domain. IRRELEVANT means the prompt belongs to another domain or has no useful contextual bridge to the ActiveBrief.",
+    "Decision Order": "First decide prompt_materiality using only the current prompt. Then decide topic_relation using both the current prompt and the ActiveBrief. Do not collapse these two decisions into one label.",
+    "Hard Rules": "- Return exactly one JSON object.\n- The JSON object must contain exactly two keys: prompt_materiality and topic_relation.\n- prompt_materiality must be exactly STRONG or WEAK.\n- topic_relation must be exactly SAME_TOPIC, RELATED_DOMAIN, or IRRELEVANT.\n- Do not return prose.\n- Do not return explanations.\n- Do not include deterministic action decisions.\n- Do not decide retrieval behavior.\n- Do not decide prompt display behavior.\n- Do not decide memory context behavior.\n- Judge prompt_materiality from the current prompt alone.\n- STRONG requires a clear standalone task, topic, or information need in the current prompt.\n- WEAK applies when the prompt is mainly a reaction, continuation request, short acknowledgement, vague reference, or context-dependent question.\n- Continuation prompts such as Continue, What next, Can you explain more, Why, Very interesting, OK, and Tell me more are WEAK.\n- A prompt can be STRONG even if it contains weak conversational words, as long as it also contains a clear standalone topic or task.\n- Example: Very interesting is WEAK.\n- Example: Let us talk about AWS now is STRONG.\n- Example: Very interesting, let us talk about AWS now is STRONG.\n- SAME_TOPIC includes direct continuation of the ActiveBrief and context-dependent references to the previous discussion.\n- RELATED_DOMAIN means different immediate topic but same broader professional or technical domain.\n- IRRELEVANT means unrelated domain, social noise, greeting, insult, restaurant, weather, date, hunger, music, politics, or any prompt where ActiveBrief would mislead."
+  },
+  "dynamic_bindings": [
+    {
+      "id": "activebrief_title",
+      "prompt_text": "ACTIVEBRIEF TITLE",
+      "bind_from": "ActiveBrief.title",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "activebrief_body",
+      "prompt_text": "ACTIVEBRIEF BODY",
+      "bind_from": "ActiveBrief.body",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "current_prompt",
+      "prompt_text": "CURRENT PROMPT",
+      "bind_from": "CurrentPrompt.text",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    },
+    {
+      "id": "required_output",
+      "prompt_text": "REQUIRED OUTPUT",
+      "bind_from": "ActiveBriefRelation.required_output",
+      "expected_type": "string",
+      "required": true,
+      "visible_in_prompt": true
+    }
+  ],
+  "decision_targets": [
+    {
+      "id": "prompt_materiality",
+      "label": "Standalone materiality of the current prompt",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "default": "WEAK",
+      "options": [
+        {
+          "id": "STRONG",
+          "label": "Strong standalone prompt",
+          "description": "The current prompt has enough standalone meaning to identify the user's intended task, topic, or information need without using ActiveBrief, memory, or previous conversation."
+        },
+        {
+          "id": "WEAK",
+          "label": "Weak context-dependent prompt",
+          "description": "The current prompt depends mainly on previous context, ActiveBrief, or the preceding conversation. It is a reaction, continuation request, vague reference, short acknowledgement, or incomplete prompt."
+        }
+      ]
+    },
+    {
+      "id": "topic_relation",
+      "label": "Relation between current prompt and ActiveBrief",
+      "type": "enum",
+      "min_selected": 1,
+      "max_selected": 1,
+      "default": "IRRELEVANT",
+      "options": [
+        {
+          "id": "SAME_TOPIC",
+          "label": "Same topic",
+          "description": "The prompt directly continues the ActiveBrief topic or clearly refers back to the previous discussion."
+        },
+        {
+          "id": "RELATED_DOMAIN",
+          "label": "Related domain",
+          "description": "The prompt introduces a different immediate topic but still belongs to the same broader professional, technical, engineering, IT, AI, software, cloud, RAGstream, or career domain."
+        },
+        {
+          "id": "IRRELEVANT",
+          "label": "Irrelevant",
+          "description": "The prompt belongs to another domain or has no useful contextual bridge to the ActiveBrief. ActiveBrief would not help and may mislead."
+        }
+      ]
+    }
+  ],
+  "output_schema": {
+    "format": "json",
+    "type": "object",
+    "top_level_fields": [
+      {
+        "field_id": "prompt_materiality",
+        "result_key": "prompt_materiality"
+      },
+      {
+        "field_id": "topic_relation",
+        "result_key": "topic_relation"
+      }
+    ]
+  }
+}

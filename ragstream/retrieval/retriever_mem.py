@@ -39,8 +39,13 @@ from ragstream.memory.compression.memory_compressor import MemoryCompressor
 from ragstream.memory.memory_merge_synthesizer import MemoryMergeSynthesizer
 from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.textforge.RagLog import LogALL as logger
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
+DEV_LOG_ENABLED = False
 
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
 
 class MemoryRetriever:
     """

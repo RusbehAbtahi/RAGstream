@@ -1,9 +1,6 @@
-Updated based on your current report file. 
-
-````markdown
 # RAGstream_Implementation_Status.md
 
-Last update: 06.05.2026
+Last update: 13.05.2026
 
 Purpose:
 - This file is a compact implementation status snapshot.
@@ -14,11 +11,14 @@ Purpose:
 - [03.05.2026 / KW18 2026] This update adds the implemented Memory Recording layer, the implemented Memory Ingestion layer, and the corrected TextForge / RagLog logging layer.
 - [06.05.2026 / KW19 2026] This update adds the corrected MemoryRecord persistence authority split, initial Memory Retrieval, MemoryContextPack wiring, server-side Memory Files management, tabbed Streamlit structure, auto-created memory histories, and the future ActiveRetrievalBrief requirement.
 - [06.05.2026 / KW19 2026] This update also adds K-based recency scoring for Green episodic memory and semantic memory chunks.
+- [13.05.2026 / KW20 2026] This update adds the immediate hardening work around A4 empty selection, hard retrieval similarity floor, A2 LLM bypass direction, and the new two-dimensional ActiveBrief Relation Classifier.
+- [13.05.2026 / KW20 2026] This update also records the ActiveRetrievalBrief compression correction: ActiveBrief must reflect the topic well but remain compressed, normally 150–250 tokens for one narrow topic and at most 500 tokens for several related durable topics.
+
 ---
 
 ## 1. High-level picture
 
-RAGstream already has a stable foundation in ten major layers:
+RAGstream already has a stable foundation in eleven major layers:
 
 1. foundational prompt processing and GUI/controller structure,
 2. JSON-based agent architecture with working A2, A3, and A4 stages,
@@ -29,7 +29,8 @@ RAGstream already has a stable foundation in ten major layers:
 7. [03.05.2026 / KW18 2026] structured Memory Recording with durable `.ragmem`, `.ragmeta.json`, and SQLite persistence,
 8. [03.05.2026 / KW18 2026] structured Memory Ingestion with dedicated memory vectors and TextForge / RagLog logging support,
 9. [06.05.2026 / KW19 2026] initial Memory Retrieval with raw memory candidates, semantic chunks, episodic candidates, working memory, Direct Recall hook, and `MemoryContextPack`,
-10. [06.05.2026 / KW19 2026] server-side Memory Files management through a dedicated FILES tab.
+10. [06.05.2026 / KW19 2026] server-side Memory Files management through a dedicated FILES tab,
+11. [13.05.2026 / KW20 2026] ActiveBrief relation classification around PreProcessing, producing independent prompt materiality and topic-relation signals for later deterministic routing.
 
 The pipeline now reaches from prompt input and A2 shaping to project-aware hybrid chunk selection from the active document database, and it also includes a deterministic ReRanker stage, a real A3 stage, and a live A4 Condenser that writes `S_CTX_MD`.
 
@@ -43,9 +44,11 @@ accepted prompt + accepted response
 → dedicated memory vector store
 → Memory Retrieval
 → later Memory Merge / Compression
-````
+```
 
 [06.05.2026 / KW19 2026] Memory Retrieval is now implemented as an initial raw retrieval stage. It is not yet Memory Compression and not yet final memory context generation.
+
+[13.05.2026 / KW20 2026] ActiveBrief relation classification is now introduced as a PreProcessing-adjacent classifier. It does not replace Memory Retrieval or MemoryMerge. It produces early routing signals about whether the current prompt is standalone and how it relates to the current ActiveBrief.
 
 Current practical truth:
 
@@ -61,7 +64,11 @@ Current practical truth:
 * [06.05.2026 / KW19 2026] `LogDeveloper` is now used for detailed developer diagnostics in new Memory Retrieval and file-management related code.
 * [06.05.2026 / KW19 2026] Memory Retrieval is implemented enough to retrieve raw memory candidates and write them into the SuperPrompt state / GUI-visible retrieved context.
 * [06.05.2026 / KW19 2026] The FILES tab is implemented as a server-side memory-history manager backed by SQLite and RAGstream file operations.
-* However, the current BERT-style reranker direction is not accepted as the long-term solution, because in practical tests it often worsened ranking quality instead of improving it.
+* [13.05.2026 / KW20 2026] A4 now has empty-selection safety so zero selected A3-useful chunks can be handled gracefully instead of crashing.
+* [13.05.2026 / KW20 2026] A hard retrieval similarity floor has been introduced before A3 to discard absolute rubbish retrieval results early; the current working threshold is `0.2`, but this remains a practical runtime parameter to be tested and adjusted.
+* [13.05.2026 / KW20 2026] A2 PromptShaper now has a bypass direction: A2 LLM can be deactivated while deterministic/default prompt-shaping values still allow Retrieval to continue.
+* [13.05.2026 / KW20 2026] ActiveBrief Relation Classifier now uses two outputs instead of the earlier failed five-state label: `prompt_materiality` and `topic_relation`.
+* However, the current SPLADE and reranking branches have not consistently produced better results than normal embeddings in practical tests. They remain optional and should be evaluated cautiously rather than treated as automatically superior.
 
 The currently agreed next implementation direction is:
 
@@ -72,11 +79,12 @@ The currently agreed next implementation direction is:
 * keep the Memory Recording and Memory Ingestion truth stable,
 * keep initial Memory Retrieval stable,
 * continue with Memory Merge / Memory Compression later,
-* preserve the ActiveRetrievalBrief idea for the future MemoryMerge stage,
+* preserve ActiveRetrievalBrief as the compact current working memory anchor,
+* keep ActiveBrief relation classification as a PreProcessing-adjacent routing signal,
 * continue hardening the FILES tab as the official server-side memory-history manager,
 * implement Prompt Builder next for the document-RAG pipeline continuation,
 * postpone A5 to a later phase because its action may still change before implementation,
-* keep ColBERT as the agreed later reranking improvement direction.
+* keep ColBERT / reranking improvement as a later evaluation topic, not an immediate assumption.
 
 ---
 
@@ -126,6 +134,7 @@ GENERAL SETTINGS
 
 * [06.05.2026 / KW19 2026] The tab structure is defined in `ui_streamlit.py`, while the MAIN tab still calls the existing `render_page()` from `ui_layout.py`.
 * The current GUI supports prompt processing, project creation, file ingestion, active project selection, embedded-file display, manual memory recording, runtime log visibility, and server-side memory-file management.
+* [13.05.2026 / KW20 2026] GUI-side control direction includes keeping optional bypasses for slow or low-value stages, especially A2 LLM and optional SPLADE / ColBERT reranking branches.
 
 ### 2.2 Deterministic prompt preprocessing
 
@@ -137,6 +146,7 @@ GENERAL SETTINGS
   * `prompt_ready` generation exists for the current preprocessing path.
 * This stage is already part of the live GUI/controller wiring and acts as the first normalization layer for user input.
 * [03.05.2026 / KW18 2026] PreProcessing logging now uses the corrected project-level RagLog import pattern.
+* [13.05.2026 / KW20 2026] ActiveBrief relation classification is called around the PreProcessing button flow, after deterministic preprocessing, while the classifier logic remains separate from `preprocessing.py`.
 
 ### 2.3 JSON-based agent architecture
 
@@ -156,6 +166,7 @@ GENERAL SETTINGS
   * [24.04.2026] It now applies deterministic selector sanitization after parsing and before write-back; invalid, cross-field, invented, malformed, and duplicate ids are removed.
   * [24.04.2026] If a field becomes empty after sanitization, A2 preserves the existing preprocessing value instead of applying catalog defaults.
   * It updates stage/history.
+  * [13.05.2026 / KW20 2026] A2 LLM bypass direction is implemented so the pipeline can proceed with deterministic/default A2 values when the A2 LLM call is deactivated.
 * A3 NLI Gate is implemented and already wired.
 
   * It reads the reranked candidate set from the current `SuperPrompt`.
@@ -163,6 +174,7 @@ GENERAL SETTINGS
   * It performs usefulness-only classification.
   * It writes `views_by_stage["a3"]`, `extras["a3_selection_band"]`, `extras["a3_item_decisions"]`, and `final_selection_ids`.
 * [24.04.2026] A4 Condenser is now implemented and wired as the next live LLM-based stage after A3.
+* [13.05.2026 / KW20 2026] ActiveBrief Relation Classifier is implemented as a new JSON-based classifier with a dedicated Python module and JSON config.
 * [24.04.2026] The current immediate next implementation target for the document-RAG pipeline is Prompt Builder. A5 is intentionally postponed for a later phase because its final action is still open to revision.
 
 ### 2.4 SuperPrompt as shared state
@@ -188,6 +200,7 @@ GENERAL SETTINGS
 * [06.05.2026 / KW19 2026] `SuperPrompt` now includes `memory_context_pack` as a runtime field.
 * [06.05.2026 / KW19 2026] `SuperPromptProjector` now renders raw memory retrieval candidates from `sp.extras["memory_debug_markdown"]` under the Retrieved Context section.
 * [06.05.2026 / KW19 2026] Memory retrieval output is intentionally raw at this stage. It is not yet compressed memory and not yet final prompt context.
+* [13.05.2026 / KW20 2026] ActiveBrief relation outputs are written into `sp.extras`, including prompt materiality, topic relation, derived relation state, classifier-used flag, deterministic decision mapping, and the ActiveBrief snapshot.
 
 ### 2.5 Project-based ingestion
 
@@ -241,6 +254,7 @@ GENERAL SETTINGS
 * Retrieval ranks chunks, reconstructs their text from `doc_raw/<project>`, and writes the selected chunks into `base_context_chunks`.
 * [06.05.2026 / KW19 2026] `AppController.run_retrieval(...)` now also calls Memory Retrieval if `MemoryRetriever` is configured.
 * [06.05.2026 / KW19 2026] Pressing the Retrieval button now produces both document retrieval output and raw memory retrieval output. It still does not run A3, A4, MemoryMerge, or memory compression.
+* [13.05.2026 / KW20 2026] A hard embedding similarity floor was added before A3 so absolute rubbish retrieval results can be discarded early. The current working value is `0.2` and is configured through runtime configuration.
 
 ### 2.8 Retrieval-related GUI/controller integration
 
@@ -258,18 +272,13 @@ GENERAL SETTINGS
   * `use Reranking Colbert`
 * [06.05.2026 / KW19 2026] `ui_streamlit.py` now configures Memory Retrieval during Streamlit startup after `MemoryManager` and `MemoryVectorStore` exist.
 * [06.05.2026 / KW19 2026] `ui_actions.py` has a defensive `_ensure_memory_retrieval_configured(...)` helper so older sessions can still configure Memory Retrieval before running Retrieval.
+* [13.05.2026 / KW20 2026] When optional reranking is disabled, the desired behavior is that Retrieval should prepare the state for A3 without forcing the user to press ReRanker only to pass values through. This remains an immediate mechanical integration task if not already fully wired.
 
 ### 2.9 ReRanker is implemented
 
 * ReRanker is implemented as a deterministic stage.
 * It is no longer only a planned step.
-* The currently implemented ReRanker direction is:
-
-  * BERT-style cross-encoder reranking
-  * CPU-only runtime
-  * current model:
-
-    * `cross-encoder/ms-marco-MiniLM-L-12-v2`
+* The currently implemented ReRanker direction is optional and should remain bypassable.
 * Its logic is:
 
   * read the Retrieval candidates already stored in `SuperPrompt`,
@@ -279,7 +288,7 @@ GENERAL SETTINGS
     * `purpose`
     * `context`
   * dynamically clean chunk text before scoring,
-  * score each `(query, chunk)` pair with the cross-encoder,
+  * score each `(query, chunk)` pair,
   * sort by reranker score,
   * write the reranked view back into `SuperPrompt`.
 * ReRanker reranks Retrieval candidates and writes the reranked view back into `SuperPrompt`.
@@ -303,16 +312,14 @@ GENERAL SETTINGS
   * duplicate marking has been intentionally removed.
 * A3 already performs meaningful semantic filtering and is considered good enough to keep as the current stage truth while the next work moves to Prompt Builder.
 * [06.05.2026 / KW19 2026] A3 does not yet process raw memory candidates. Memory-specific semantic filtering is reserved for later MemoryMerge / Memory Compression design.
+* [13.05.2026 / KW20 2026] A3 speed remains an open optimization topic. Current planned improvements are to reduce normal A3 prompt logging, compact `required_output`, carefully reduce max output tokens, preserve the same classification rules, and benchmark model/API-call variants using the same candidate set.
 
-### 2.11 Why the current ReRanker direction is not accepted as final
+### 2.11 Why the current SPLADE / reranking direction is not accepted as final
 
-* Practical evaluation showed that the current BERT-style reranker often did not improve the already good Retrieval ranking.
-* In important real examples, it made the ranking worse:
-
-  * relevant chunks were demoted too aggressively,
-  * some weaker or less useful chunks were promoted,
-  * and the final ranking became less trustworthy than dense Retrieval alone.
-* Therefore the current BERT-style reranking direction is considered unsatisfactory as the future production direction.
+* Practical evaluation showed that SPLADE and reranking have not consistently improved the already good dense Retrieval ranking.
+* In important real examples, they sometimes made ranking quality worse instead of better.
+* Therefore these branches are currently treated as optional evaluation branches, not as guaranteed quality improvements.
+* The agreed direction is to keep the stage structure, keep bypass controls, and evaluate improvements carefully before increasing their weight.
 
 ### 2.12 A4 Condenser is implemented
 
@@ -347,6 +354,7 @@ GENERAL SETTINGS
 * [24.04.2026] The final condenser prompt was corrected so A4 produces neutral internal context, not a polished final answer to the user.
 * [24.04.2026] If classifier output is empty or unusable, A4 continues through fallback grouping instead of crashing; the warning belongs in logs/status, not inside the final SuperPrompt.
 * [06.05.2026 / KW19 2026] A4 currently condenses document evidence, not MemoryContextPack content.
+* [13.05.2026 / KW20 2026] A4 empty-selection safety is implemented. If A3 selects zero useful document chunks, A4 can finalize a controlled empty-selection state instead of crashing.
 
 ### 2.13 GUI-visible SuperPrompt rendering hardening
 
@@ -416,9 +424,21 @@ from ragstream.textforge.RagLog import LogALL as logger
 * [06.05.2026 / KW19 2026] New developer-diagnostic modules should additionally use:
 
 ```python
-from ragstream.textforge.RagLog import LogDeveloper as logger_dev
+from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
 ```
 
+and use a wrapper such as:
+
+```python
+DEV_LOG_ENABLED = False
+
+def logger_dev(*args, **kwargs):
+    if DEV_LOG_ENABLED:
+        return _logger_dev(*args, **kwargs)
+    return None
+```
+
+* [13.05.2026 / KW20 2026] The wrapper must call `_logger_dev`, not `logger_dev`, otherwise it creates recursion when developer logging is enabled.
 * The important corrected rule is:
 
   * `type` and `sensitivity` are message labels,
@@ -436,6 +456,7 @@ from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 * [03.05.2026 / KW18 2026] The previous `st.session_state.raglog` helper/wrapper direction has been rejected. Application modules should import the public RagLog function directly instead of passing logger objects through Streamlit state.
 * [06.05.2026 / KW19 2026] Memory Retrieval developer diagnostics log detailed payloads such as vector hits, SQLite candidates, metadata, scores, and packed memory context through `logger_dev`.
 * [06.05.2026 / KW19 2026] MAIN Runtime Log is append-style operational logging. FILES status messages are intentionally latest-action status only and overwrite previous FILES action state to avoid UI noise.
+* [13.05.2026 / KW20 2026] ActiveBrief Relation Classifier developer logging is intentionally limited to LLM INPUT and LLM OUTPUT only, so prompt, ActiveBrief, raw model output, and parsed classifier values can be audited without extra deterministic decision noise.
 
 ### 2.16 Memory Recording is implemented
 
@@ -689,26 +710,29 @@ token_budget_report
   * episodic memory limits,
   * Direct Recall limits,
   * semantic memory chunk limits.
-
-  * [06.05.2026 / KW19 2026] Memory Retrieval scoring now includes K-based recency weighting. In this model, `k = 0` means the latest MemoryRecord, `k = 1` means one episode older, and so on.
+* [06.05.2026 / KW19 2026] Memory Retrieval scoring now includes K-based recency weighting. In this model, `k = 0` means the latest MemoryRecord, `k = 1` means one episode older, and so on.
 * [06.05.2026 / KW19 2026] Green episodic memory now combines semantic relevance and recency:
 
-  final_parent_score =
-    green_semantic_weight * semantic_parent_score
-  + green_recency_weight  * recency_score
+```text
+final_parent_score =
+  green_semantic_weight * semantic_parent_score
++ green_recency_weight  * recency_score
+```
 
 * [06.05.2026 / KW19 2026] Semantic memory chunks also combine semantic relevance and recency, but with weaker recency influence than Green episodic memory.
 * [06.05.2026 / KW19 2026] Current default values in `runtime_config.json` are:
 
-  Green episodic memory:
-  - semantic = 0.75
-  - recency = 0.25
-  - half_life_k = 10
+```text
+Green episodic memory:
+- semantic = 0.75
+- recency = 0.25
+- half_life_k = 10
 
-  Semantic memory chunks:
-  - semantic = 0.90
-  - recency = 0.10
-  - half_life_k = 10
+Semantic memory chunks:
+- semantic = 0.90
+- recency = 0.10
+- half_life_k = 10
+```
 
 * [06.05.2026 / KW19 2026] Gold and Direct Recall remain outside the normal recency-decay path. Black records remain excluded from automatic Memory Retrieval.
 * [06.05.2026 / KW19 2026] `MemoryContextPack` debug output now shows `semantic_score`, `recency_score`, `final_score`, and `episode_distance_k` for memory candidates.
@@ -782,10 +806,11 @@ delete
 * [06.05.2026 / KW19 2026] SQLite `memory_files` is the authority for memory-history listing and path resolution.
 * [06.05.2026 / KW19 2026] Filenames are mutable path/display fields. `file_id` is the stable identity.
 
-### 2.20 Future ActiveRetrievalBrief requirement was captured
+### 2.20 ActiveRetrievalBrief requirement and current implementation status
 
-* [06.05.2026 / KW19 2026] The future `ActiveRetrievalBrief` design decision was captured for later MemoryMerge / Memory Compression work.
-* The core idea is:
+* [06.05.2026 / KW19 2026] The `ActiveRetrievalBrief` design decision was captured for later MemoryMerge / Memory Compression work.
+* [13.05.2026 / KW20 2026] ActiveRetrievalBrief generation/update is now present enough to be tested through memory histories and relation-classifier logging.
+* The core idea remains:
 
 ```text
 Each MemoryRecord gets its own immutable cumulative ActiveRetrievalBrief.
@@ -800,14 +825,25 @@ Each MemoryRecord gets its own immutable cumulative ActiveRetrievalBrief.
 latest clean non-Black ActiveRetrievalBrief
 ```
 
-* Future fields:
+* Current / intended fields:
 
 ```text
-qa_summary
+active_retrieval_brief_title
 active_retrieval_brief
 active_retrieval_brief_contributor_ids
 ```
 
+* [13.05.2026 / KW20 2026] The ActiveBrief summarizer JSON files were corrected so ActiveBrief is a compression, not an expansion.
+* [13.05.2026 / KW20 2026] The current compression rule is:
+
+```text
+one narrow topic: target 150–250 tokens
+several related durable topics: target 250–500 tokens
+absolute maximum: 500 tokens
+```
+
+* [13.05.2026 / KW20 2026] ActiveBrief must not grow larger than the original reduced Q/A for a narrow single-topic exchange.
+* [13.05.2026 / KW20 2026] ActiveBrief must not add checklists, rejected interpretations, operational implications, or implementation decisions unless those are explicitly present in the Q/A or previous brief.
 * Intended future use for document retrieval:
 
 ```text
@@ -824,10 +860,93 @@ current query support
 + latest clean ActiveRetrievalBrief
 ```
 
-* The brief should be generated by LLM semantic rules, not by fixed 50/50 or 70/30 numeric weighting.
-* The updater rules should preserve stable context, add durable new information, treat corrections as high-importance scope constraints, ignore noise/insults as topic content, and keep the brief compact.
 * `active_retrieval_brief_contributor_ids` are required so Black-tagged records can be avoided by selecting the latest brief whose contributors do not include Black records.
-* This belongs to future MemoryMerge / Memory Compression, not the current raw Memory Retrieval stage.
+* ActiveBrief is now practically useful, but final MemoryMerge / final prompt injection behavior is still not complete.
+
+### 2.21 ActiveBrief Relation Classifier is implemented
+
+* [13.05.2026 / KW20 2026] ActiveBrief Relation Classifier is implemented as a separate PreProcessing-adjacent classifier.
+* New / changed files:
+
+```text
+ragstream/preprocessing/activebrief_relation_classifier.py
+data/agents/activebrief_relation_classifier/activebrief_relation_classifier_001.json
+ragstream/app/controller.py
+ragstream/app/ui_actions.py
+```
+
+* The first direct five-state classifier design was rejected after testing because it badly confused strong/weak and same/shifted topic.
+* The implemented design is now two-dimensional:
+
+```text
+prompt_materiality:
+  STRONG | WEAK
+
+topic_relation:
+  SAME_TOPIC | RELATED_DOMAIN | IRRELEVANT
+```
+
+* `prompt_materiality` means:
+
+```text
+STRONG
+= current prompt has standalone semantic material and does not need memory/context to identify its task, topic, or information need.
+
+WEAK
+= current prompt depends mainly on previous context, ActiveBrief, or the preceding conversation.
+```
+
+* `topic_relation` means:
+
+```text
+SAME_TOPIC
+= directly continues the ActiveBrief topic or clearly refers back to the previous discussion.
+
+RELATED_DOMAIN
+= different immediate topic but still inside the same broader professional, technical, engineering, IT, AI, software, cloud, RAGstream, or career domain.
+
+IRRELEVANT
+= unrelated domain or no useful contextual bridge to the ActiveBrief.
+```
+
+* Tested examples showed the new classifier works much better than the five-state version:
+
+```text
+What is next?
+→ WEAK / SAME_TOPIC
+
+Very Interesting
+→ WEAK / SAME_TOPIC
+
+Can you explain cloud engineering?
+→ STRONG / RELATED_DOMAIN
+
+What date is it?
+→ STRONG / IRRELEVANT
+
+Can you explain how to analyze text and context?
+→ STRONG / SAME_TOPIC
+```
+
+* The classifier uses `LLMClient.responses(...)` with a short prompt cache key.
+* Developer logging for this classifier now records only:
+
+```text
+ActiveBriefRelationClassifier LLM INPUT
+ActiveBriefRelationClassifier LLM OUTPUT
+```
+
+* The deterministic mapping from these two classifier outputs to retrieval/display/memory behavior remains in Python and is not part of the LLM judgment.
+* The current classifier writes these values into `SuperPrompt.extras`:
+
+```text
+activebrief_prompt_materiality
+activebrief_topic_relation
+activebrief_relation_state
+activebrief_relation_llm_used
+activebrief_relation_decision
+activebrief_relation_activebrief
+```
 
 ---
 
@@ -841,6 +960,7 @@ current query support
 * [24.04.2026] Prompt Builder should reuse or align with the current `SuperPromptProjector` structure so GUI preview and final-send prompt assembly do not diverge.
 * [03.05.2026 / KW18 2026] Prompt Builder remains incomplete. The KW18 Memory work did not replace this pipeline milestone.
 * [06.05.2026 / KW19 2026] The initial Memory Retrieval and FILES tab work did not replace Prompt Builder. Prompt Builder remains a separate document-RAG pipeline milestone.
+* [13.05.2026 / KW20 2026] ActiveBrief relation classification does not replace Prompt Builder. It only provides routing metadata before retrieval/final prompt assembly.
 
 ### 3.2 A5 Format Enforcer
 
@@ -854,14 +974,14 @@ current query support
 * Memory Recording is now implemented.
 * Memory Ingestion is now implemented.
 * [06.05.2026 / KW19 2026] Initial raw Memory Retrieval is now implemented.
+* [13.05.2026 / KW20 2026] ActiveRetrievalBrief generation/update and ActiveBrief relation classification now exist, but final MemoryMerge is still not complete.
 * What remains intentionally incomplete is:
 
   * MemoryMerge,
-  * Memory Compression,
+  * final Memory Compression,
   * compressed episodic-memory summaries,
   * compressed working-memory context,
   * Direct Recall final handling,
-  * ActiveRetrievalBrief generation/update,
   * final memory-context preparation for the final prompt,
   * advanced memory-management GUI beyond the current FILES tab.
 * Initial Memory Retrieval searches and reconstructs raw candidates.
@@ -886,6 +1006,7 @@ current query support
   * possible thread-safety hardening around GUI logging and background workers.
 * These points do not block the current Memory Recording / Memory Ingestion / initial Memory Retrieval implementation.
 * [06.05.2026 / KW19 2026] Metrics / Observability should be treated as a broader future UI area than just “logs.” The METRICS tab should later include logs, token usage, retrieval counts, memory retrieval diagnostics, cost estimates, latency, success/failure status, and developer/debug summaries.
+* [13.05.2026 / KW20 2026] Developer logging should stay compact by default. Full LLM INPUT/OUTPUT logging is useful for classifier debugging but should not become uncontrolled normal-mode logging.
 
 ### 3.5 Multi-user support
 
@@ -921,7 +1042,7 @@ user_id → workspace_id → file_id → record_id → paths / metadata / vector
 1. keep current Retrieval / ReRanker / A3 / A4 truth stable,
 2. implement Prompt Builder,
 3. postpone A5,
-4. revisit ReRanker improvement with ColBERT after the pipeline is stable through A4 and Prompt Builder.
+4. revisit ReRanker improvement after the pipeline is stable through A4 and Prompt Builder.
 
 [03.05.2026 / KW18 2026] After the KW18 Memory work, the Memory-subsystem work order was:
 
@@ -931,7 +1052,7 @@ user_id → workspace_id → file_id → record_id → paths / metadata / vector
 4. reconstruct parent-aware `MemoryContextPack`,
 5. only then decide Memory Compression and SuperPrompt memory-section injection.
 
-[06.05.2026 / KW19 2026] Current status after this chat:
+[06.05.2026 / KW19 2026] Status after that chat:
 
 1. Memory Recording is stable enough to continue.
 2. Memory Ingestion is stable enough to continue.
@@ -940,16 +1061,29 @@ user_id → workspace_id → file_id → record_id → paths / metadata / vector
 5. Server-side FILES tab exists for Memory history management.
 6. The next Memory-subsystem direction is MemoryMerge / Memory Compression, not another redesign of Recording/Ingestion.
 7. The FILES tab should continue to be polished only where needed for presentation quality and safe server-side operations.
-8. ActiveRetrievalBrief is captured as a future requirement for MemoryMerge.
+8. ActiveRetrievalBrief was captured as a future requirement for MemoryMerge.
+
+[13.05.2026 / KW20 2026] Current status after this chat:
+
+1. A4 empty-selection safety is implemented.
+2. Hard retrieval similarity floor is implemented with current value `0.2`, but still needs practical testing and tuning.
+3. A2 LLM bypass direction is implemented / prepared so Retrieval can proceed without forcing the A2 LLM call.
+4. ActiveBrief Relation Classifier is implemented with two-dimensional output and tested successfully on representative prompts.
+5. ActiveBrief summarizer rules were corrected to prevent oversized expansion.
+6. ActiveBrief quality must still be tested with new memory histories, because old histories keep old oversized ActiveBriefs.
+7. Retrieval-to-A3-ready behavior when ColBERT/reranking is disabled remains an immediate mechanical integration task if not fully completed.
+8. A3 optimization remains open: reduce noisy logging, compact required output, reduce max tokens carefully, and benchmark model/API choices without changing classification quality.
 
 The two tracks remain related but separate:
 
 ```text
 Document-RAG pipeline next:
   Prompt Builder
+  plus small mechanical hardening of Retrieval/ReRanker/A3 flow
 
 Memory subsystem next:
-  MemoryMerge / Memory Compression / ActiveRetrievalBrief later
+  MemoryMerge / Memory Compression
+  plus continued ActiveBrief quality testing on new histories
 ```
 
 ### 4.2 Why this order is now preferred
@@ -958,18 +1092,15 @@ Memory subsystem next:
 * ReRanker is live enough to keep the stage contract while its long-term replacement is still open.
 * A3 is already good enough to be treated as a real stage.
 * [24.04.2026] A4 is now implemented and good enough to be treated as the current condenser stage.
+* [13.05.2026 / KW20 2026] A4 is now safer because empty A3 selection does not have to crash the pipeline.
+* [13.05.2026 / KW20 2026] ActiveBrief relation classification now provides an early, useful routing signal, but it does not remove the need for MemoryMerge.
 * The biggest missing operational gap in the end-to-end document-RAG pipeline is now downstream of A4:
 
   * final deterministic prompt assembly,
   * production decision on raw evidence vs. debug/audit evidence visibility.
 * Therefore the highest leverage in the document-RAG pipeline remains Prompt Builder, not more A3/A4 redesign.
-* [03.05.2026 / KW18 2026] The biggest missing operational gap in the Memory subsystem was Memory Retrieval:
-
-  * Memory Recording already stores the durable truth,
-  * Memory Ingestion already prepares searchable vectors,
-  * Retrieval had to reconstruct useful parent-aware Q/A context rather than returning isolated vector chunks.
-* [06.05.2026 / KW19 2026] That initial Memory Retrieval gap is now closed at raw-candidate level.
-* The next Memory gap is higher-level selection/compression:
+* [06.05.2026 / KW19 2026] The initial Memory Retrieval gap is now closed at raw-candidate level.
+* [13.05.2026 / KW20 2026] The next Memory gap is higher-level selection/compression:
 
   * which memory episodes to keep,
   * how to compress them,
@@ -1004,11 +1135,12 @@ It already has:
 * [06.05.2026 / KW19 2026] raw memory retrieval display inside SuperPrompt rendering,
 * [06.05.2026 / KW19 2026] server-side FILES tab for New / Load / Rename / Delete memory histories,
 * [06.05.2026 / KW19 2026] file-level delete cleanup across physical files, SQLite, and memory vectors,
-* [06.05.2026 / KW19 2026] future ActiveRetrievalBrief requirement captured for MemoryMerge.
+* [13.05.2026 / KW20 2026] A4 empty-selection safety,
+* [13.05.2026 / KW20 2026] hard retrieval similarity floor before A3,
+* [13.05.2026 / KW20 2026] A2 LLM bypass direction,
+* [13.05.2026 / KW20 2026] corrected ActiveBrief compression rules,
+* [13.05.2026 / KW20 2026] implemented two-dimensional ActiveBrief Relation Classifier.
 
 [24.04.2026] The immediate next document-RAG milestone is Prompt Builder. A4 Condenser is implemented and live; A5 is postponed and may be redefined before it is built.
 
-[06.05.2026 / KW19 2026] The immediate next Memory milestone is MemoryMerge / Memory Compression. Memory Recording, Memory Ingestion, initial Memory Retrieval, and server-side Memory Files management are now implemented; the next work must decide how raw memory candidates become compressed, controlled, final memory context.
-
-```
-```
+[13.05.2026 / KW20 2026] The immediate next Memory milestone is MemoryMerge / Memory Compression. ActiveBrief is now corrected toward compact topic reflection, and the ActiveBrief Relation Classifier is now usable, but final memory-context construction is still open.

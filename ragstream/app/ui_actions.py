@@ -34,7 +34,11 @@ def do_preprocess() -> None:
     st.session_state.sp_a4 = SuperPrompt()
 
     sp: SuperPrompt = st.session_state.sp
-    sp = ctrl.preprocess(user_text, sp)
+    sp = ctrl.preprocess(
+        user_text,
+        sp,
+        memory_manager=st.session_state.get("memory_manager"),
+    )
 
     st.session_state.sp = sp
     st.session_state.sp_pre = copy.deepcopy(sp)
