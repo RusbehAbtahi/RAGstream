@@ -35,11 +35,44 @@ class SuperPromptProjector:
 
     @staticmethod
     def build_query_text(sp: "SuperPrompt") -> str:
+        """
+        Build the document Retrieval query text from SuperPrompt.
+
+        6-state routing:
+
+        1. SAME_TOPIC + STRONG       -> current prompt only
+        2. RELATED_DOMAIN + STRONG   -> current prompt only
+        3. IRRELEVANT + STRONG       -> current prompt only
+        4. SAME_TOPIC + WEAK         -> current prompt + full ActiveBrief
+        5. RELATED_DOMAIN + WEAK     -> current prompt + ActiveBrief title
+        6. IRRELEVANT + WEAK         -> no document retrieval
+        """
         if sp is None:
             raise ValueError("SuperPromptProjector.build_query_text: 'sp' must not be None")
 
         if not hasattr(sp, "body") or sp.body is None:
             raise ValueError("SuperPromptProjector.build_query_text: SuperPrompt has no usable 'body'")
+
+        extras = getattr(sp, "extras", {}) or {}
+
+        materiality = str(
+            extras.get("activebrief_prompt_materiality", "") or ""
+        ).strip().upper()
+
+        topic_relation = str(
+            extras.get("activebrief_topic_relation", "") or ""
+        ).strip().upper()
+
+        activebrief_snapshot = extras.get("activebrief_relation_activebrief", {}) or {}
+        if isinstance(activebrief_snapshot, dict):
+            active_brief_title = str(activebrief_snapshot.get("title", "") or "").strip()
+            active_brief_text = str(activebrief_snapshot.get("body", "") or "").strip()
+        else:
+            active_brief_title = ""
+            active_brief_text = ""
+
+        if materiality == "WEAK" and topic_relation == "IRRELEVANT":
+            return ""
 
         blocks: List[str] = []
 
@@ -62,6 +95,18 @@ class SuperPromptProjector:
             blocks.append(context)
             blocks.append("")
 
+        if materiality == "WEAK" and topic_relation == "SAME_TOPIC":
+            if active_brief_text:
+                blocks.append("## PREVIOUS MEMORY SUMMARY")
+                blocks.append(active_brief_text)
+                blocks.append("")
+
+        elif materiality == "WEAK" and topic_relation == "RELATED_DOMAIN":
+            if active_brief_title:
+                blocks.append("## PREVIOUS MEMORY TITLE")
+                blocks.append(active_brief_title)
+                blocks.append("")
+
         query_text = "\n".join(blocks).strip()
 
         if not query_text:
@@ -71,6 +116,89 @@ class SuperPromptProjector:
             )
 
         return query_text
+
+    @staticmethod
+    def build_a3_comparison_prompt_text(sp: "SuperPrompt") -> str:
+        """
+        Build the A3 comparison prompt.
+
+        6-state routing:
+
+        1. SAME_TOPIC + STRONG       -> current prompt + full ActiveBrief
+        2. RELATED_DOMAIN + STRONG   -> current prompt + full ActiveBrief
+        3. IRRELEVANT + STRONG       -> current prompt + ActiveBrief title
+        4. SAME_TOPIC + WEAK         -> current prompt + full ActiveBrief
+        5. RELATED_DOMAIN + WEAK     -> current prompt + ActiveBrief title
+        6. IRRELEVANT + WEAK         -> current prompt + full ActiveBrief
+        """
+        if sp is None:
+            raise ValueError("SuperPromptProjector.build_a3_comparison_prompt_text: 'sp' must not be None")
+
+        if not hasattr(sp, "body") or sp.body is None:
+            raise ValueError(
+                "SuperPromptProjector.build_a3_comparison_prompt_text: SuperPrompt has no usable 'body'"
+            )
+
+        extras = getattr(sp, "extras", {}) or {}
+
+        materiality = str(
+            extras.get("activebrief_prompt_materiality", "") or ""
+        ).strip().upper()
+
+        topic_relation = str(
+            extras.get("activebrief_topic_relation", "") or ""
+        ).strip().upper()
+
+        activebrief_snapshot = extras.get("activebrief_relation_activebrief", {}) or {}
+        if isinstance(activebrief_snapshot, dict):
+            active_brief_title = str(activebrief_snapshot.get("title", "") or "").strip()
+            active_brief_text = str(activebrief_snapshot.get("body", "") or "").strip()
+        else:
+            active_brief_title = ""
+            active_brief_text = ""
+
+        lines: List[str] = ["<user_prompt_under_evaluation>"]
+
+        task = (sp.body.get("task") or "").strip()
+        purpose = (sp.body.get("purpose") or "").strip()
+        context = (sp.body.get("context") or "").strip()
+
+        if task:
+            lines.append("TASK:")
+            lines.append(task)
+            lines.append("")
+
+        if purpose:
+            lines.append("PURPOSE:")
+            lines.append(purpose)
+            lines.append("")
+
+        if context:
+            lines.append("CONTEXT:")
+            lines.append(context)
+            lines.append("")
+
+        use_full_brief = (
+            (materiality == "STRONG" and topic_relation in {"SAME_TOPIC", "RELATED_DOMAIN"})
+            or (materiality == "WEAK" and topic_relation in {"SAME_TOPIC", "IRRELEVANT"})
+        )
+
+        use_title_only = (
+            (materiality == "STRONG" and topic_relation == "IRRELEVANT")
+            or (materiality == "WEAK" and topic_relation == "RELATED_DOMAIN")
+        )
+
+        if use_full_brief and active_brief_text:
+            lines.append("PREVIOUS MEMORY SUMMARY:")
+            lines.append(active_brief_text)
+            lines.append("")
+        elif use_title_only and active_brief_title:
+            lines.append("PREVIOUS MEMORY TITLE:")
+            lines.append(active_brief_title)
+            lines.append("")
+
+        lines.append("</user_prompt_under_evaluation>")
+        return "\n".join(lines).strip()
 
     def compose_prompt_ready(self) -> str:
         self.sp.System_MD = self._render_system_md()
@@ -138,16 +266,11 @@ class SuperPromptProjector:
         format_value = (self.sp.body.get("format") or "").strip()
         text_value = (self.sp.body.get("text") or "").strip()
 
-        active_brief_title = str(getattr(self.sp, "active_memory_brief_title", "") or "").strip()
-        active_brief_text = str(getattr(self.sp, "active_memory_brief", "") or "").strip()
-
-        if not active_brief_title:
-            active_brief_title = str((getattr(self.sp, "extras", {}) or {}).get("active_memory_brief_title", "") or "").strip()
-
-        if not active_brief_text:
-            active_brief_text = str((getattr(self.sp, "extras", {}) or {}).get("active_memory_brief", "") or "").strip()
-
-        lines.append("## User")
+        lines.append("## Current User Request")
+        lines.append(
+            "Priority: highest. Answer this request directly. "
+            "Treat all later memory and retrieved context as supporting background only."
+        )
         lines.append("")
 
         lines.append("### Task")
@@ -164,15 +287,6 @@ class SuperPromptProjector:
             lines.append(context_value)
             lines.append("")
 
-        if active_brief_title or active_brief_text:
-            lines.append("### Active Memory Brief")
-            if active_brief_title:
-                lines.append(f"Title: {active_brief_title}")
-                lines.append("")
-            if active_brief_text:
-                lines.append(active_brief_text)
-                lines.append("")
-
         if format_value:
             lines.append("### Format")
             lines.append(format_value)
@@ -187,36 +301,97 @@ class SuperPromptProjector:
 
     def _render_retrieved_context_md(self) -> str:
         """
-        Render retrieved/condensed context for GUI-visible SuperPrompt preview.
+        Render supporting context for GUI-visible SuperPrompt preview.
 
         Rules:
-        - show synthesized Memory Context, not raw memory episodes/chunks
+        - Previous Conversation Summary belongs under Supporting Context.
+        - Memory Context belongs under Supporting Context.
+        - Retrieved Project Evidence Summary belongs under Supporting Context.
         - show document raw chunks after Retrieval/Reranker/A3
         - hide document raw chunks after A4/A5
-        - keep document summary context when available
         """
+        extras = getattr(self.sp, "extras", {}) or {}
+
+        materiality = str(
+            extras.get("activebrief_prompt_materiality", "") or ""
+        ).strip().upper()
+
+        topic_relation = str(
+            extras.get("activebrief_topic_relation", "") or ""
+        ).strip().upper()
+
+        activebrief_snapshot = extras.get("activebrief_relation_activebrief", {}) or {}
+        if isinstance(activebrief_snapshot, dict):
+            active_brief_title = str(activebrief_snapshot.get("title", "") or "").strip()
+            active_brief_text = str(activebrief_snapshot.get("body", "") or "").strip()
+        else:
+            active_brief_title = ""
+            active_brief_text = ""
+
+        use_full_brief = (
+            (materiality == "STRONG" and topic_relation in {"SAME_TOPIC", "RELATED_DOMAIN"})
+            or (materiality == "WEAK" and topic_relation in {"SAME_TOPIC", "IRRELEVANT"})
+        )
+
+        use_title_only = (
+            (materiality == "STRONG" and topic_relation == "IRRELEVANT")
+            or (materiality == "WEAK" and topic_relation == "RELATED_DOMAIN")
+        )
+
         memory_context_md = self._render_memory_context_md()
         document_context_md = self._render_document_context_summary_md()
         raw_document_evidence_md = self._render_raw_document_evidence_for_stage_md()
 
-        if not memory_context_md and not document_context_md and not raw_document_evidence_md:
+        has_previous_summary = use_full_brief and (active_brief_title or active_brief_text)
+        has_previous_topic = use_title_only and active_brief_title
+
+        if (
+            not has_previous_summary
+            and not has_previous_topic
+            and not memory_context_md
+            and not document_context_md
+            and not raw_document_evidence_md
+        ):
             return ""
 
         lines: List[str] = []
 
-        lines.append("## Retrieved Context")
+        lines.append("## Supporting Context")
+        lines.append("Priority: supporting only. Use this material only when it helps answer the current TASK.")
         lines.append("")
+
+        if has_previous_summary:
+            lines.append("### Previous Conversation Summary")
+            lines.append("Priority: background only. Use this for continuity, but do not treat it as the current task.")
+            lines.append("")
+
+            if active_brief_title:
+                lines.append(f"Title: {active_brief_title}")
+                lines.append("")
+
+            if active_brief_text:
+                lines.append(active_brief_text)
+                lines.append("")
+
+        elif has_previous_topic:
+            lines.append("### Previous Conversation Topic")
+            lines.append("Priority: weak background only. Use only for continuity or topic-shift awareness.")
+            lines.append("")
+            lines.append(f"Title: {active_brief_title}")
+            lines.append("")
 
         if memory_context_md:
             lines.append("### Memory Context")
+            lines.append("This is synthesized memory context. It is background support, not the current task.")
+            lines.append("")
             lines.append(memory_context_md)
             lines.append("")
 
         if document_context_md:
-            lines.append("### Document Context Summary")
+            lines.append("### Retrieved Project Evidence Summary")
             lines.append(
                 "The following summary is retrieved from selected project files. "
-                "It is supporting context for the task, not part of the task itself."
+                "It is supporting evidence for the current TASK, not the task itself."
             )
             lines.append("")
             lines.append(document_context_md)
@@ -224,6 +399,8 @@ class SuperPromptProjector:
 
         if raw_document_evidence_md:
             lines.append("### Raw Retrieved Evidence")
+            lines.append("Raw evidence is lower priority than the current TASK and should only support the answer.")
+            lines.append("")
             lines.append(raw_document_evidence_md)
 
         return "\n".join(lines).strip()

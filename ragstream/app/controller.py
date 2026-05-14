@@ -45,6 +45,7 @@ from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
 
 DEV_LOG_ENABLED = False
 
+
 def logger_dev(*args, **kwargs):
     if DEV_LOG_ENABLED:
         return _logger_dev(*args, **kwargs)
@@ -205,6 +206,8 @@ class AppController:
             memory_manager=memory_manager,
             raw_user_text=text,
         )
+
+        sp.compose_prompt_ready()
 
         logger("PreProcessing completed.", "INFO", "PUBLIC")
         return sp
@@ -522,7 +525,7 @@ class AppController:
 
     def reload_runtime_config(self) -> dict[str, Any]:
         """
-        Reload runtime_config.json from disk.
+        Reload runtime_config.json.
 
         Useful during development when limits are changed without restarting
         the whole app process.

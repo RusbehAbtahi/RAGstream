@@ -1,4 +1,3 @@
-cat > /home/rusbeh_ab/project/AkbarOurDearFriend/MD_Print.py <<'PY'
 from pathlib import Path
 import subprocess
 import sys
@@ -225,4 +224,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-PY

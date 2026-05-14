@@ -26,6 +26,7 @@ import json
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
 from ragstream.orchestration.super_prompt import SuperPrompt
+from ragstream.textforge.RagLog import LogALL as logger
 from ragstream.textforge.RagLog import LogDeveloper as _logger_dev
 
 
@@ -297,6 +298,38 @@ class ActiveBriefRelationClassifier:
             }
 
         sp.extras["activebrief_relation_activebrief"] = activebrief_snapshot
+
+        logger(
+            (
+                "Prompt relation with current topic: "
+                f"{self._format_topic_relation_for_log(topic_relation)}. "
+                "Prompt strength: "
+                f"{self._format_prompt_materiality_for_log(prompt_materiality)}."
+            ),
+            "INFO",
+            "PUBLIC",
+        )
+
+    @staticmethod
+    def _format_topic_relation_for_log(topic_relation: str) -> str:
+        mapping = {
+            "SAME_TOPIC": "On Topic",
+            "RELATED_DOMAIN": "Related",
+            "IRRELEVANT": "Irrelevant",
+            NO_ACTIVEBRIEF_STATE: "No ActiveBrief",
+        }
+        key = str(topic_relation or "").strip().upper()
+        return mapping.get(key, key or "Unknown")
+
+    @staticmethod
+    def _format_prompt_materiality_for_log(prompt_materiality: str) -> str:
+        mapping = {
+            "STRONG": "Strong",
+            "WEAK": "Weak",
+            "UNKNOWN": "Unknown",
+        }
+        key = str(prompt_materiality or "").strip().upper()
+        return mapping.get(key, key or "Unknown")
 
     @staticmethod
     def _build_relation_state(

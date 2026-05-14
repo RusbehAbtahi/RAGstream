@@ -47,6 +47,7 @@ import time
 from ragstream.orchestration.super_prompt import SuperPrompt, A3ChunkStatus
 from ragstream.orchestration.agent_factory import AgentFactory
 from ragstream.orchestration.llm_client import LLMClient
+from ragstream.orchestration.superprompt_projector import SuperPromptProjector
 from ragstream.textforge.RagLog import LogALL as logger
 from ragstream.textforge.RagLog import LogDeveloper as logger_dev
 
@@ -137,7 +138,7 @@ class A3NLIGate:
             )
             raise RuntimeError("A3NLIGate: could not build evidence chunk text from candidate rows.")
 
-        user_prompt_text = self._build_user_prompt_under_evaluation(sp)
+        user_prompt_text = SuperPromptProjector.build_a3_comparison_prompt_text(sp)
         required_output_text = self._build_required_output_text(len(local_to_real))
 
         inputs: Dict[str, Any] = {
