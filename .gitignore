@@ -277,4 +277,4 @@ data/logs/**
 # OS / Windows metadata
 Thumbs.db
 Desktop.ini
-*:Zone.Identifier
+*:Zone.Identifier 
