@@ -3,6 +3,7 @@
 RAGstream is an agentic, memory-aware AI system for software engineering. It combines deterministic NLP, retrieval, reranking, tag-governed memory, and JSON-defined LLM agents inside a neutral Agent Stack to build controllable multi-stage knowledge and orchestration pipelines. The system is designed to keep requirements, architecture, code, and tests aligned through structured context analysis and version-aware synchronization, and it is deployed on AWS through a CI/CD DevOps pipeline, with governance-oriented support for testing, observability, benchmarking, and system evaluation
 
 
+
 ```mermaid
 %%{init: {
   "theme": "base",
